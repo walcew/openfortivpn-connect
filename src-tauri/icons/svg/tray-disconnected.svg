@@ -1,0 +1,16 @@
+<svg viewBox="0 0 22 24" xmlns="http://www.w3.org/2000/svg">
+  <g transform="translate(11, 12.5) scale(0.13)">
+    <!-- Shield outline only (not filled) -->
+    <path d="M0 -72 L-65 -50 L-65 -2 C-65 28 -35 58 0 72 C35 58 65 28 65 -2 L65 -50 Z"
+          fill="none" stroke="black" stroke-width="12" stroke-linejoin="round"/>
+
+    <!-- Padlock body -->
+    <rect x="-20" y="6" width="40" height="30" rx="5" fill="black"/>
+
+    <!-- Padlock shackle (OPEN - right side raised) -->
+    <path d="M-13 6 V-8 C-13 -22 13 -22 13 -16"
+          fill="none" stroke="black" stroke-width="7" stroke-linecap="round"/>
+
+    <!-- Keyhole (transparent cutout - no fill means transparent in PNG) -->
+  </g>
+</svg>

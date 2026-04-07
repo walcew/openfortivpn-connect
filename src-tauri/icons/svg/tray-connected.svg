@@ -1,0 +1,29 @@
+<svg viewBox="0 0 22 24" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <mask id="padlock-mask">
+      <!-- White = visible, Black = hidden -->
+      <rect width="22" height="24" fill="white"/>
+      <!-- Cut out padlock body -->
+      <g transform="translate(11, 12.5) scale(0.13)">
+        <rect x="-20" y="6" width="40" height="30" rx="5" fill="black"/>
+        <!-- Cut out closed shackle -->
+        <path d="M-13 6 V-8 C-13 -22 13 -22 13 -8 V6"
+              fill="none" stroke="black" stroke-width="7" stroke-linecap="round"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- Shield FILLED with padlock cutout via mask -->
+  <g mask="url(#padlock-mask)">
+    <g transform="translate(11, 12.5) scale(0.13)">
+      <path d="M0 -72 L-65 -50 L-65 -2 C-65 28 -35 58 0 72 C35 58 65 28 65 -2 L65 -50 Z"
+            fill="black" stroke="black" stroke-width="12" stroke-linejoin="round"/>
+    </g>
+  </g>
+
+  <!-- Keyhole (black, visible on the transparent padlock area) -->
+  <g transform="translate(11, 12.5) scale(0.13)">
+    <circle cx="0" cy="17" r="5" fill="black"/>
+    <rect x="-2" y="17" width="4" height="9" rx="1" fill="black"/>
+  </g>
+</svg>
