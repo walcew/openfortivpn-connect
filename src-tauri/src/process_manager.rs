@@ -37,6 +37,7 @@ impl ProcessManager {
         args: Vec<String>,
         profile_id: String,
         app_handle: AppHandle,
+        debug_mode: bool,
     ) -> Result<(), String> {
         // Capture the current default gateway before connecting
         self.original_gateway = get_default_gateway();
@@ -94,7 +95,7 @@ impl ProcessManager {
 
         let stop_flag = self.stop_flag.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            start_log_monitor(log_path, profile_id, app_handle, stop_flag).await;
+            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode).await;
         });
         self.monitor_handle = Some(handle);
 
@@ -192,6 +193,7 @@ async fn start_log_monitor(
     profile_id: String,
     app_handle: AppHandle,
     stop_flag: Arc<AtomicBool>,
+    debug_mode: bool,
 ) {
     // Wait a moment for the log file to start receiving data
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -232,15 +234,28 @@ async fn start_log_monitor(
                     "info"
                 };
 
-                // Emit log line event
-                let _ = app_handle.emit(
-                    "log-line",
-                    LogLinePayload {
-                        timestamp: Utc::now().to_rfc3339(),
-                        level: level.to_string(),
-                        message: trimmed.clone(),
-                    },
-                );
+                // Check if this is an important line that should always be shown
+                let is_important = level != "info"
+                    || trimmed.contains("Tunnel is up")
+                    || trimmed.contains("Tunnel is down")
+                    || trimmed.contains("Connected to")
+                    || trimmed.contains("saml")
+                    || trimmed.contains("SAML")
+                    || trimmed.contains("certificate")
+                    || trimmed.contains("Authenticated")
+                    || trimmed.contains("Disconnecting");
+
+                // Only emit verbose info lines when debug mode is enabled
+                if debug_mode || is_important {
+                    let _ = app_handle.emit(
+                        "log-line",
+                        LogLinePayload {
+                            timestamp: Utc::now().to_rfc3339(),
+                            level: level.to_string(),
+                            message: trimmed.clone(),
+                        },
+                    );
+                }
 
                 // Collect DNS info from log lines before tunnel comes up
                 if let Some(dns_info) = dns_manager::parse_dns_from_log(&trimmed) {

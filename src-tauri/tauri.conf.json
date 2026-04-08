@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "OpenFortiVPN GUI",
+  "productName": "OpenFortiVpn Connect",
   "version": "0.1.0",
-  "identifier": "com.openvpngui.desktop",
+  "identifier": "com.openfortivpn-connect.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -11,15 +11,21 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
-        "title": "OpenFortiVPN GUI",
+        "title": "OPENFORTIVPN CONNECT",
+        "hiddenTitle": true,
         "width": 400,
-        "height": 500,
+        "height": 560,
         "resizable": false,
         "fullscreen": false,
-        "visible": true
+        "visible": true,
+        "transparent": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "shadow": true
       }
     ],
     "security": {

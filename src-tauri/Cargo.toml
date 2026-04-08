@@ -1,10 +1,10 @@
 [package]
 name = "openvpngui"
 version = "0.1.0"
-description = "OpenFortiVPN GUI - A macOS VPN client"
+description = "OpenFortiVpn Connect - A macOS VPN client"
 authors = ["you"]
-license = ""
-repository = ""
+license = "MIT"
+repository = "https://github.com/walcew/openfortivpn-connect"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -22,7 +22,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 security-framework = "3"
 tokio = { version = "1", features = ["full"] }
-tauri = { version = "2.10.3", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.10.3", features = ["tray-icon", "image-png", "macos-private-api"] }
+window-vibrancy = "0.6"
 tauri-plugin-opener = "2"
 log = "0.4"
 dirs = "6"

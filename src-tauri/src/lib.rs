@@ -4,6 +4,7 @@ mod keychain;
 mod models;
 mod process_manager;
 mod profile_store;
+mod settings_store;
 pub mod tray;
 mod vpn_manager;
 
@@ -27,9 +28,28 @@ pub fn run() {
             commands::connect,
             commands::disconnect,
             commands::get_status,
+            commands::get_settings,
+            commands::save_settings,
         ])
         .setup(|app| {
             tray::setup_tray(app)?;
+
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::Manager;
+                let window = app.get_webview_window("main").unwrap();
+                use window_vibrancy::{
+                    apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
+                };
+                apply_vibrancy(
+                    &window,
+                    NSVisualEffectMaterial::HudWindow,
+                    Some(NSVisualEffectState::Active),
+                    Some(12.0),
+                )
+                .expect("Failed to apply vibrancy");
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {

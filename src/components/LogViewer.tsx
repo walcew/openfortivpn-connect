@@ -11,7 +11,7 @@ interface Props {
 const LEVEL_COLORS: Record<string, string> = {
   error: "text-red-400",
   warn: "text-yellow-400",
-  info: "text-gray-300",
+  info: "text-white/60",
 };
 
 export function LogViewer({ logs, isOpen, onClose, onClear }: Props) {
@@ -33,35 +33,35 @@ export function LogViewer({ logs, isOpen, onClose, onClear }: Props) {
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50">
-      <div className="w-full h-3/4 bg-gray-900 rounded-t-xl flex flex-col border-t border-gray-700">
-        <div className="flex items-center justify-between px-4 py-2 border-b border-gray-700">
-          <span className="text-sm font-semibold text-gray-300">Logs</span>
+      <div className="w-full h-3/4 bg-black/80 backdrop-blur-xl rounded-t-xl flex flex-col border-t border-white/10">
+        <div className="flex items-center justify-between px-4 py-2 border-b border-white/10">
+          <span className="text-sm font-semibold text-white/70">Logs</span>
           <div className="flex items-center gap-2">
             <button
               onClick={() => setAutoScroll(!autoScroll)}
-              className={`text-xs px-2 py-1 rounded ${
+              className={`text-xs px-2 py-1 rounded-md ${
                 autoScroll
-                  ? "bg-blue-600/30 text-blue-300"
-                  : "bg-gray-700 text-gray-400"
+                  ? "bg-blue-500/20 text-blue-300"
+                  : "bg-white/10 text-white/40"
               }`}
             >
               Auto-scroll {autoScroll ? "ON" : "OFF"}
             </button>
             <button
               onClick={handleCopy}
-              className="text-xs px-2 py-1 bg-gray-700 text-gray-400 hover:text-gray-200 rounded"
+              className="text-xs px-2 py-1 bg-white/10 text-white/40 hover:text-white/70 rounded-md transition-colors"
             >
               Copy
             </button>
             <button
               onClick={onClear}
-              className="text-xs px-2 py-1 bg-gray-700 text-gray-400 hover:text-gray-200 rounded"
+              className="text-xs px-2 py-1 bg-white/10 text-white/40 hover:text-white/70 rounded-md transition-colors"
             >
               Clear
             </button>
             <button
               onClick={onClose}
-              className="text-gray-500 hover:text-gray-300 ml-1"
+              className="text-white/30 hover:text-white/60 ml-1 transition-colors"
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -74,10 +74,10 @@ export function LogViewer({ logs, isOpen, onClose, onClear }: Props) {
           className="flex-1 overflow-y-auto px-4 py-2 font-mono text-xs leading-5"
         >
           {logs.length === 0 ? (
-            <div className="text-gray-600 text-center mt-8">No logs yet</div>
+            <div className="text-white/20 text-center mt-8">No logs yet</div>
           ) : (
             logs.map((log, i) => (
-              <div key={i} className={LEVEL_COLORS[log.level] ?? "text-gray-300"}>
+              <div key={i} className={LEVEL_COLORS[log.level] ?? "text-white/60"}>
                 {log.message}
               </div>
             ))

@@ -75,7 +75,7 @@ impl VpnManager {
         crate::tray::update_tray_icon(app_handle, &self.state);
     }
 
-    pub fn connect(&mut self, profile_id: &str, app_handle: AppHandle) -> Result<(), String> {
+    pub fn connect(&mut self, profile_id: &str, app_handle: AppHandle, debug_mode: bool) -> Result<(), String> {
         // Validate state
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
@@ -136,7 +136,7 @@ impl VpnManager {
         // Spawn the process
         match self
             .process_manager
-            .spawn_vpn(args, profile_id.to_string(), app_handle.clone())
+            .spawn_vpn(args, profile_id.to_string(), app_handle.clone(), debug_mode)
         {
             Ok(()) => Ok(()),
             Err(e) => {

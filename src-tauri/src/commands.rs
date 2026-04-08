@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use tauri::State;
 
 use crate::models::*;
+use crate::settings_store::{AppSettings, SettingsStore};
 use crate::vpn_manager::VpnManager;
 
 #[tauri::command]
@@ -46,9 +47,14 @@ pub fn connect(
     app_handle: tauri::AppHandle,
     profile_id: String,
 ) -> Result<(), String> {
+    let debug_mode = SettingsStore::new()
+        .and_then(|s| s.get())
+        .map(|s| s.debug_mode)
+        .unwrap_or(false);
+
     let mut mgr = manager.lock().map_err(|e| e.to_string())?;
     mgr.set_selected_profile(&profile_id);
-    mgr.connect(&profile_id, app_handle)
+    mgr.connect(&profile_id, app_handle, debug_mode)
 }
 
 #[tauri::command]
@@ -66,4 +72,16 @@ pub fn get_status(
 ) -> Result<ConnectionStatusPayload, String> {
     let mgr = manager.lock().map_err(|e| e.to_string())?;
     Ok(ConnectionStatusPayload::from(mgr.get_state()))
+}
+
+#[tauri::command]
+pub fn get_settings() -> Result<AppSettings, String> {
+    let store = SettingsStore::new()?;
+    store.get()
+}
+
+#[tauri::command]
+pub fn save_settings(settings: AppSettings) -> Result<(), String> {
+    let store = SettingsStore::new()?;
+    store.save(&settings)
 }

@@ -207,9 +207,13 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                     mgr.selected_profile_id().map(|s| s.to_string())
                 };
                 if let Some(profile_id) = profile_id {
+                    let debug_mode = crate::settings_store::SettingsStore::new()
+                        .and_then(|s| s.get())
+                        .map(|s| s.debug_mode)
+                        .unwrap_or(false);
                     let mgr_state = app.state::<Mutex<VpnManager>>();
                     let mut mgr = mgr_state.lock().unwrap();
-                    let _ = mgr.connect(&profile_id, app.clone());
+                    let _ = mgr.connect(&profile_id, app.clone(), debug_mode);
                     drop(mgr);
                 }
                 // Refresh after lock is released
