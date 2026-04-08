@@ -3,10 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface AppSettings {
   debug_mode: boolean;
+  helper_declined: boolean;
 }
 
 export function useSettings() {
-  const [settings, setSettings] = useState<AppSettings>({ debug_mode: false });
+  const [settings, setSettings] = useState<AppSettings>({ debug_mode: false, helper_declined: false });
   const [loading, setLoading] = useState(true);
 
   const fetchSettings = useCallback(async () => {

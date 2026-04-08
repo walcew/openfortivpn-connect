@@ -12,6 +12,7 @@ import { LogViewer } from "./components/LogViewer";
 import { CertDialog } from "./components/CertDialog";
 import { Settings } from "./components/Settings";
 import { About } from "./components/About";
+import { HelperInstallDialog } from "./components/HelperInstallDialog";
 import type { VpnProfile, CertWarningPayload } from "./types";
 
 type EditingState = null | "new" | VpnProfile;
@@ -27,6 +28,7 @@ function App() {
   const [showLogs, setShowLogs] = useState(false);
   const [certWarning, setCertWarning] = useState<CertWarningPayload | null>(null);
   const [currentView, setCurrentView] = useState<AppView>("main");
+  const [showHelperInstall, setShowHelperInstall] = useState(false);
 
   // Listen for cert warnings
   useEffect(() => {
@@ -37,6 +39,40 @@ function App() {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  // Check helper status on mount
+  useEffect(() => {
+    const checkHelper = async () => {
+      try {
+        const status = await invoke<{ installed: boolean; running: boolean }>("check_helper_status");
+        if (!status.running) {
+          const settings = await invoke<{ helper_declined: boolean }>("get_settings");
+          if (!settings.helper_declined) {
+            setShowHelperInstall(true);
+          }
+        }
+      } catch (e) {
+        console.error("Failed to check helper status:", e);
+      }
+    };
+    checkHelper();
+  }, []);
+
+  const handleHelperInstalled = () => {
+    setShowHelperInstall(false);
+  };
+
+  const handleHelperDeclined = async () => {
+    setShowHelperInstall(false);
+    try {
+      const currentSettings = await invoke<{ debug_mode: boolean; helper_declined: boolean }>("get_settings");
+      await invoke("save_settings", {
+        settings: { ...currentSettings, helper_declined: true },
+      });
+    } catch (e) {
+      console.error("Failed to save helper declined preference:", e);
+    }
+  };
 
   const handleAcceptCert = async () => {
     if (!certWarning) return;
@@ -229,6 +265,14 @@ function App() {
           digest={certWarning.digest}
           onAccept={handleAcceptCert}
           onReject={handleRejectCert}
+        />
+      )}
+
+      {/* Helper install dialog */}
+      {showHelperInstall && (
+        <HelperInstallDialog
+          onInstalled={handleHelperInstalled}
+          onDeclined={handleHelperDeclined}
         />
       )}
     </div>
