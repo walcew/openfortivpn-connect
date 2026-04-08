@@ -18,6 +18,8 @@ export function Settings({ onBack }: Props) {
   const [helperStatus, setHelperStatus] = useState<HelperStatus | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
+  const [showUninstallConfirm, setShowUninstallConfirm] = useState(false);
+  const [uninstalling, setUninstalling] = useState(false);
 
   useEffect(() => {
     invoke<HelperStatus>("check_helper_status").then(setHelperStatus).catch(console.error);
@@ -38,6 +40,21 @@ export function Settings({ onBack }: Props) {
       setInstallError(String(e));
     } finally {
       setInstalling(false);
+    }
+  };
+
+  const handleUninstallHelper = async () => {
+    setUninstalling(true);
+    setInstallError(null);
+    try {
+      await invoke("uninstall_helper");
+      const status = await invoke<HelperStatus>("check_helper_status");
+      setHelperStatus(status);
+      setShowUninstallConfirm(false);
+    } catch (e) {
+      setInstallError(String(e));
+    } finally {
+      setUninstalling(false);
     }
   };
 
@@ -116,7 +133,7 @@ export function Settings({ onBack }: Props) {
               {/* Install/Reinstall button */}
               <button
                 onClick={handleInstallHelper}
-                disabled={installing}
+                disabled={installing || uninstalling}
                 className="w-full px-3 py-2 text-xs text-white/80 font-medium bg-white/10 hover:bg-white/15 rounded-lg transition-colors disabled:opacity-50"
               >
                 {installing
@@ -127,6 +144,44 @@ export function Settings({ onBack }: Props) {
                       ? "Reinstall"
                       : "Install"}
               </button>
+
+              {/* Uninstall button */}
+              {helperStatus.installed && !showUninstallConfirm && (
+                <button
+                  onClick={() => setShowUninstallConfirm(true)}
+                  disabled={installing || uninstalling}
+                  className="w-full mt-2 px-3 py-2 text-xs text-red-400 font-medium bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 rounded-lg transition-colors disabled:opacity-50"
+                >
+                  Uninstall
+                </button>
+              )}
+
+              {/* Uninstall confirmation */}
+              {showUninstallConfirm && (
+                <div className="mt-2 bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+                  <p className="text-xs text-red-300 font-medium mb-1">Are you sure?</p>
+                  <p className="text-xs text-white/40 mb-3">
+                    The helper component will be removed. You will need to enter your
+                    system password each time you connect or disconnect.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setShowUninstallConfirm(false)}
+                      disabled={uninstalling}
+                      className="flex-1 px-3 py-1.5 text-xs text-white/60 bg-white/5 hover:bg-white/10 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleUninstallHelper}
+                      disabled={uninstalling}
+                      className="flex-1 px-3 py-1.5 text-xs text-white font-medium bg-red-500 hover:bg-red-600 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      {uninstalling ? "Uninstalling..." : "Uninstall"}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

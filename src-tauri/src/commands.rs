@@ -96,3 +96,8 @@ pub fn check_helper_status() -> Result<helper_installer::HelperStatus, String> {
 pub fn install_helper(app_handle: tauri::AppHandle) -> Result<(), String> {
     helper_installer::install(&app_handle)
 }
+
+#[tauri::command]
+pub fn uninstall_helper() -> Result<(), String> {
+    helper_installer::uninstall()
+}
