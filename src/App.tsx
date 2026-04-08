@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { useProfiles } from "./hooks/useProfiles";
 import { useVpnConnection } from "./hooks/useVpnConnection";
+import { useAppVersion } from "./hooks/useAppVersion";
 import { TitleBar } from "./components/TitleBar";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ProfileList } from "./components/ProfileList";
@@ -19,6 +20,7 @@ type AppView = "main" | "settings" | "about";
 function App() {
   const { profiles, saveProfile, deleteProfile, refetch } = useProfiles();
   const { status, logs, connect, disconnect, clearLogs } = useVpnConnection();
+  const appVersion = useAppVersion();
 
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [editing, setEditing] = useState<EditingState>(null);
@@ -197,7 +199,7 @@ function App() {
                   />
                 </svg>
               </button>
-              <span className="text-xs text-white/20">v0.1.0</span>
+              {appVersion && <span className="text-xs text-white/20">v{appVersion}</span>}
             </div>
           </div>
         </>

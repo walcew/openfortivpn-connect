@@ -1,10 +1,12 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { useAppVersion } from "../hooks/useAppVersion";
 
 interface Props {
   onBack: () => void;
 }
 
 export function About({ onBack }: Props) {
+  const appVersion = useAppVersion();
   const handleOpenGithub = async () => {
     await openUrl("https://github.com/walcew/openfortivpn-connect");
   };
@@ -40,7 +42,7 @@ export function About({ onBack }: Props) {
 
         <div>
           <h3 className="text-lg font-semibold text-white">OpenFortiVpn Connect</h3>
-          <p className="text-xs text-white/40 mt-1">Version 0.1.0</p>
+          {appVersion && <p className="text-xs text-white/40 mt-1">Version {appVersion}</p>}
         </div>
 
         <div className="w-full border-t border-white/10" />
