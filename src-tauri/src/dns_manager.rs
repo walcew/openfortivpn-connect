@@ -9,18 +9,25 @@ pub fn setup_dns(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(),
         return Ok(());
     }
 
-    // Build scutil commands to create a resolver for the VPN
-    let mut scutil_commands = String::new();
-    scutil_commands.push_str("d.init\n");
-    for (i, server) in dns_servers.iter().enumerate() {
-        scutil_commands.push_str(&format!("d.add ServerAddresses * {}\n", server));
-        if i == 0 {
-            // First add sets the array, subsequent ones should append
-            // Actually scutil d.add with * creates an array, let's build it properly
-        }
-    }
+    log::info!(
+        "Setting up macOS DNS with servers: {}",
+        dns_servers.join(", ")
+    );
 
-    // Build the full server list as a single d.add command
+    match crate::helper_client::setup_dns(dns_servers, dns_suffix) {
+        Ok(()) => {
+            log::info!("DNS configured via helper daemon");
+            return Ok(());
+        }
+        Err(e) if crate::helper_client::is_connection_error(&e) => {
+            log::info!("Helper unavailable ({}), configuring DNS via osascript", e);
+        }
+        Err(e) => return Err(e),
+    }
+    setup_dns_osascript(dns_servers, dns_suffix)
+}
+
+fn setup_dns_osascript(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(), String> {
     let servers_str = dns_servers.join(" ");
 
     let domain_line = if let Some(suffix) = dns_suffix {
@@ -39,8 +46,6 @@ pub fn setup_dns(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(),
         servers = servers_str,
         domain = domain_line,
     );
-
-    log::info!("Setting up macOS DNS via scutil with servers: {}", servers_str);
 
     let output = Command::new("osascript")
         .args([
@@ -64,9 +69,23 @@ pub fn setup_dns(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(),
 
 /// Remove the VPN DNS configuration from macOS
 pub fn teardown_dns() -> Result<(), String> {
-    let scutil_input = "remove State:/Network/Service/OpenFortiVPN/DNS\nquit\n";
-
     log::info!("Tearing down macOS DNS configuration");
+
+    match crate::helper_client::teardown_dns() {
+        Ok(()) => {
+            log::info!("DNS torn down via helper daemon");
+            return Ok(());
+        }
+        Err(e) if crate::helper_client::is_connection_error(&e) => {
+            log::info!("Helper unavailable ({}), tearing down DNS via osascript", e);
+        }
+        Err(e) => return Err(e),
+    }
+    teardown_dns_osascript()
+}
+
+fn teardown_dns_osascript() -> Result<(), String> {
+    let scutil_input = "remove State:/Network/Service/OpenFortiVPN/DNS\nquit\n";
 
     let output = Command::new("osascript")
         .args([
@@ -81,7 +100,6 @@ pub fn teardown_dns() -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Don't fail if it's already gone
         if !stderr.contains("User canceled") {
             log::warn!("scutil DNS teardown returned error: {}", stderr);
         }

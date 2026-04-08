@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:helper": "cd src-tauri && cargo build --release -p openvpngui-helper",
+    "prebuild": "npm run build:helper",
     "preview": "vite preview",
     "tauri": "tauri"
   },

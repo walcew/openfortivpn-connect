@@ -7,6 +7,8 @@ mod profile_store;
 mod settings_store;
 pub mod tray;
 mod vpn_manager;
+mod helper_client;
+mod helper_installer;
 
 use std::sync::Mutex;
 
@@ -30,6 +32,8 @@ pub fn run() {
             commands::get_status,
             commands::get_settings,
             commands::save_settings,
+            commands::check_helper_status,
+            commands::install_helper,
         ])
         .setup(|app| {
             tray::setup_tray(app)?;

@@ -1,6 +1,9 @@
+[workspace]
+members = [".", "helper"]
+
 [package]
 name = "openvpngui"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenFortiVpn Connect - A macOS VPN client"
 authors = ["you"]
 license = "MIT"
