@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "helper"]
+
 [package]
 name = "openvpngui"
 version = "0.1.0"
