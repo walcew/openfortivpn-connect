@@ -55,9 +55,9 @@ fn send_request(json: &str) -> Result<HelperResponse, String> {
     Ok(response)
 }
 
-/// Check if the helper daemon is reachable.
-pub fn is_available() -> bool {
-    ping().is_ok()
+/// Check if an error message indicates a connection failure (helper not running).
+pub fn is_connection_error(err: &str) -> bool {
+    err.contains("Failed to connect to helper socket")
 }
 
 /// Ping the helper and return its version.

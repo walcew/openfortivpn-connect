@@ -39,6 +39,27 @@ pub fn is_valid_gateway(s: &str) -> bool {
     is_valid_ipv4(s)
 }
 
+/// Reject args that could cause openfortivpn/pppd to execute arbitrary code.
+/// We block args that reference plugin paths or arbitrary script execution.
+const BLOCKED_ARG_PREFIXES: &[&str] = &[
+    "--plugin",
+    "--pppd-plugin",
+    "--pppd-ifname",
+    "--pppd-call",
+];
+
+pub fn validate_vpn_args(args: &[String]) -> Result<(), String> {
+    for arg in args {
+        let lower = arg.to_lowercase();
+        for prefix in BLOCKED_ARG_PREFIXES {
+            if lower.starts_with(prefix) {
+                return Err(format!("Blocked argument: {}", arg));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The only binary we allow the helper to execute.
 pub const OPENFORTIVPN_PATH: &str = "/opt/homebrew/bin/openfortivpn";
 
@@ -92,5 +113,24 @@ mod tests {
         assert!(!is_valid_log_path("/etc/passwd"));
         assert!(!is_valid_log_path("/tmp/other-file.log"));
         assert!(!is_valid_log_path("/tmp/openvpngui-../../etc/passwd"));
+    }
+
+    #[test]
+    fn test_validate_vpn_args() {
+        assert!(validate_vpn_args(&vec![
+            "-u".to_string(), "user".to_string(),
+            "-p".to_string(), "pass".to_string(),
+            "--trusted-cert=abc".to_string(),
+        ]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_vpn_args_rejects_dangerous() {
+        assert!(validate_vpn_args(&vec![
+            "--pppd-plugin=/evil".to_string(),
+        ]).is_err());
+        assert!(validate_vpn_args(&vec![
+            "--plugin=/evil".to_string(),
+        ]).is_err());
     }
 }

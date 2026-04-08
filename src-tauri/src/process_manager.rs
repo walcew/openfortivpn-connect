@@ -54,14 +54,16 @@ impl ProcessManager {
         File::create(&log_path)
             .map_err(|e| format!("Failed to create log file: {}", e))?;
 
-        let pid = if helper_client::is_available() {
-            // Use privileged helper daemon (no password prompt)
-            log::info!("Spawning openfortivpn via helper daemon");
-            helper_client::spawn_vpn(&args, log_path.to_str().unwrap())?
-        } else {
-            // Fallback to osascript (will prompt for password)
-            log::info!("Helper unavailable, falling back to osascript");
-            self.spawn_vpn_osascript(&args, &log_path)?
+        let pid = match helper_client::spawn_vpn(&args, log_path.to_str().unwrap()) {
+            Ok(pid) => {
+                log::info!("Spawned openfortivpn via helper daemon");
+                pid
+            }
+            Err(e) if helper_client::is_connection_error(&e) => {
+                log::info!("Helper unavailable ({}), falling back to osascript", e);
+                self.spawn_vpn_osascript(&args, &log_path)?
+            }
+            Err(e) => return Err(e),
         };
 
         log::info!("openfortivpn started with PID {}", pid);
@@ -130,12 +132,15 @@ impl ProcessManager {
                 self.original_gateway
             );
 
-            if helper_client::is_available() {
-                log::info!("Killing openfortivpn via helper daemon");
-                helper_client::kill_vpn(pid, self.original_gateway.as_deref())?;
-            } else {
-                log::info!("Helper unavailable, falling back to osascript");
-                self.kill_vpn_osascript(pid)?;
+            match helper_client::kill_vpn(pid, self.original_gateway.as_deref()) {
+                Ok(()) => {
+                    log::info!("Killed openfortivpn via helper daemon");
+                }
+                Err(e) if helper_client::is_connection_error(&e) => {
+                    log::info!("Helper unavailable ({}), falling back to osascript", e);
+                    self.kill_vpn_osascript(pid)?;
+                }
+                Err(e) => return Err(e),
             }
         } else {
             // No PID but still clean up DNS just in case

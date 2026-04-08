@@ -14,12 +14,16 @@ pub fn setup_dns(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(),
         dns_servers.join(", ")
     );
 
-    if crate::helper_client::is_available() {
-        log::info!("Configuring DNS via helper daemon");
-        return crate::helper_client::setup_dns(dns_servers, dns_suffix);
+    match crate::helper_client::setup_dns(dns_servers, dns_suffix) {
+        Ok(()) => {
+            log::info!("DNS configured via helper daemon");
+            return Ok(());
+        }
+        Err(e) if crate::helper_client::is_connection_error(&e) => {
+            log::info!("Helper unavailable ({}), configuring DNS via osascript", e);
+        }
+        Err(e) => return Err(e),
     }
-
-    log::info!("Helper unavailable, configuring DNS via osascript");
     setup_dns_osascript(dns_servers, dns_suffix)
 }
 
@@ -67,12 +71,16 @@ fn setup_dns_osascript(dns_servers: &[String], dns_suffix: Option<&str>) -> Resu
 pub fn teardown_dns() -> Result<(), String> {
     log::info!("Tearing down macOS DNS configuration");
 
-    if crate::helper_client::is_available() {
-        log::info!("Tearing down DNS via helper daemon");
-        return crate::helper_client::teardown_dns();
+    match crate::helper_client::teardown_dns() {
+        Ok(()) => {
+            log::info!("DNS torn down via helper daemon");
+            return Ok(());
+        }
+        Err(e) if crate::helper_client::is_connection_error(&e) => {
+            log::info!("Helper unavailable ({}), tearing down DNS via osascript", e);
+        }
+        Err(e) => return Err(e),
     }
-
-    log::info!("Helper unavailable, tearing down DNS via osascript");
     teardown_dns_osascript()
 }
 

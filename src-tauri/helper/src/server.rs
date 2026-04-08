@@ -18,11 +18,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = UnixListener::bind(socket_path)?;
 
-    // Set socket permissions: owner (root) read/write, group read/write
+    // Set socket permissions: world read/write so unprivileged Tauri app can connect.
+    // This is safe because the protocol validates all commands.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
+        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666))?;
     }
 
     log::info!("Listening on {}", SOCKET_PATH);

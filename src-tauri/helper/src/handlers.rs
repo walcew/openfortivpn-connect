@@ -19,6 +19,11 @@ fn handle_ping() -> Response {
 }
 
 fn handle_spawn_vpn(args: Vec<String>, log_path: String) -> Response {
+    // Validate args
+    if let Err(e) = validation::validate_vpn_args(&args) {
+        return Response::error(e);
+    }
+
     // Validate log path
     if !validation::is_valid_log_path(&log_path) {
         return Response::error(format!("Invalid log path: {}", log_path));

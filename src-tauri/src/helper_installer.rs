@@ -136,6 +136,7 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
 }
 
 /// Uninstall the helper daemon.
+#[allow(dead_code)] // Available for future Settings UI "Uninstall" button
 pub fn uninstall() -> Result<(), String> {
     let script = format!(
         "do shell script \"\
