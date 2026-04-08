@@ -85,9 +85,9 @@ export function Settings({ onBack }: Props) {
           {/* Helper Status Card */}
           {helperStatus && (
             <div className="bg-white/5 border border-white/10 rounded-xl p-4">
-              <div className="text-sm font-medium text-white/90 mb-2">Componente Auxiliar</div>
+              <div className="text-sm font-medium text-white/90 mb-2">Helper Component</div>
               <div className="text-xs text-white/40 mb-3">
-                Permite conectar e desconectar sem digitar a senha do sistema.
+                Connect and disconnect without entering system password.
               </div>
 
               {/* Status indicator */}
@@ -99,10 +99,10 @@ export function Settings({ onBack }: Props) {
                 />
                 <span className="text-xs text-white/60">
                   {helperStatus.running
-                    ? `Ativo (v${helperStatus.version})`
+                    ? `Active (v${helperStatus.version})`
                     : helperStatus.installed
-                      ? "Instalado mas nao esta rodando"
-                      : "Nao instalado"}
+                      ? "Installed but not running"
+                      : "Not installed"}
                 </span>
               </div>
 
@@ -120,12 +120,12 @@ export function Settings({ onBack }: Props) {
                 className="w-full px-3 py-2 text-xs text-white/80 font-medium bg-white/10 hover:bg-white/15 rounded-lg transition-colors disabled:opacity-50"
               >
                 {installing
-                  ? "Instalando..."
+                  ? "Installing..."
                   : helperStatus.needs_update
-                    ? "Atualizar"
+                    ? "Update"
                     : helperStatus.installed
-                      ? "Reinstalar"
-                      : "Instalar"}
+                      ? "Reinstall"
+                      : "Install"}
               </button>
             </div>
           )}

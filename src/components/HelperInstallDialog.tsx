@@ -36,14 +36,14 @@ export function HelperInstallDialog({ onInstalled, onDeclined }: Props) {
 
         {/* Title */}
         <h3 className="text-base font-semibold text-white text-center mb-2">
-          Instalar Componente Auxiliar
+          Install Helper Component
         </h3>
 
         {/* Description */}
         <p className="text-sm text-white/50 text-center mb-5 leading-relaxed">
-          Para conectar e desconectar sem pedir senha repetidamente, precisamos instalar um
-          componente auxiliar. Isso requer sua senha de administrador{" "}
-          <span className="text-white/70 font-medium">uma unica vez</span>.
+          To connect and disconnect without repeatedly asking for your password, we need to
+          install a helper component. This requires your administrator password{" "}
+          <span className="text-white/70 font-medium">only once</span>.
         </p>
 
         {/* Error */}
@@ -60,14 +60,14 @@ export function HelperInstallDialog({ onInstalled, onDeclined }: Props) {
             disabled={installing}
             className="flex-1 px-4 py-2.5 text-sm text-white/50 hover:text-white/80 bg-white/5 hover:bg-white/10 rounded-xl transition-colors disabled:opacity-50"
           >
-            Agora nao
+            Not now
           </button>
           <button
             onClick={handleInstall}
             disabled={installing}
             className="flex-1 px-4 py-2.5 text-sm text-white font-medium bg-blue-500 hover:bg-blue-600 rounded-xl transition-colors disabled:opacity-50"
           >
-            {installing ? "Instalando..." : "Instalar"}
+            {installing ? "Installing..." : "Install"}
           </button>
         </div>
       </div>
