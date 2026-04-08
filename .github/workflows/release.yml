@@ -134,6 +134,6 @@ jobs:
                 \"cask\": \"openfortivpn-connect\",
                 \"version\": \"$VERSION\",
                 \"repo\": \"walcew/openfortivpn-connect\",
-                \"asset_pattern\": \"OpenFortiVpn%20Connect_{version}_{arch}.dmg\"
+                \"asset_pattern\": \"OpenFortiVpn.Connect_{version}_{arch}.dmg\"
               }
             }"
