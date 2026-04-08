@@ -7,6 +7,8 @@ mod profile_store;
 mod settings_store;
 pub mod tray;
 mod vpn_manager;
+mod helper_client;
+mod helper_installer;
 
 use std::sync::Mutex;
 
