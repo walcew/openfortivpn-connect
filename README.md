@@ -23,14 +23,34 @@ The UI is inspired by [OpenVPN Connect](https://openvpn.net/client/) — simple,
 - **Real-time logs** — monitor connection logs with optional debug mode
 - **Lightweight** — small binary, minimal resource usage
 
-## Prerequisites
+## Installation
 
-- macOS 12 or later
-- [openfortivpn](https://github.com/adrienverge/openfortivpn) installed via Homebrew:
+### Homebrew (recommended)
+
+```bash
+brew tap walcew/tap
+brew install --cask openfortivpn-connect
+```
+
+This will automatically install [openfortivpn](https://github.com/adrienverge/openfortivpn) as a dependency.
+
+### Manual
+
+Download the `.dmg` for your architecture from [Releases](https://github.com/walcew/openfortivpn-connect/releases):
+
+- **Apple Silicon (M1/M2/M3/M4):** `OpenFortiVpn.Connect_x.x.x_aarch64.dmg`
+- **Intel:** `OpenFortiVpn.Connect_x.x.x_x64.dmg`
+
+You will also need to install openfortivpn manually:
 
 ```bash
 brew install openfortivpn
 ```
+
+## Prerequisites
+
+- macOS 12 (Monterey) or later
+- [openfortivpn](https://github.com/adrienverge/openfortivpn)
 
 ## Building from Source
 
