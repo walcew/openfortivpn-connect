@@ -52,6 +52,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Build helper binary
+        run: |
+          cd src-tauri
+          cargo build --release --target ${{ matrix.target }} -p openvpngui-helper
+          mkdir -p target/release
+          cp target/${{ matrix.target }}/release/openvpngui-helper target/release/openvpngui-helper
+
       - name: Build and release with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
