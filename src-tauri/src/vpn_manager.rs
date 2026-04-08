@@ -2,7 +2,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::keychain;
 use crate::models::*;
-use crate::process_manager::{shell_quote, ProcessManager};
+use crate::process_manager::ProcessManager;
 use crate::profile_store::ProfileStore;
 
 pub struct VpnManager {
@@ -103,11 +103,11 @@ impl VpnManager {
             AuthType::Password => {
                 if let Some(ref username) = profile.username {
                     args.push("-u".to_string());
-                    args.push(shell_quote(username));
+                    args.push(username.clone());
                 }
                 if let Ok(Some(password)) = keychain::get_password(&profile.id) {
                     args.push("-p".to_string());
-                    args.push(shell_quote(&password));
+                    args.push(password);
                 }
             }
             AuthType::Saml => {

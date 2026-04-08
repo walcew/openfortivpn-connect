@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 use tauri::async_runtime::JoinHandle;
 
 use crate::dns_manager::{self, DnsInfo};
+use crate::helper_client;
 use crate::models::{ConnectionState, ConnectionStatusPayload, LogLinePayload};
 
 pub struct ProcessManager {
@@ -53,39 +54,15 @@ impl ProcessManager {
         File::create(&log_path)
             .map_err(|e| format!("Failed to create log file: {}", e))?;
 
-        // Build the openfortivpn command
-        let ovpn_args = args.join(" ");
-        let cmd = format!(
-            "/opt/homebrew/bin/openfortivpn {} >> {} 2>&1 & echo $!",
-            ovpn_args,
-            log_path.display()
-        );
-
-        let script = format!(
-            "do shell script \"{}\" with administrator privileges",
-            applescript_escape(&cmd)
-        );
-
-        log::info!("Spawning openfortivpn with osascript");
-
-        let output = Command::new("osascript")
-            .args(["-e", &script])
-            .output()
-            .map_err(|e| format!("Failed to run osascript: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // User likely cancelled the sudo prompt
-            if stderr.contains("User canceled") || stderr.contains("-128") {
-                return Err("Authentication cancelled by user".to_string());
-            }
-            return Err(format!("osascript failed: {}", stderr));
-        }
-
-        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let pid: u32 = pid_str
-            .parse()
-            .map_err(|_| format!("Failed to parse PID from osascript output: '{}'", pid_str))?;
+        let pid = if helper_client::is_available() {
+            // Use privileged helper daemon (no password prompt)
+            log::info!("Spawning openfortivpn via helper daemon");
+            helper_client::spawn_vpn(&args, log_path.to_str().unwrap())?
+        } else {
+            // Fallback to osascript (will prompt for password)
+            log::info!("Helper unavailable, falling back to osascript");
+            self.spawn_vpn_osascript(&args, &log_path)?
+        };
 
         log::info!("openfortivpn started with PID {}", pid);
 
@@ -100,6 +77,42 @@ impl ProcessManager {
         self.monitor_handle = Some(handle);
 
         Ok(())
+    }
+
+    /// Fallback: spawn openfortivpn via osascript with admin privileges.
+    fn spawn_vpn_osascript(&self, args: &[String], log_path: &PathBuf) -> Result<u32, String> {
+        let quoted_args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+        let ovpn_args = quoted_args.join(" ");
+        let cmd = format!(
+            "/opt/homebrew/bin/openfortivpn {} >> {} 2>&1 & echo $!",
+            ovpn_args,
+            log_path.display()
+        );
+
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            applescript_escape(&cmd)
+        );
+
+        let output = Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("Failed to run osascript: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("User canceled") || stderr.contains("-128") {
+                return Err("Authentication cancelled by user".to_string());
+            }
+            return Err(format!("osascript failed: {}", stderr));
+        }
+
+        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let pid: u32 = pid_str
+            .parse()
+            .map_err(|_| format!("Failed to parse PID from osascript output: '{}'", pid_str))?;
+
+        Ok(pid)
     }
 
     pub fn kill_vpn(&mut self) -> Result<(), String> {
@@ -117,56 +130,12 @@ impl ProcessManager {
                 self.original_gateway
             );
 
-            // Build a single privileged script that does ALL cleanup:
-            // 1. SIGINT openfortivpn (clean shutdown)
-            // 2. Wait, then SIGKILL if still alive
-            // 3. Kill orphaned pppd processes
-            // 4. Bring down ppp interfaces
-            // 5. Restore original default route
-            // 6. Clean up DNS (scutil + flush cache)
-            let gateway_restore = if let Some(ref gw) = self.original_gateway {
-                format!(
-                    "/sbin/route delete default 2>/dev/null; \
-                     /sbin/route add default {} 2>/dev/null;",
-                    gw
-                )
+            if helper_client::is_available() {
+                log::info!("Killing openfortivpn via helper daemon");
+                helper_client::kill_vpn(pid, self.original_gateway.as_deref())?;
             } else {
-                String::new()
-            };
-
-            let cmd = format!(
-                "kill -INT {pid} 2>/dev/null; \
-                 sleep 2; \
-                 kill -0 {pid} 2>/dev/null && kill -9 {pid} 2>/dev/null; \
-                 killall pppd 2>/dev/null; \
-                 sleep 1; \
-                 ifconfig ppp0 down 2>/dev/null; \
-                 ifconfig ppp1 down 2>/dev/null; \
-                 {gateway_restore} \
-                 echo 'remove State:/Network/Service/OpenFortiVPN/DNS' | /usr/sbin/scutil; \
-                 /usr/bin/dscacheutil -flushcache; \
-                 /usr/bin/killall -HUP mDNSResponder 2>/dev/null; \
-                 true",
-                pid = pid,
-                gateway_restore = gateway_restore,
-            );
-
-            let script = format!(
-                "do shell script \"{}\" with administrator privileges",
-                applescript_escape(&cmd)
-            );
-
-            let output = Command::new("osascript")
-                .args(["-e", &script])
-                .output()
-                .map_err(|e| format!("Failed to disconnect: {}", e))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("User canceled") || stderr.contains("-128") {
-                    return Err("Disconnect cancelled by user".to_string());
-                }
-                log::warn!("Disconnect command returned error: {}", stderr);
+                log::info!("Helper unavailable, falling back to osascript");
+                self.kill_vpn_osascript(pid)?;
             }
         } else {
             // No PID but still clean up DNS just in case
@@ -178,6 +147,56 @@ impl ProcessManager {
         // Cleanup log file
         if let Some(path) = self.log_file_path.take() {
             let _ = fs::remove_file(&path);
+        }
+
+        Ok(())
+    }
+
+    /// Fallback: kill openfortivpn via osascript with admin privileges.
+    fn kill_vpn_osascript(&self, pid: u32) -> Result<(), String> {
+        let gateway_restore = if let Some(ref gw) = self.original_gateway {
+            format!(
+                "/sbin/route delete default 2>/dev/null; \
+                 /sbin/route add default {} 2>/dev/null;",
+                gw
+            )
+        } else {
+            String::new()
+        };
+
+        let cmd = format!(
+            "kill -INT {pid} 2>/dev/null; \
+             sleep 2; \
+             kill -0 {pid} 2>/dev/null && kill -9 {pid} 2>/dev/null; \
+             killall pppd 2>/dev/null; \
+             sleep 1; \
+             ifconfig ppp0 down 2>/dev/null; \
+             ifconfig ppp1 down 2>/dev/null; \
+             {gateway_restore} \
+             echo 'remove State:/Network/Service/OpenFortiVPN/DNS' | /usr/sbin/scutil; \
+             /usr/bin/dscacheutil -flushcache; \
+             /usr/bin/killall -HUP mDNSResponder 2>/dev/null; \
+             true",
+            pid = pid,
+            gateway_restore = gateway_restore,
+        );
+
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            applescript_escape(&cmd)
+        );
+
+        let output = Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("Failed to disconnect: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("User canceled") || stderr.contains("-128") {
+                return Err("Disconnect cancelled by user".to_string());
+            }
+            log::warn!("Disconnect command returned error: {}", stderr);
         }
 
         Ok(())
@@ -435,6 +454,6 @@ fn applescript_escape(s: &str) -> String {
 
 /// Wrap a user-supplied value in single quotes for shell safety.
 /// Inside single quotes, the shell interprets nothing — only `'` needs handling.
-pub fn shell_quote(s: &str) -> String {
+fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
