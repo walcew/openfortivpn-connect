@@ -48,14 +48,13 @@ pub fn connect(
     app_handle: tauri::AppHandle,
     profile_id: String,
 ) -> Result<(), String> {
-    let debug_mode = SettingsStore::new()
+    let settings = SettingsStore::new()
         .and_then(|s| s.get())
-        .map(|s| s.debug_mode)
-        .unwrap_or(false);
+        .unwrap_or_default();
 
     let mut mgr = manager.lock().map_err(|e| e.to_string())?;
     mgr.set_selected_profile(&profile_id);
-    mgr.connect(&profile_id, app_handle, debug_mode)
+    mgr.connect(&profile_id, app_handle, settings.debug_mode, settings.dns_fallback)
 }
 
 #[tauri::command]

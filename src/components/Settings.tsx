@@ -29,6 +29,10 @@ export function Settings({ onBack }: Props) {
     updateSettings({ ...settings, debug_mode: !settings.debug_mode });
   };
 
+  const handleToggleDnsFallback = () => {
+    updateSettings({ ...settings, dns_fallback: !settings.dns_fallback });
+  };
+
   const handleInstallHelper = async () => {
     setInstalling(true);
     setInstallError(null);
@@ -93,6 +97,31 @@ export function Settings({ onBack }: Props) {
                 <span
                   className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform ${
                     settings.debug_mode ? "translate-x-4" : ""
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+
+          {/* DNS Fallback Card */}
+          <div className="bg-white/5 border border-white/10 rounded-xl p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium text-white/90">DNS Fallback</div>
+                <div className="text-xs text-white/40 mt-0.5">
+                  Use your current DNS servers as a fallback for connections that route
+                  all internet traffic through the VPN tunnel but don't define any VPN DNS servers
+                </div>
+              </div>
+              <button
+                onClick={handleToggleDnsFallback}
+                className={`relative w-10 h-6 rounded-full transition-colors shrink-0 ml-3 ${
+                  settings.dns_fallback ? "bg-blue-500" : "bg-white/15"
+                }`}
+              >
+                <span
+                  className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform ${
+                    settings.dns_fallback ? "translate-x-4" : ""
                   }`}
                 />
               </button>

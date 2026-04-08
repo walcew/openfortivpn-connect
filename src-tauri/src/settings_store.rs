@@ -7,6 +7,8 @@ pub struct AppSettings {
     pub debug_mode: bool,
     #[serde(default)]
     pub helper_declined: bool,
+    #[serde(default)]
+    pub dns_fallback: bool,
 }
 
 impl Default for AppSettings {
@@ -14,6 +16,7 @@ impl Default for AppSettings {
         Self {
             debug_mode: false,
             helper_declined: false,
+            dns_fallback: false,
         }
     }
 }

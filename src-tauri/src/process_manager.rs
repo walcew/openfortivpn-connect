@@ -39,6 +39,7 @@ impl ProcessManager {
         profile_id: String,
         app_handle: AppHandle,
         debug_mode: bool,
+        dns_fallback: bool,
     ) -> Result<(), String> {
         // Capture the current default gateway before connecting
         self.original_gateway = get_default_gateway();
@@ -46,6 +47,15 @@ impl ProcessManager {
             "Saved original default gateway: {:?}",
             self.original_gateway
         );
+
+        // Capture current system DNS servers before VPN modifies them
+        let fallback_dns = if dns_fallback {
+            let servers = dns_manager::get_current_dns_servers();
+            log::info!("Captured fallback DNS servers: {:?}", servers);
+            servers
+        } else {
+            Vec::new()
+        };
 
         let log_id = uuid::Uuid::new_v4();
         let log_path = PathBuf::from(format!("/tmp/openvpngui-{}.log", log_id));
@@ -74,7 +84,7 @@ impl ProcessManager {
 
         let stop_flag = self.stop_flag.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode).await;
+            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode, fallback_dns).await;
         });
         self.monitor_handle = Some(handle);
 
@@ -218,6 +228,7 @@ async fn start_log_monitor(
     app_handle: AppHandle,
     stop_flag: Arc<AtomicBool>,
     debug_mode: bool,
+    fallback_dns: Vec<String>,
 ) {
     // Wait a moment for the log file to start receiving data
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -297,9 +308,27 @@ async fn start_log_monitor(
 
                 // Detect state changes
                 if trimmed.contains("Tunnel is up and running") {
+                    // Build final DNS server list: VPN servers + fallback (DHCP) + Google
+                    let mut all_dns = dns_servers.clone();
+                    if !fallback_dns.is_empty() {
+                        for s in &fallback_dns {
+                            if !all_dns.contains(s) {
+                                all_dns.push(s.clone());
+                            }
+                        }
+                        // Add Google DNS as last resort
+                        for google in &["8.8.8.8", "8.8.4.4"] {
+                            let g = google.to_string();
+                            if !all_dns.contains(&g) {
+                                all_dns.push(g);
+                            }
+                        }
+                        log::info!("DNS with fallback: {:?}", all_dns);
+                    }
+
                     // Configure macOS DNS via scutil
-                    if !dns_servers.is_empty() {
-                        if let Err(e) = dns_manager::setup_dns(&dns_servers, dns_suffix.as_deref()) {
+                    if !all_dns.is_empty() {
+                        if let Err(e) = dns_manager::setup_dns(&all_dns, dns_suffix.as_deref()) {
                             log::error!("Failed to setup DNS: {}", e);
                         }
                     }
