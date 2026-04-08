@@ -32,6 +32,8 @@ pub fn run() {
             commands::get_status,
             commands::get_settings,
             commands::save_settings,
+            commands::check_helper_status,
+            commands::install_helper,
         ])
         .setup(|app| {
             tray::setup_tray(app)?;

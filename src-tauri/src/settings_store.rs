@@ -5,11 +5,16 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub debug_mode: bool,
+    #[serde(default)]
+    pub helper_declined: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { debug_mode: false }
+        Self {
+            debug_mode: false,
+            helper_declined: false,
+        }
     }
 }
 

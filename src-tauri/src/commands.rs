@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use tauri::State;
 
+use crate::helper_installer;
 use crate::models::*;
 use crate::settings_store::{AppSettings, SettingsStore};
 use crate::vpn_manager::VpnManager;
@@ -84,4 +85,14 @@ pub fn get_settings() -> Result<AppSettings, String> {
 pub fn save_settings(settings: AppSettings) -> Result<(), String> {
     let store = SettingsStore::new()?;
     store.save(&settings)
+}
+
+#[tauri::command]
+pub fn check_helper_status() -> Result<helper_installer::HelperStatus, String> {
+    Ok(helper_installer::check_status())
+}
+
+#[tauri::command]
+pub fn install_helper(app_handle: tauri::AppHandle) -> Result<(), String> {
+    helper_installer::install(&app_handle)
 }
