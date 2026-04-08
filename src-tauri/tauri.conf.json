@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "OpenFortiVpn Connect",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "identifier": "com.openfortivpn-connect.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -35,9 +35,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": [
-      "target/release/openvpngui-helper"
-    ],
+    "resources": {
+      "target/release/openvpngui-helper": "openvpngui-helper"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

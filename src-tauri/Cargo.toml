@@ -3,7 +3,7 @@ members = [".", "helper"]
 
 [package]
 name = "openvpngui"
-version = "0.1.3"
+version = "0.1.4"
 description = "OpenFortiVpn Connect - A macOS VPN client"
 authors = ["you"]
 license = "MIT"
