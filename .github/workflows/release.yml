@@ -127,5 +127,13 @@ jobs:
           curl -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
-            "https://api.github.com/repos/walcew/homebrew-openfortivpn-connect/dispatches" \
-            -d "{\"event_type\": \"update-cask\", \"client_payload\": {\"version\": \"$VERSION\"}}"
+            "https://api.github.com/repos/walcew/homebrew-tap/dispatches" \
+            -d "{
+              \"event_type\": \"update-cask\",
+              \"client_payload\": {
+                \"cask\": \"openfortivpn-connect\",
+                \"version\": \"$VERSION\",
+                \"repo\": \"walcew/openfortivpn-connect\",
+                \"asset_pattern\": \"OpenFortiVpn%20Connect_{version}_{arch}.dmg\"
+              }
+            }"
