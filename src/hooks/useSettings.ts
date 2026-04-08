@@ -8,7 +8,7 @@ export interface AppSettings {
 }
 
 export function useSettings() {
-  const [settings, setSettings] = useState<AppSettings>({ debug_mode: false, helper_declined: false, dns_fallback: false });
+  const [settings, setSettings] = useState<AppSettings>({ debug_mode: false, helper_declined: false, dns_fallback: true });
   const [loading, setLoading] = useState(true);
 
   const fetchSettings = useCallback(async () => {
