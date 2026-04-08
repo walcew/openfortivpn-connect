@@ -124,7 +124,7 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>) -> Response {
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
+            if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(b"remove State:/Network/Service/OpenFortiVPN/DNS\nquit\n")?;
             }
             child.wait()
@@ -186,8 +186,9 @@ fn handle_setup_dns(servers: Vec<String>, suffix: Option<String>) -> Response {
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
+            if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(scutil_input.as_bytes())?;
+                // stdin is dropped here, closing the pipe so scutil processes input
             }
             child.wait()
         });
@@ -210,7 +211,7 @@ fn handle_teardown_dns() -> Response {
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
+            if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(b"remove State:/Network/Service/OpenFortiVPN/DNS\nquit\n")?;
             }
             child.wait()

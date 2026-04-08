@@ -19,6 +19,11 @@ const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <array>
         <string>/Library/PrivilegedHelperTools/com.openvpngui.helper</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
