@@ -74,7 +74,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'OpenFortiVpn Connect v__VERSION__'
           releaseBody: 'See the assets to download and install this version.'
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || true }}
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == 'true' }}
           prerelease: false
           args: '--target ${{ matrix.target }}'
 
