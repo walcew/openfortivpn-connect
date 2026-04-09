@@ -146,19 +146,28 @@ impl VpnManager {
         }
     }
 
-    pub fn disconnect(&mut self, app_handle: AppHandle) -> Result<(), String> {
-        self.set_state(ConnectionState::Disconnecting, &app_handle);
+    /// Begin disconnecting: sets state to Disconnecting and returns immediately.
+    pub fn begin_disconnect(&mut self, app_handle: &AppHandle) {
+        self.set_state(ConnectionState::Disconnecting, app_handle);
+    }
 
+    /// Perform the heavy disconnect work (kill process, restore routes, DNS).
+    pub fn finish_disconnect(&mut self, app_handle: &AppHandle) {
         match self.process_manager.kill_vpn() {
             Ok(()) => {
-                self.set_state(ConnectionState::Disconnected, &app_handle);
-                Ok(())
+                self.set_state(ConnectionState::Disconnected, app_handle);
             }
             Err(e) => {
-                self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
-                Err(e)
+                self.set_state(ConnectionState::Error { message: e.clone() }, app_handle);
             }
         }
+    }
+
+    /// Full synchronous disconnect (used by tray menu).
+    pub fn disconnect(&mut self, app_handle: AppHandle) -> Result<(), String> {
+        self.begin_disconnect(&app_handle);
+        self.finish_disconnect(&app_handle);
+        Ok(())
     }
 
     pub fn get_profiles(&self) -> Result<Vec<VpnProfile>, String> {

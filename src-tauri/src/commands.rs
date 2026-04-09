@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::helper_installer;
 use crate::models::*;
@@ -62,8 +62,20 @@ pub fn disconnect(
     manager: State<'_, Mutex<VpnManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let mut mgr = manager.lock().map_err(|e| e.to_string())?;
-    mgr.disconnect(app_handle)
+    // Set Disconnecting state immediately so the UI updates right away.
+    {
+        let mut mgr = manager.lock().map_err(|e| e.to_string())?;
+        mgr.begin_disconnect(&app_handle);
+    }
+
+    // Spawn the heavy kill work in background so this command returns instantly.
+    tauri::async_runtime::spawn(async move {
+        let state = app_handle.state::<Mutex<VpnManager>>();
+        let mut mgr = state.lock().unwrap();
+        mgr.finish_disconnect(&app_handle);
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
