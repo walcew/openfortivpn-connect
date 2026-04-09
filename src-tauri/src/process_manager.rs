@@ -11,7 +11,7 @@ use tauri::async_runtime::JoinHandle;
 
 use crate::dns_manager::{self, DnsInfo};
 use crate::helper_client;
-use crate::models::{ConnectionState, ConnectionStatusPayload, LogLinePayload};
+use crate::models::{BandwidthPayload, ConnectionState, ConnectionStatusPayload, LogLinePayload};
 
 pub struct ProcessManager {
     pid: Option<u32>,
@@ -245,6 +245,7 @@ async fn start_log_monitor(
     let mut line = String::new();
     let mut dns_servers: Vec<String> = Vec::new();
     let mut dns_suffix: Option<String> = None;
+    let mut vpn_local_ip: Option<String> = None;
 
     while !stop_flag.load(Ordering::Relaxed) {
         line.clear();
@@ -306,6 +307,14 @@ async fn start_log_monitor(
                     }
                 }
 
+                // Capture VPN local IP from earlier log lines
+                if vpn_local_ip.is_none() {
+                    if let Some(ip) = extract_vpn_ip_from_log(&trimmed) {
+                        log::info!("Captured VPN local IP from log: {}", ip);
+                        vpn_local_ip = Some(ip);
+                    }
+                }
+
                 // Detect state changes
                 if trimmed.contains("Tunnel is up and running") {
                     // Build final DNS server list: VPN servers + fallback (DHCP) + Google
@@ -333,7 +342,11 @@ async fn start_log_monitor(
                         }
                     }
 
-                    let ip = extract_ip(&trimmed).unwrap_or_else(|| "unknown".to_string());
+                    let ip = vpn_local_ip
+                        .clone()
+                        .or_else(|| extract_ip(&trimmed))
+                        .or_else(get_ppp_interface_ip)
+                        .unwrap_or_else(|| "unknown".to_string());
                     crate::tray::update_tray_icon(
                         &app_handle,
                         &ConnectionState::Connected {
@@ -342,6 +355,9 @@ async fn start_log_monitor(
                             since: Utc::now(),
                         },
                     );
+                    // Capture IP for bandwidth monitor before moving into payload
+                    let bw_ip = ip.clone();
+
                     let _ = app_handle.emit(
                         "connection-status-changed",
                         ConnectionStatusPayload {
@@ -352,6 +368,13 @@ async fn start_log_monitor(
                             message: None,
                         },
                     );
+
+                    // Start bandwidth monitoring
+                    let bw_app_handle = app_handle.clone();
+                    let bw_stop_flag = stop_flag.clone();
+                    tauri::async_runtime::spawn(async move {
+                        start_bandwidth_monitor(bw_app_handle, bw_stop_flag, bw_ip).await;
+                    });
                 } else if trimmed.contains("Tunnel is down") {
                     crate::tray::update_tray_icon(&app_handle, &ConnectionState::Disconnected);
                     let _ = app_handle.emit(
@@ -427,6 +450,76 @@ fn extract_ip(line: &str) -> Option<String> {
     None
 }
 
+fn is_valid_vpn_ip(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| p.parse::<u8>().is_ok())
+        && !s.starts_with("127.")
+        && !s.starts_with("0.")
+}
+
+/// Extract VPN local IP from openfortivpn verbose log lines.
+/// Matches patterns like:
+///   "Got addresses: [10.0.1.45], peer [192.168.1.1]"
+///   "local  IP address 10.0.1.45"
+///   "local IP is 10.0.1.45"
+fn extract_vpn_ip_from_log(line: &str) -> Option<String> {
+    // Pattern 1: "Got addresses: [10.x.x.x], peer [y.y.y.y]"
+    if line.contains("Got addresses") {
+        if let Some(start) = line.find('[') {
+            if let Some(end) = line[start..].find(']') {
+                let candidate = &line[start + 1..start + end];
+                if is_valid_vpn_ip(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+    }
+
+    // Pattern 2: "local  IP address X.X.X.X" (pppd output)
+    if line.contains("local") && line.contains("IP address") {
+        for word in line.split_whitespace().rev() {
+            let cleaned = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+            if is_valid_vpn_ip(cleaned) {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+
+    // Pattern 3: "local IP is X.X.X.X"
+    if line.contains("local IP is") {
+        for word in line.split_whitespace().rev() {
+            let cleaned = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+            if is_valid_vpn_ip(cleaned) {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Fallback: query ppp interface IP via ifconfig when log parsing fails.
+fn get_ppp_interface_ip() -> Option<String> {
+    for iface in &["ppp0", "ppp1", "ppp2"] {
+        if let Ok(output) = Command::new("ifconfig").arg(iface).output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("inet ") {
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                        if parts.len() >= 2 && is_valid_vpn_ip(parts[1]) {
+                            return Some(parts[1].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn extract_url(line: &str) -> Option<String> {
     // Find URL starting with http
     for word in line.split_whitespace() {
@@ -451,6 +544,148 @@ fn extract_cert_digest(line: &str) -> Option<String> {
         let stripped: String = word.chars().filter(|c| c.is_ascii_hexdigit()).collect();
         if stripped.len() == 64 {
             return Some(stripped);
+        }
+    }
+    None
+}
+
+/// Start polling the ppp interface for bandwidth statistics.
+/// Runs until stop_flag is set. Emits "bandwidth-update" events.
+async fn start_bandwidth_monitor(
+    app_handle: AppHandle,
+    stop_flag: Arc<AtomicBool>,
+    vpn_ip: String,
+) {
+    // Wait for the ppp interface to be fully ready
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let iface = match detect_ppp_interface(&vpn_ip) {
+        Some(i) => i,
+        None => {
+            log::warn!("Could not detect ppp interface for IP {}", vpn_ip);
+            return;
+        }
+    };
+    log::info!("Bandwidth monitor starting on interface: {}", iface);
+
+    let mut prev_rx: Option<u64> = None;
+    let mut prev_tx: Option<u64> = None;
+    let mut prev_time: Option<std::time::Instant> = None;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        if let Some((rx_bytes, tx_bytes)) = read_interface_bytes(&iface) {
+            let now = std::time::Instant::now();
+
+            let (rx_speed, tx_speed) = if let (Some(p_rx), Some(p_tx), Some(p_time)) =
+                (prev_rx, prev_tx, prev_time)
+            {
+                let elapsed = now.duration_since(p_time).as_secs_f64();
+                if elapsed > 0.0 {
+                    let rx_delta = rx_bytes.saturating_sub(p_rx) as f64;
+                    let tx_delta = tx_bytes.saturating_sub(p_tx) as f64;
+                    (rx_delta / elapsed, tx_delta / elapsed)
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                (0.0, 0.0)
+            };
+
+            prev_rx = Some(rx_bytes);
+            prev_tx = Some(tx_bytes);
+            prev_time = Some(now);
+
+            let _ = app_handle.emit(
+                "bandwidth-update",
+                BandwidthPayload {
+                    rx_bytes,
+                    tx_bytes,
+                    rx_speed,
+                    tx_speed,
+                    timestamp: Utc::now().to_rfc3339(),
+                },
+            );
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+
+    log::info!("Bandwidth monitor stopped");
+}
+
+/// Detect the ppp interface that has the given VPN IP assigned.
+/// Parses `ifconfig` output to find the matching interface, handling
+/// stale ppp interfaces from previous connections.
+fn detect_ppp_interface(vpn_ip: &str) -> Option<String> {
+    let output = Command::new("ifconfig").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut current_iface: Option<String> = None;
+    for line in stdout.lines() {
+        // Interface header line: "pppN: flags=..."
+        if !line.starts_with('\t') && !line.starts_with(' ') {
+            if let Some(name) = line.split(':').next() {
+                if name.starts_with("ppp") {
+                    current_iface = Some(name.to_string());
+                } else {
+                    current_iface = None;
+                }
+            }
+        }
+        // Look for our VPN IP on this interface
+        if let Some(ref iface) = current_iface {
+            let trimmed = line.trim();
+            if trimmed.starts_with("inet ") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == vpn_ip {
+                    log::info!("Found VPN IP {} on interface {}", vpn_ip, iface);
+                    return Some(iface.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read cumulative RX and TX bytes from a network interface using netstat.
+/// Parses `netstat -I <iface> -b` output on macOS. Looks for the <Link> row
+/// which contains total cumulative bytes.
+fn read_interface_bytes(iface: &str) -> Option<(u64, u64)> {
+    let output = Command::new("netstat")
+        .args(["-I", iface, "-b"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+
+    // Parse header to find Ibytes and Obytes column indices
+    let header = lines.next()?;
+    let header_cols: Vec<&str> = header.split_whitespace().collect();
+    let ibytes_idx = header_cols.iter().position(|&c| c == "Ibytes")?;
+    let obytes_idx = header_cols.iter().position(|&c| c == "Obytes")?;
+
+    // Find the <Link> row (cumulative totals, no address field = one fewer column)
+    for line in lines {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.is_empty() {
+            continue;
+        }
+        // Match interface name, ignoring trailing asterisk (inactive marker)
+        let name = cols[0].trim_end_matches('*');
+        if name != iface {
+            continue;
+        }
+        // The <Link> row has no Address column, so it has one fewer field
+        // than the header. Adjust indices by -1 for this row.
+        if cols.iter().any(|c| c.contains("<Link")) {
+            let adj_ibytes = ibytes_idx.checked_sub(1)?;
+            let adj_obytes = obytes_idx.checked_sub(1)?;
+            if cols.len() > adj_obytes {
+                let ibytes = cols[adj_ibytes].parse::<u64>().ok()?;
+                let obytes = cols[adj_obytes].parse::<u64>().ok()?;
+                return Some((ibytes, obytes));
+            }
         }
     }
     None

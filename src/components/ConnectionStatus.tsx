@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import type { ConnectionStatus as ConnectionStatusType } from "../types";
+import type { ConnectionStatus as ConnectionStatusType, BandwidthData } from "../types";
+import { BandwidthChart } from "./BandwidthChart";
 
 interface Props {
   status: ConnectionStatusType;
   profileName: string;
   selectedProfileId: string | null;
+  bandwidth: BandwidthData[];
   onConnect: () => void;
   onDisconnect: () => void;
 }
@@ -32,6 +34,7 @@ export function ConnectionStatus({
   status,
   profileName,
   selectedProfileId,
+  bandwidth,
   onConnect,
   onDisconnect,
 }: Props) {
@@ -65,6 +68,7 @@ export function ConnectionStatus({
           <div>{profileName}</div>
           {status.ip && <div>IP: {status.ip}</div>}
           <div>{formatDuration(duration)}</div>
+          {bandwidth.length > 1 && <BandwidthChart data={bandwidth} />}
         </div>
       )}
 

@@ -130,3 +130,12 @@ pub struct LogLinePayload {
     pub level: String,
     pub message: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BandwidthPayload {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_speed: f64,
+    pub tx_speed: f64,
+    pub timestamp: String,
+}

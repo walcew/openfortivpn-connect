@@ -20,7 +20,7 @@ type AppView = "main" | "settings" | "about";
 
 function App() {
   const { profiles, saveProfile, deleteProfile, refetch } = useProfiles();
-  const { status, logs, connect, disconnect, clearLogs } = useVpnConnection();
+  const { status, logs, bandwidth, connect, disconnect, clearLogs } = useVpnConnection();
   const appVersion = useAppVersion();
 
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
@@ -152,6 +152,7 @@ function App() {
               status={status}
               profileName={profileName}
               selectedProfileId={selectedProfileId}
+              bandwidth={bandwidth}
               onConnect={handleConnect}
               onDisconnect={handleDisconnect}
             />

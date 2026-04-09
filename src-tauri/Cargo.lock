@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "openvpngui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "dirs",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "openvpngui-helper"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "env_logger",
  "log",

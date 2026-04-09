@@ -35,6 +35,14 @@ export interface CertWarningPayload {
   profile_id: string;
 }
 
+export interface BandwidthData {
+  rx_bytes: number;
+  tx_bytes: number;
+  rx_speed: number;
+  tx_speed: number;
+  timestamp: string;
+}
+
 export function newProfile(): VpnProfile {
   return {
     id: "",

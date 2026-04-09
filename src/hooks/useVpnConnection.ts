@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { ConnectionStatus, LogLine } from "../types";
+import type { ConnectionStatus, LogLine, BandwidthData } from "../types";
 
 const INITIAL_STATUS: ConnectionStatus = {
   state: "Disconnected",
@@ -16,6 +16,8 @@ export function useVpnConnection() {
   const [status, setStatus] = useState<ConnectionStatus>(INITIAL_STATUS);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logsRef = useRef<LogLine[]>([]);
+  const [bandwidth, setBandwidth] = useState<BandwidthData[]>([]);
+  const bandwidthRef = useRef<BandwidthData[]>([]);
 
   useEffect(() => {
     const unlistenStatus = listen<ConnectionStatus>(
@@ -41,6 +43,17 @@ export function useVpnConnection() {
       },
     );
 
+    const unlistenBandwidth = listen<BandwidthData>(
+      "bandwidth-update",
+      (event) => {
+        bandwidthRef.current = [
+          ...bandwidthRef.current.slice(-59),
+          event.payload,
+        ];
+        setBandwidth([...bandwidthRef.current]);
+      },
+    );
+
     // Fetch initial status
     invoke<ConnectionStatus>("get_status")
       .then(setStatus)
@@ -50,8 +63,17 @@ export function useVpnConnection() {
       unlistenStatus.then((fn) => fn());
       unlistenLog.then((fn) => fn());
       unlistenSaml.then((fn) => fn());
+      unlistenBandwidth.then((fn) => fn());
     };
   }, []);
+
+  // Reset bandwidth data on disconnect
+  useEffect(() => {
+    if (status.state !== "Connected") {
+      bandwidthRef.current = [];
+      setBandwidth([]);
+    }
+  }, [status.state]);
 
   const connect = useCallback(async (profileId: string) => {
     try {
@@ -76,5 +98,5 @@ export function useVpnConnection() {
     setLogs([]);
   }, []);
 
-  return { status, logs, connect, disconnect, clearLogs };
+  return { status, logs, bandwidth, connect, disconnect, clearLogs };
 }
