@@ -21,7 +21,8 @@ pub enum Request {
     #[serde(rename = "setup-dns")]
     SetupDns {
         servers: Vec<String>,
-        suffix: Option<String>,
+        #[serde(default)]
+        suffixes: Vec<String>,
     },
 
     #[serde(rename = "teardown-dns")]

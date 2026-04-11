@@ -244,7 +244,7 @@ async fn start_log_monitor(
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut dns_servers: Vec<String> = Vec::new();
-    let mut dns_suffix: Option<String> = None;
+    let mut dns_suffixes: Vec<String> = Vec::new();
     let mut vpn_local_ip: Option<String> = None;
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -301,8 +301,12 @@ async fn start_log_monitor(
                                 dns_servers.push(s);
                             }
                         }
-                        DnsInfo::SearchDomain(d) => {
-                            dns_suffix = Some(d);
+                        DnsInfo::SearchDomains(ds) => {
+                            for d in ds {
+                                if !dns_suffixes.contains(&d) {
+                                    dns_suffixes.push(d);
+                                }
+                            }
                         }
                     }
                 }
@@ -337,7 +341,7 @@ async fn start_log_monitor(
 
                     // Configure macOS DNS via scutil
                     if !all_dns.is_empty() {
-                        if let Err(e) = dns_manager::setup_dns(&all_dns, dns_suffix.as_deref()) {
+                        if let Err(e) = dns_manager::setup_dns(&all_dns, &dns_suffixes) {
                             log::error!("Failed to setup DNS: {}", e);
                         }
                     }

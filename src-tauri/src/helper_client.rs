@@ -90,11 +90,11 @@ pub fn kill_vpn(pid: u32, gateway: Option<&str>) -> Result<(), String> {
 }
 
 /// Configure macOS DNS via the helper.
-pub fn setup_dns(servers: &[String], suffix: Option<&str>) -> Result<(), String> {
+pub fn setup_dns(servers: &[String], suffixes: &[String]) -> Result<(), String> {
     let request = serde_json::json!({
         "cmd": "setup-dns",
         "servers": servers,
-        "suffix": suffix,
+        "suffixes": suffixes,
     });
     send_request(&request.to_string())?;
     Ok(())

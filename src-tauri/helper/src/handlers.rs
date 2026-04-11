@@ -9,7 +9,7 @@ pub fn handle(request: Request) -> Response {
         Request::Ping => handle_ping(),
         Request::SpawnVpn { args, log_path } => handle_spawn_vpn(args, log_path),
         Request::KillVpn { pid, gateway } => handle_kill_vpn(pid, gateway),
-        Request::SetupDns { servers, suffix } => handle_setup_dns(servers, suffix),
+        Request::SetupDns { servers, suffixes } => handle_setup_dns(servers, suffixes),
         Request::TeardownDns => handle_teardown_dns(),
     }
 }
@@ -142,7 +142,7 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>) -> Response {
     Response::success()
 }
 
-fn handle_setup_dns(servers: Vec<String>, suffix: Option<String>) -> Response {
+fn handle_setup_dns(servers: Vec<String>, suffixes: Vec<String>) -> Response {
     // Validate servers
     if servers.is_empty() {
         return Response::error("No DNS servers provided".to_string());
@@ -153,8 +153,8 @@ fn handle_setup_dns(servers: Vec<String>, suffix: Option<String>) -> Response {
         }
     }
 
-    // Validate suffix if provided
-    if let Some(ref s) = suffix {
+    // Validate each suffix individually (rejecting e.g. strings containing ';')
+    for s in &suffixes {
         if !validation::is_valid_hostname(s) {
             return Response::error(format!("Invalid DNS suffix: {}", s));
         }
@@ -162,24 +162,34 @@ fn handle_setup_dns(servers: Vec<String>, suffix: Option<String>) -> Response {
 
     let servers_str = servers.join(" ");
 
-    let domain_line = if let Some(ref s) = suffix {
-        format!("d.add DomainName {}\n", s)
+    let scutil_input = if suffixes.is_empty() {
+        format!(
+            "d.init\n\
+             d.add ServerAddresses * {servers}\n\
+             d.add SupplementalMatchDomains * \"\"\n\
+             set State:/Network/Service/OpenFortiVPN/DNS\n\
+             quit\n",
+            servers = servers_str,
+        )
     } else {
-        String::new()
+        let domains = suffixes.join(" ");
+        format!(
+            "d.init\n\
+             d.add ServerAddresses * {servers}\n\
+             d.add SupplementalMatchDomains * {domains}\n\
+             d.add SearchDomains * {domains}\n\
+             set State:/Network/Service/OpenFortiVPN/DNS\n\
+             quit\n",
+            servers = servers_str,
+            domains = domains,
+        )
     };
 
-    let scutil_input = format!(
-        "d.init\n\
-         d.add ServerAddresses * {servers}\n\
-         {domain}\
-         d.add SupplementalMatchDomains * \"\"\n\
-         set State:/Network/Service/OpenFortiVPN/DNS\n\
-         quit\n",
-        servers = servers_str,
-        domain = domain_line,
+    log::info!(
+        "Setting up DNS with servers: {} suffixes: {:?}",
+        servers_str,
+        suffixes
     );
-
-    log::info!("Setting up DNS with servers: {}", servers_str);
 
     let result = Command::new("/usr/sbin/scutil")
         .stdin(std::process::Stdio::piped())

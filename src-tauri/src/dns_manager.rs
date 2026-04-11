@@ -4,17 +4,18 @@ use std::process::Command;
 /// This is necessary because macOS ignores /etc/resolv.conf and uses
 /// the SystemConfiguration framework instead. openfortivpn only writes
 /// to resolv.conf, which doesn't affect macOS DNS resolution.
-pub fn setup_dns(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(), String> {
+pub fn setup_dns(dns_servers: &[String], dns_suffixes: &[String]) -> Result<(), String> {
     if dns_servers.is_empty() {
         return Ok(());
     }
 
     log::info!(
-        "Setting up macOS DNS with servers: {}",
-        dns_servers.join(", ")
+        "Setting up macOS DNS with servers: {} suffixes: {:?}",
+        dns_servers.join(", "),
+        dns_suffixes
     );
 
-    match crate::helper_client::setup_dns(dns_servers, dns_suffix) {
+    match crate::helper_client::setup_dns(dns_servers, dns_suffixes) {
         Ok(()) => {
             log::info!("DNS configured via helper daemon");
             return Ok(());
@@ -24,28 +25,34 @@ pub fn setup_dns(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(),
         }
         Err(e) => return Err(e),
     }
-    setup_dns_osascript(dns_servers, dns_suffix)
+    setup_dns_osascript(dns_servers, dns_suffixes)
 }
 
-fn setup_dns_osascript(dns_servers: &[String], dns_suffix: Option<&str>) -> Result<(), String> {
+fn setup_dns_osascript(dns_servers: &[String], dns_suffixes: &[String]) -> Result<(), String> {
     let servers_str = dns_servers.join(" ");
 
-    let domain_line = if let Some(suffix) = dns_suffix {
-        format!("d.add DomainName {}\n", suffix)
+    let scutil_input = if dns_suffixes.is_empty() {
+        format!(
+            "d.init\n\
+             d.add ServerAddresses * {servers}\n\
+             d.add SupplementalMatchDomains * \"\"\n\
+             set State:/Network/Service/OpenFortiVPN/DNS\n\
+             quit\n",
+            servers = servers_str,
+        )
     } else {
-        String::new()
+        let domains = dns_suffixes.join(" ");
+        format!(
+            "d.init\n\
+             d.add ServerAddresses * {servers}\n\
+             d.add SupplementalMatchDomains * {domains}\n\
+             d.add SearchDomains * {domains}\n\
+             set State:/Network/Service/OpenFortiVPN/DNS\n\
+             quit\n",
+            servers = servers_str,
+            domains = domains,
+        )
     };
-
-    let scutil_input = format!(
-        "d.init\n\
-         d.add ServerAddresses * {servers}\n\
-         {domain}\
-         d.add SupplementalMatchDomains * \"\"\n\
-         set State:/Network/Service/OpenFortiVPN/DNS\n\
-         quit\n",
-        servers = servers_str,
-        domain = domain_line,
-    );
 
     let output = Command::new("osascript")
         .args([
@@ -153,6 +160,10 @@ pub fn get_current_dns_servers() -> Vec<String> {
 /// With -v flag, openfortivpn logs:
 ///   "Found dns server 10.0.0.1 in xml config"
 ///   "Found dns suffix corp.example.com in xml config"
+///   "Found dns suffix a.example.com;b.example.com;c.example.com in xml config"
+///
+/// The FortiGate may concatenate multiple DNS suffixes in a single line, separated
+/// by ';' (or sometimes ','). We split them so each suffix becomes a search domain.
 pub fn parse_dns_from_log(line: &str) -> Option<DnsInfo> {
     let trimmed = line.trim();
 
@@ -170,14 +181,20 @@ pub fn parse_dns_from_log(line: &str) -> Option<DnsInfo> {
         }
     }
 
-    // Match "Found dns suffix example.com in xml config"
+    // Match "Found dns suffix example.com in xml config" (possibly with multiple
+    // suffixes separated by ';' or ',')
     if trimmed.contains("Found dns suffix") {
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         for (i, part) in parts.iter().enumerate() {
             if *part == "suffix" && i + 1 < parts.len() {
-                let domain = parts[i + 1];
-                if domain.contains('.') {
-                    return Some(DnsInfo::SearchDomain(domain.to_string()));
+                let compound = parts[i + 1];
+                let domains: Vec<String> = compound
+                    .split(|c: char| c == ';' || c == ',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| s.contains('.'))
+                    .collect();
+                if !domains.is_empty() {
+                    return Some(DnsInfo::SearchDomains(domains));
                 }
             }
         }
@@ -189,7 +206,67 @@ pub fn parse_dns_from_log(line: &str) -> Option<DnsInfo> {
 #[derive(Debug, Clone)]
 pub enum DnsInfo {
     Server(String),
-    SearchDomain(String),
+    SearchDomains(Vec<String>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_dns_suffix() {
+        let line = "[2026-04-11T12:41:23.189550+00:00] DEBUG:  Found dns suffix corp.example.com in xml config";
+        match parse_dns_from_log(line) {
+            Some(DnsInfo::SearchDomains(domains)) => {
+                assert_eq!(domains, vec!["corp.example.com".to_string()]);
+            }
+            other => panic!("expected SearchDomains, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_dns_suffixes_semicolon() {
+        let line = "[2026-04-11T12:41:23.189550+00:00] DEBUG:  Found dns suffix redecamara.camara.gov.br;camara.leg.br;camara.gov.br in xml config";
+        match parse_dns_from_log(line) {
+            Some(DnsInfo::SearchDomains(domains)) => {
+                assert_eq!(
+                    domains,
+                    vec![
+                        "redecamara.camara.gov.br".to_string(),
+                        "camara.leg.br".to_string(),
+                        "camara.gov.br".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected SearchDomains, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_dns_suffixes_comma() {
+        let line = "DEBUG: Found dns suffix a.com,b.com in xml config";
+        match parse_dns_from_log(line) {
+            Some(DnsInfo::SearchDomains(domains)) => {
+                assert_eq!(domains, vec!["a.com".to_string(), "b.com".to_string()]);
+            }
+            other => panic!("expected SearchDomains, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dns_server() {
+        let line = "[2026-04-11T12:41:23.189573+00:00] DEBUG:  Found dns server 10.1.3.6 in xml config";
+        match parse_dns_from_log(line) {
+            Some(DnsInfo::Server(ip)) => assert_eq!(ip, "10.1.3.6"),
+            other => panic!("expected Server, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_irrelevant_line_returns_none() {
+        let line = "[2026-04-11T12:41:23.190413+00:00] Sat Apr 11 09:41:23 2026 : Using interface ppp16";
+        assert!(parse_dns_from_log(line).is_none());
+    }
 }
 
 /// Escape for use inside a single-quoted AppleScript string that's inside a double-quoted shell string.
