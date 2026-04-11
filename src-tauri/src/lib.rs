@@ -12,7 +12,7 @@ mod helper_installer;
 
 use std::sync::Mutex;
 
-use tauri::WindowEvent;
+use tauri::{Manager, RunEvent, WindowEvent};
 
 use vpn_manager::VpnManager;
 
@@ -41,7 +41,6 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             {
-                use tauri::Manager;
                 let window = app.get_webview_window("main").unwrap();
                 use window_vibrancy::{
                     apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
@@ -63,6 +62,17 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        });
 }
