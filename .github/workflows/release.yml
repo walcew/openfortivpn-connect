@@ -81,6 +81,8 @@ jobs:
   checksums:
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     permissions:
       contents: write
     steps:
@@ -120,3 +122,28 @@ jobs:
             ./artifacts/checksums-sha256.txt \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+
+  dispatch-homebrew:
+    needs: checksums
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Homebrew tap update
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ needs.checksums.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
+            "https://api.github.com/repos/walcew/homebrew-tap/dispatches" \
+            -d "{
+              \"event_type\": \"update-cask\",
+              \"client_payload\": {
+                \"cask\": \"openfortivpn-connect\",
+                \"version\": \"$VERSION\",
+                \"repo\": \"walcew/openfortivpn-connect\",
+                \"asset_pattern\": \"OpenFortiVpn.Connect_{version}_{arch}.dmg\"
+              }
+            }"
