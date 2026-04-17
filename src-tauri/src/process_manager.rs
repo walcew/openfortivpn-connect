@@ -321,22 +321,25 @@ async fn start_log_monitor(
 
                 // Detect state changes
                 if trimmed.contains("Tunnel is up and running") {
-                    // Build final DNS server list: VPN servers + fallback (DHCP) + Google
+                    // Build final DNS server list. Fallback (DHCP + Google) is only
+                    // used when the VPN itself did not provide any DNS servers —
+                    // otherwise mixing public resolvers with the VPN's split-DNS
+                    // causes public IPs to be cached for internal hostnames, which
+                    // the VPN's firewall then blocks (hairpin/split-DNS enforcement).
                     let mut all_dns = dns_servers.clone();
-                    if !fallback_dns.is_empty() {
+                    if all_dns.is_empty() && !fallback_dns.is_empty() {
                         for s in &fallback_dns {
                             if !all_dns.contains(s) {
                                 all_dns.push(s.clone());
                             }
                         }
-                        // Add Google DNS as last resort
                         for google in &["8.8.8.8", "8.8.4.4"] {
                             let g = google.to_string();
                             if !all_dns.contains(&g) {
                                 all_dns.push(g);
                             }
                         }
-                        log::info!("DNS with fallback: {:?}", all_dns);
+                        log::info!("DNS with fallback (VPN provided none): {:?}", all_dns);
                     }
 
                     // Configure macOS DNS via scutil
