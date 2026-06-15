@@ -75,7 +75,14 @@ impl VpnManager {
         crate::tray::update_tray_icon(app_handle, &self.state);
     }
 
-    pub fn connect(&mut self, profile_id: &str, app_handle: AppHandle, debug_mode: bool, dns_fallback: bool) -> Result<(), String> {
+    pub fn connect(
+        &mut self,
+        profile_id: &str,
+        app_handle: AppHandle,
+        debug_mode: bool,
+        dns_fallback: bool,
+        otp: Option<String>,
+    ) -> Result<(), String> {
         // Validate state
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
@@ -129,7 +136,7 @@ impl VpnManager {
             None
         };
 
-        let args = build_openfortivpn_args(&profile, password_creds, gateway_digest.as_deref());
+        let args = build_openfortivpn_args(&profile, password_creds, gateway_digest.as_deref(), otp.as_deref());
 
         // Spawn the process
         match self
@@ -230,6 +237,7 @@ fn build_openfortivpn_args(
     profile: &VpnProfile,
     password_creds: Option<(String, String)>,
     gateway_digest: Option<&str>,
+    otp: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![format!("{}:{}", profile.host, profile.port)];
 
@@ -238,6 +246,9 @@ fn build_openfortivpn_args(
         args.push(username);
         args.push("-p".to_string());
         args.push(password);
+        if let Some(otp) = otp.map(str::trim).filter(|value| !value.is_empty()) {
+            args.push(format!("--otp={}", otp));
+        }
     } else {
         args.push("--saml-login".to_string());
     }
@@ -301,7 +312,7 @@ mod tests {
 
     fn args_of(profile: &VpnProfile, creds: Option<(&str, &str)>, digest: Option<&str>) -> Vec<String> {
         let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
-        build_openfortivpn_args(profile, creds, digest)
+        build_openfortivpn_args(profile, creds, digest, None)
     }
 
     fn saml_profile() -> VpnProfile {

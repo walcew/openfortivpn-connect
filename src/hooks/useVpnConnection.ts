@@ -75,9 +75,9 @@ export function useVpnConnection() {
     }
   }, [status.state]);
 
-  const connect = useCallback(async (profileId: string) => {
+  const connect = useCallback(async (profileId: string, otp?: string) => {
     try {
-      await invoke("connect", { profileId });
+      await invoke("connect", { profileId, otp: otp || null });
     } catch (e) {
       console.error("Connect failed:", e);
       throw e;

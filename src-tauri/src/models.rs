@@ -21,6 +21,8 @@ pub struct VpnProfile {
     pub port: u16,
     pub auth_type: AuthType,
     pub username: Option<String>,
+    #[serde(default)]
+    pub otp_required: bool,
     pub realm: Option<String>,
     pub trusted_certs: Vec<String>,
     #[serde(default)]
@@ -37,6 +39,7 @@ impl Default for VpnProfile {
             port: 8443,
             auth_type: AuthType::default(),
             username: None,
+            otp_required: false,
             realm: None,
             trusted_certs: Vec::new(),
             ignore_cert_errors: false,
