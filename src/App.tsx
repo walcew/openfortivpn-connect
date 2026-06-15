@@ -13,6 +13,7 @@ import { CertDialog } from "./components/CertDialog";
 import { Settings } from "./components/Settings";
 import { About } from "./components/About";
 import { HelperInstallDialog } from "./components/HelperInstallDialog";
+import { OtpDialog } from "./components/OtpDialog";
 import type { VpnProfile, CertWarningPayload } from "./types";
 
 type EditingState = null | "new" | VpnProfile;
@@ -29,6 +30,7 @@ function App() {
   const [certWarning, setCertWarning] = useState<CertWarningPayload | null>(null);
   const [currentView, setCurrentView] = useState<AppView>("main");
   const [showHelperInstall, setShowHelperInstall] = useState(false);
+  const [otpProfile, setOtpProfile] = useState<VpnProfile | null>(null);
 
   // Listen for cert warnings
   useEffect(() => {
@@ -88,7 +90,11 @@ function App() {
       // Reconnect with the trusted cert
       try {
         await disconnect();
-        await connect(profile.id);
+        if (profile.auth_type === "Password" && profile.otp_required) {
+          setOtpProfile(profile);
+        } else {
+          await connect(profile.id);
+        }
       } catch {
         // handled by status events
       }
@@ -110,8 +116,24 @@ function App() {
 
   const handleConnect = async () => {
     if (!selectedProfileId) return;
+    const profile = profiles.find((p) => p.id === selectedProfileId);
+    if (profile?.auth_type === "Password" && profile.otp_required) {
+      setOtpProfile(profile);
+      return;
+    }
     try {
       await connect(selectedProfileId);
+    } catch {
+      // Error is handled via status events
+    }
+  };
+
+  const handleOtpConnect = async (otp: string) => {
+    if (!otpProfile) return;
+    const profileId = otpProfile.id;
+    setOtpProfile(null);
+    try {
+      await connect(profileId, otp);
     } catch {
       // Error is handled via status events
     }
@@ -274,6 +296,15 @@ function App() {
         <HelperInstallDialog
           onInstalled={handleHelperInstalled}
           onDeclined={handleHelperDeclined}
+        />
+      )}
+
+      {/* One-time token dialog */}
+      {otpProfile && (
+        <OtpDialog
+          profileName={otpProfile.name}
+          onSubmit={handleOtpConnect}
+          onCancel={() => setOtpProfile(null)}
         />
       )}
     </div>

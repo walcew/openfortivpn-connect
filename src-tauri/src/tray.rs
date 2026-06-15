@@ -212,7 +212,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                         .unwrap_or_default();
                     let mgr_state = app.state::<Mutex<VpnManager>>();
                     let mut mgr = mgr_state.lock().unwrap();
-                    let _ = mgr.connect(&profile_id, app.clone(), settings.debug_mode, settings.dns_fallback);
+                    let _ = mgr.connect(&profile_id, app.clone(), settings.debug_mode, settings.dns_fallback, None);
                     drop(mgr);
                 }
                 // Refresh after lock is released

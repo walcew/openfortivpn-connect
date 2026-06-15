@@ -47,6 +47,7 @@ pub fn connect(
     manager: State<'_, Mutex<VpnManager>>,
     app_handle: tauri::AppHandle,
     profile_id: String,
+    otp: Option<String>,
 ) -> Result<(), String> {
     let settings = SettingsStore::new()
         .and_then(|s| s.get())
@@ -54,7 +55,7 @@ pub fn connect(
 
     let mut mgr = manager.lock().map_err(|e| e.to_string())?;
     mgr.set_selected_profile(&profile_id);
-    mgr.connect(&profile_id, app_handle, settings.debug_mode, settings.dns_fallback)
+    mgr.connect(&profile_id, app_handle, settings.debug_mode, settings.dns_fallback, otp)
 }
 
 #[tauri::command]

@@ -114,4 +114,36 @@ mod tests {
         // Cleanup
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_profiles_without_otp_required_default_to_false() {
+        let dir = env::temp_dir().join(format!("openvpngui-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let profiles_path = dir.join("profiles.json");
+        fs::write(
+            &profiles_path,
+            r#"[
+              {
+                "id": "legacy-profile",
+                "name": "Legacy VPN",
+                "host": "vpn.example.com",
+                "port": 8443,
+                "auth_type": "Password",
+                "username": "user",
+                "realm": null,
+                "trusted_certs": [],
+                "extra_args": []
+              }
+            ]"#,
+        )
+        .unwrap();
+
+        let store = ProfileStore::with_path(profiles_path);
+        let profiles = store.get_all().unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        assert!(!profiles[0].otp_required);
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

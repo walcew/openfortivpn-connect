@@ -75,7 +75,14 @@ impl VpnManager {
         crate::tray::update_tray_icon(app_handle, &self.state);
     }
 
-    pub fn connect(&mut self, profile_id: &str, app_handle: AppHandle, debug_mode: bool, dns_fallback: bool) -> Result<(), String> {
+    pub fn connect(
+        &mut self,
+        profile_id: &str,
+        app_handle: AppHandle,
+        debug_mode: bool,
+        dns_fallback: bool,
+        otp: Option<String>,
+    ) -> Result<(), String> {
         // Validate state
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
@@ -108,6 +115,9 @@ impl VpnManager {
                 if let Ok(Some(password)) = keychain::get_password(&profile.id) {
                     args.push("-p".to_string());
                     args.push(password);
+                }
+                if let Some(otp) = otp.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                    args.push(format!("--otp={}", otp));
                 }
             }
             AuthType::Saml => {

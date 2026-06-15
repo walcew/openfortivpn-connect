@@ -115,7 +115,7 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
                 type="radio"
                 name="auth_type"
                 checked={form.auth_type === "Saml"}
-                onChange={() => setForm({ ...form, auth_type: "Saml" })}
+                onChange={() => setForm({ ...form, auth_type: "Saml", otp_required: false })}
                 className="accent-blue-500"
               />
               <span className="text-sm text-white/70">SAML</span>
@@ -143,6 +143,15 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder={isNew ? "Enter password" : "Leave empty to keep current"}
               />
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.otp_required}
+                onChange={(e) => setForm({ ...form, otp_required: e.target.checked })}
+                className="accent-blue-500"
+              />
+              <span className="text-sm text-white/70">Require token on connect</span>
             </label>
           </>
         )}

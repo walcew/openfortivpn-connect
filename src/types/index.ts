@@ -5,6 +5,7 @@ export interface VpnProfile {
   port: number;
   auth_type: "Password" | "Saml";
   username: string | null;
+  otp_required: boolean;
   realm: string | null;
   trusted_certs: string[];
   extra_args: string[];
@@ -51,6 +52,7 @@ export function newProfile(): VpnProfile {
     port: 8443,
     auth_type: "Password",
     username: null,
+    otp_required: false,
     realm: null,
     trusted_certs: [],
     extra_args: [],
