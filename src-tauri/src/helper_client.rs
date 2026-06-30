@@ -67,11 +67,13 @@ pub fn ping() -> Result<String, String> {
 }
 
 /// Spawn openfortivpn via the helper. Returns the PID.
-pub fn spawn_vpn(args: &[String], log_path: &str) -> Result<u32, String> {
+/// `vpn_server` is the resolved server IP, used for the pre-connect orphan sweep.
+pub fn spawn_vpn(args: &[String], log_path: &str, vpn_server: Option<&str>) -> Result<u32, String> {
     let request = serde_json::json!({
         "cmd": "spawn-vpn",
         "args": args,
         "log_path": log_path,
+        "vpn_server": vpn_server,
     });
     let resp = send_request(&request.to_string())?;
     resp.pid
@@ -79,11 +81,13 @@ pub fn spawn_vpn(args: &[String], log_path: &str) -> Result<u32, String> {
 }
 
 /// Kill openfortivpn and perform full cleanup via the helper.
-pub fn kill_vpn(pid: u32, gateway: Option<&str>) -> Result<(), String> {
+/// `vpn_server` is the resolved server IP whose stale host route must be removed.
+pub fn kill_vpn(pid: u32, gateway: Option<&str>, vpn_server: Option<&str>) -> Result<(), String> {
     let request = serde_json::json!({
         "cmd": "kill-vpn",
         "pid": pid,
         "gateway": gateway,
+        "vpn_server": vpn_server,
     });
     send_request(&request.to_string())?;
     Ok(())

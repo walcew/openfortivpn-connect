@@ -20,6 +20,8 @@ pub struct ProcessManager {
     monitor_handle: Option<JoinHandle<()>>,
     /// Original default gateway saved before connecting, to restore on disconnect
     original_gateway: Option<String>,
+    /// Resolved IP of the VPN server, used to clear its stale host route on cleanup
+    vpn_server_ip: Option<String>,
 }
 
 impl ProcessManager {
@@ -30,6 +32,7 @@ impl ProcessManager {
             stop_flag: Arc::new(AtomicBool::new(false)),
             monitor_handle: None,
             original_gateway: None,
+            vpn_server_ip: None,
         }
     }
 
@@ -41,6 +44,11 @@ impl ProcessManager {
         debug_mode: bool,
         dns_fallback: bool,
     ) -> Result<(), String> {
+        // Resolve the VPN server IP from "host:port" (args[0]) so the helper can
+        // clear any stale host route to it left by a previous session.
+        self.vpn_server_ip = args.first().and_then(|hp| resolve_server_ip(hp));
+        log::info!("Resolved VPN server IP: {:?}", self.vpn_server_ip);
+
         // Capture the current default gateway before connecting
         self.original_gateway = get_default_gateway();
         log::info!(
@@ -64,14 +72,15 @@ impl ProcessManager {
         File::create(&log_path)
             .map_err(|e| format!("Failed to create log file: {}", e))?;
 
-        let pid = match helper_client::spawn_vpn(&args, log_path.to_str().unwrap()) {
+        let server_ip = self.vpn_server_ip.as_deref();
+        let pid = match helper_client::spawn_vpn(&args, log_path.to_str().unwrap(), server_ip) {
             Ok(pid) => {
                 log::info!("Spawned openfortivpn via helper daemon");
                 pid
             }
             Err(e) if helper_client::is_connection_error(&e) => {
                 log::info!("Helper unavailable ({}), falling back to osascript", e);
-                self.spawn_vpn_osascript(&args, &log_path)?
+                self.spawn_vpn_osascript(&args, &log_path, server_ip)?
             }
             Err(e) => return Err(e),
         };
@@ -92,13 +101,28 @@ impl ProcessManager {
     }
 
     /// Fallback: spawn openfortivpn via osascript with admin privileges.
-    fn spawn_vpn_osascript(&self, args: &[String], log_path: &PathBuf) -> Result<u32, String> {
+    fn spawn_vpn_osascript(
+        &self,
+        args: &[String],
+        log_path: &PathBuf,
+        vpn_server: Option<&str>,
+    ) -> Result<u32, String> {
         let quoted_args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
         let ovpn_args = quoted_args.join(" ");
+        // Pre-connect orphan sweep (same admin prompt): kill a zombie pppd and
+        // remove the stale host route to the server before spawning.
+        let host_route_cleanup = match vpn_server {
+            Some(ip) => format!("/sbin/route delete {} 2>/dev/null;", shell_quote(ip)),
+            None => String::new(),
+        };
         let cmd = format!(
-            "/opt/homebrew/bin/openfortivpn {} >> {} 2>&1 & echo $!",
-            ovpn_args,
-            log_path.display()
+            "killall pppd 2>/dev/null; sleep 1; killall -KILL pppd 2>/dev/null; \
+             ifconfig ppp0 down 2>/dev/null; ifconfig ppp1 down 2>/dev/null; \
+             {host_route_cleanup} \
+             /opt/homebrew/bin/openfortivpn {ovpn_args} >> {log} 2>&1 & echo $!",
+            host_route_cleanup = host_route_cleanup,
+            ovpn_args = ovpn_args,
+            log = log_path.display()
         );
 
         let script = format!(
@@ -142,7 +166,11 @@ impl ProcessManager {
                 self.original_gateway
             );
 
-            match helper_client::kill_vpn(pid, self.original_gateway.as_deref()) {
+            match helper_client::kill_vpn(
+                pid,
+                self.original_gateway.as_deref(),
+                self.vpn_server_ip.as_deref(),
+            ) {
                 Ok(()) => {
                     log::info!("Killed openfortivpn via helper daemon");
                 }
@@ -158,6 +186,7 @@ impl ProcessManager {
         }
 
         self.original_gateway = None;
+        self.vpn_server_ip = None;
 
         // Cleanup log file
         if let Some(path) = self.log_file_path.take() {
@@ -179,20 +208,30 @@ impl ProcessManager {
             String::new()
         };
 
+        // Remove the stale /32 host route to the VPN server, if known.
+        let host_route_cleanup = if let Some(ref ip) = self.vpn_server_ip {
+            format!("/sbin/route delete {} 2>/dev/null;", shell_quote(ip))
+        } else {
+            String::new()
+        };
+
         let cmd = format!(
             "kill -INT {pid} 2>/dev/null; \
              sleep 2; \
              kill -0 {pid} 2>/dev/null && kill -9 {pid} 2>/dev/null; \
              killall pppd 2>/dev/null; \
              sleep 1; \
+             killall -KILL pppd 2>/dev/null; \
              ifconfig ppp0 down 2>/dev/null; \
              ifconfig ppp1 down 2>/dev/null; \
+             {host_route_cleanup} \
              {gateway_restore} \
              echo 'remove State:/Network/Service/OpenFortiVPN/DNS' | /usr/sbin/scutil; \
              /usr/bin/dscacheutil -flushcache; \
              /usr/bin/killall -HUP mDNSResponder 2>/dev/null; \
              true",
             pid = pid,
+            host_route_cleanup = host_route_cleanup,
             gateway_restore = gateway_restore,
         );
 
@@ -719,6 +758,27 @@ fn get_default_gateway() -> Option<String> {
     None
 }
 
+/// Resolve the VPN server IP from a `"host:port"` argument (args[0]).
+/// Returns the first IPv4 address, or the host itself if it's already an IPv4
+/// literal. Used to clear the server's stale `/32` host route on cleanup.
+fn resolve_server_ip(host_port: &str) -> Option<String> {
+    // Strip the ":port" suffix (the host may be a bare hostname or IPv4).
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some(host.to_string());
+    }
+
+    use std::net::ToSocketAddrs;
+    (host, 0u16)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| match addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+            std::net::IpAddr::V6(_) => None,
+        })
+}
+
 /// Escape a string for inclusion in an AppleScript double-quoted string.
 /// AppleScript only recognizes `\\` and `\"` as escape sequences.
 /// Shell metacharacters like `$`, `` ` ``, `&` are left as-is because
@@ -732,4 +792,28 @@ fn applescript_escape(s: &str) -> String {
 /// Inside single quotes, the shell interprets nothing — only `'` needs handling.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_server_ip_passes_through_ipv4_literal() {
+        assert_eq!(
+            resolve_server_ip("201.49.152.75:10443"),
+            Some("201.49.152.75".to_string())
+        );
+        // Bare IPv4 without a port also works.
+        assert_eq!(
+            resolve_server_ip("10.0.0.1"),
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_server_ip_rejects_garbage() {
+        // A non-resolvable, non-IP host yields None rather than a bogus route.
+        assert_eq!(resolve_server_ip("not_a_host:10443"), None);
+    }
 }

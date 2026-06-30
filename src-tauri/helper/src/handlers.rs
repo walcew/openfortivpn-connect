@@ -7,8 +7,12 @@ use crate::validation;
 pub fn handle(request: Request) -> Response {
     match request {
         Request::Ping => handle_ping(),
-        Request::SpawnVpn { args, log_path } => handle_spawn_vpn(args, log_path),
-        Request::KillVpn { pid, gateway } => handle_kill_vpn(pid, gateway),
+        Request::SpawnVpn { args, log_path, vpn_server } => {
+            handle_spawn_vpn(args, log_path, vpn_server)
+        }
+        Request::KillVpn { pid, gateway, vpn_server } => {
+            handle_kill_vpn(pid, gateway, vpn_server)
+        }
         Request::SetupDns { servers, suffixes } => handle_setup_dns(servers, suffixes),
         Request::TeardownDns => handle_teardown_dns(),
     }
@@ -18,7 +22,7 @@ fn handle_ping() -> Response {
     Response::with_version(env!("CARGO_PKG_VERSION").to_string())
 }
 
-fn handle_spawn_vpn(args: Vec<String>, log_path: String) -> Response {
+fn handle_spawn_vpn(args: Vec<String>, log_path: String, vpn_server: Option<String>) -> Response {
     // Validate args
     if let Err(e) = validation::validate_vpn_args(&args) {
         return Response::error(e);
@@ -28,6 +32,21 @@ fn handle_spawn_vpn(args: Vec<String>, log_path: String) -> Response {
     if !validation::is_valid_log_path(&log_path) {
         return Response::error(format!("Invalid log path: {}", log_path));
     }
+
+    // Validate VPN server IP if provided
+    if let Some(ref s) = vpn_server {
+        if !validation::is_valid_ipv4(s) {
+            return Response::error(format!("Invalid VPN server: {}", s));
+        }
+    }
+
+    // Pre-connect orphan sweep: a previous session that died during sleep can
+    // leave a zombie pppd, a downed ppp interface and — most importantly — a
+    // stale /32 host route to the server pointing at an old gateway. That route
+    // makes the new connection fail instantly with "Can't assign requested
+    // address". Clear it here (without touching the default route — the OS
+    // reconverges that once the dead ppp interface is gone).
+    cleanup_network(None, vpn_server.as_deref());
 
     // Open log file for appending
     let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
@@ -56,11 +75,18 @@ fn handle_spawn_vpn(args: Vec<String>, log_path: String) -> Response {
     }
 }
 
-fn handle_kill_vpn(pid: u32, gateway: Option<String>) -> Response {
+fn handle_kill_vpn(pid: u32, gateway: Option<String>, vpn_server: Option<String>) -> Response {
     // Validate gateway if provided
     if let Some(ref gw) = gateway {
         if !validation::is_valid_gateway(gw) {
             return Response::error(format!("Invalid gateway: {}", gw));
+        }
+    }
+
+    // Validate VPN server IP if provided
+    if let Some(ref s) = vpn_server {
+        if !validation::is_valid_ipv4(s) {
+            return Response::error(format!("Invalid VPN server: {}", s));
         }
     }
 
@@ -93,32 +119,48 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>) -> Response {
             .output();
     }
 
-    // 3. Kill orphaned pppd
-    let _ = Command::new("killall")
-        .args(["pppd"])
-        .output();
+    // 3. Full network cleanup (pppd, ppp interfaces, host route, default, DNS)
+    cleanup_network(gateway.as_deref(), vpn_server.as_deref());
 
+    log::info!("VPN cleanup complete for PID {}", pid);
+    Response::success()
+}
+
+/// Tear down leftover VPN networking state. Shared by the disconnect path and
+/// the pre-connect orphan sweep.
+///
+/// - Kills any `pppd`: SIGTERM first for a clean exit, then SIGKILL — a `pppd`
+///   whose peer vanished during sleep ignores SIGTERM and only dies on SIGKILL.
+/// - Brings down ppp interfaces.
+/// - Removes the `/32` host route to the VPN server (`vpn_server`), which
+///   otherwise survives a network change and breaks reconnection.
+/// - Restores the original default route when `gateway` is given (disconnect);
+///   skipped on the pre-connect sweep, where the OS reconverges the default.
+/// - Removes the VPN DNS config and flushes the resolver cache.
+fn cleanup_network(gateway: Option<&str>, vpn_server: Option<&str>) {
+    // Kill pppd — escalate to SIGKILL for ones that ignore SIGTERM.
+    let _ = Command::new("killall").args(["pppd"]).output();
     std::thread::sleep(std::time::Duration::from_secs(1));
+    let _ = Command::new("killall").args(["-KILL", "pppd"]).output();
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // 4. Bring down ppp interfaces
-    let _ = Command::new("ifconfig")
-        .args(["ppp0", "down"])
-        .output();
-    let _ = Command::new("ifconfig")
-        .args(["ppp1", "down"])
-        .output();
-
-    // 5. Restore original default route
-    if let Some(ref gw) = gateway {
-        let _ = Command::new("/sbin/route")
-            .args(["delete", "default"])
-            .output();
-        let _ = Command::new("/sbin/route")
-            .args(["add", "default", gw])
-            .output();
+    // Bring down ppp interfaces
+    for iface in ["ppp0", "ppp1", "ppp2"] {
+        let _ = Command::new("ifconfig").args([iface, "down"]).output();
     }
 
-    // 6. Remove VPN DNS config
+    // Remove the stale /32 host route to the VPN server
+    if let Some(server) = vpn_server {
+        let _ = Command::new("/sbin/route").args(["delete", server]).output();
+    }
+
+    // Restore original default route
+    if let Some(gw) = gateway {
+        let _ = Command::new("/sbin/route").args(["delete", "default"]).output();
+        let _ = Command::new("/sbin/route").args(["add", "default", gw]).output();
+    }
+
+    // Remove VPN DNS config
     let _ = Command::new("/usr/sbin/scutil")
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -130,16 +172,13 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>) -> Response {
             child.wait()
         });
 
-    // 7. Flush DNS cache
+    // Flush DNS cache
     let _ = Command::new("/usr/bin/dscacheutil")
         .args(["-flushcache"])
         .output();
     let _ = Command::new("/usr/bin/killall")
         .args(["-HUP", "mDNSResponder"])
         .output();
-
-    log::info!("VPN cleanup complete for PID {}", pid);
-    Response::success()
 }
 
 fn handle_setup_dns(servers: Vec<String>, suffixes: Vec<String>) -> Response {

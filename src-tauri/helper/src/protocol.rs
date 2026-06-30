@@ -10,12 +10,19 @@ pub enum Request {
     SpawnVpn {
         args: Vec<String>,
         log_path: String,
+        /// IP of the VPN server, used to clear a stale /32 host route left by a
+        /// previous session before spawning (pre-connect orphan sweep).
+        #[serde(default)]
+        vpn_server: Option<String>,
     },
 
     #[serde(rename = "kill-vpn")]
     KillVpn {
         pid: u32,
         gateway: Option<String>,
+        /// IP of the VPN server, used to remove its /32 host route on cleanup.
+        #[serde(default)]
+        vpn_server: Option<String>,
     },
 
     #[serde(rename = "setup-dns")]
