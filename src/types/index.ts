@@ -1,3 +1,5 @@
+export type TwoFactorType = "Totp" | "Push";
+
 export interface VpnProfile {
   id: string;
   name: string;
@@ -8,6 +10,8 @@ export interface VpnProfile {
   realm: string | null;
   trusted_certs: string[];
   extra_args: string[];
+  two_factor_enabled: boolean;
+  two_factor_type: TwoFactorType;
 }
 
 export interface ConnectionStatus {
@@ -15,6 +19,8 @@ export interface ConnectionStatus {
     | "Disconnected"
     | "Connecting"
     | "WaitingSaml"
+    | "WaitingOtp"
+    | "WaitingPush"
     | "Connected"
     | "Disconnecting"
     | "Error";
@@ -54,5 +60,7 @@ export function newProfile(): VpnProfile {
     realm: null,
     trusted_certs: [],
     extra_args: [],
+    two_factor_enabled: false,
+    two_factor_type: "Totp",
   };
 }

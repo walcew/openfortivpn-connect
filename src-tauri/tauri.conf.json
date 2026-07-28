@@ -1,12 +1,12 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "OpenFortiVpn Connect",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "identifier": "com.openfortivpn-connect.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run build:helper && npm run dev",
     "beforeBuildCommand": "npm run build"
   },
   "app": {

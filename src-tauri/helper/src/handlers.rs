@@ -1,20 +1,33 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::process::Command;
+use std::io::Write;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use crate::protocol::{Request, Response};
 use crate::validation;
 
+fn stdin_handles() -> &'static Mutex<HashMap<u32, ChildStdin>> {
+    static HANDLES: OnceLock<Mutex<HashMap<u32, ChildStdin>>> = OnceLock::new();
+    HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub fn handle(request: Request) -> Response {
     match request {
         Request::Ping => handle_ping(),
-        Request::SpawnVpn { args, log_path, vpn_server } => {
-            handle_spawn_vpn(args, log_path, vpn_server)
-        }
-        Request::KillVpn { pid, gateway, vpn_server } => {
-            handle_kill_vpn(pid, gateway, vpn_server)
-        }
+        Request::SpawnVpn {
+            args,
+            log_path,
+            vpn_server,
+        } => handle_spawn_vpn(args, log_path, vpn_server),
+        Request::KillVpn {
+            pid,
+            gateway,
+            vpn_server,
+        } => handle_kill_vpn(pid, gateway, vpn_server),
         Request::SetupDns { servers, suffixes } => handle_setup_dns(servers, suffixes),
         Request::TeardownDns => handle_teardown_dns(),
+        Request::WriteStdin { pid, data } => handle_write_stdin(pid, data),
     }
 }
 
@@ -41,10 +54,10 @@ fn handle_spawn_vpn(args: Vec<String>, log_path: String, vpn_server: Option<Stri
     }
 
     // Pre-connect orphan sweep: a previous session that died during sleep can
-    // leave a zombie pppd, a downed ppp interface and — most importantly — a
+    // leave a zombie pppd, a downed ppp interface and (most importantly) a
     // stale /32 host route to the server pointing at an old gateway. That route
     // makes the new connection fail instantly with "Can't assign requested
-    // address". Clear it here (without touching the default route — the OS
+    // address". Clear it here (without touching the default route; the OS
     // reconverges that once the dead ppp interface is gone).
     cleanup_network(None, vpn_server.as_deref());
 
@@ -59,19 +72,83 @@ fn handle_spawn_vpn(args: Vec<String>, log_path: String, vpn_server: Option<Stri
         Err(e) => return Response::error(format!("Failed to clone log file handle: {}", e)),
     };
 
-    // Spawn openfortivpn directly (no shell, no quoting needed)
+    // Spawn openfortivpn with a piped stdin so the app can submit OTP / 2FA codes.
     match Command::new(validation::OPENFORTIVPN_PATH)
         .args(&args)
+        .stdin(Stdio::piped())
         .stdout(log_file)
         .stderr(log_file_stderr)
         .spawn()
     {
-        Ok(child) => {
+        Ok(mut child) => {
             let pid = child.id();
+            if let Some(stdin) = child.stdin.take() {
+                if let Ok(mut map) = stdin_handles().lock() {
+                    map.insert(pid, stdin);
+                }
+            }
+            // Reap the child when it exits and drop its stdin handle.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                if let Ok(mut map) = stdin_handles().lock() {
+                    map.remove(&pid);
+                }
+                log::info!("openfortivpn PID {} exited", pid);
+            });
             log::info!("Spawned openfortivpn with PID {}", pid);
             Response::with_pid(pid)
         }
         Err(e) => Response::error(format!("Failed to spawn openfortivpn: {}", e)),
+    }
+}
+
+fn handle_write_stdin(pid: u32, data: String) -> Response {
+    if !validation::is_openfortivpn_pid(pid) {
+        return Response::error(format!(
+            "PID {} is not an openfortivpn process",
+            pid
+        ));
+    }
+
+    // OTP / token codes are short; reject oversized payloads.
+    if data.len() > 128 {
+        return Response::error("Stdin payload too large".to_string());
+    }
+
+    // Reject control characters other than newline/tab (defense in depth).
+    if data
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+    {
+        return Response::error("Stdin payload contains invalid characters".to_string());
+    }
+
+    let mut map = match stdin_handles().lock() {
+        Ok(m) => m,
+        Err(e) => return Response::error(format!("Failed to lock stdin handles: {}", e)),
+    };
+
+    let stdin = match map.get_mut(&pid) {
+        Some(s) => s,
+        None => {
+            return Response::error(format!(
+                "No stdin handle for PID {} (process may have exited)",
+                pid
+            ))
+        }
+    };
+
+    let mut payload = data;
+    if !payload.ends_with('\n') {
+        payload.push('\n');
+    }
+
+    match stdin.write_all(payload.as_bytes()).and_then(|_| stdin.flush()) {
+        Ok(()) => {
+            log::info!("Wrote {} bytes to openfortivpn PID {} stdin", payload.len(), pid);
+            Response::success()
+        }
+        Err(e) => Response::error(format!("Failed to write to stdin: {}", e)),
     }
 }
 
@@ -99,6 +176,11 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>, vpn_server: Option<String>
     }
 
     log::info!("Killing openfortivpn PID {}", pid);
+
+    // Drop stdin handle early so the process is not blocked on a closed reader later.
+    if let Ok(mut map) = stdin_handles().lock() {
+        map.remove(&pid);
+    }
 
     // 1. SIGINT for clean shutdown
     let _ = Command::new("kill")
@@ -129,7 +211,7 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>, vpn_server: Option<String>
 /// Tear down leftover VPN networking state. Shared by the disconnect path and
 /// the pre-connect orphan sweep.
 ///
-/// - Kills any `pppd`: SIGTERM first for a clean exit, then SIGKILL — a `pppd`
+/// - Kills any `pppd`: SIGTERM first for a clean exit, then SIGKILL. A `pppd`
 ///   whose peer vanished during sleep ignores SIGTERM and only dies on SIGKILL.
 /// - Brings down ppp interfaces.
 /// - Removes the `/32` host route to the VPN server (`vpn_server`), which
@@ -138,7 +220,7 @@ fn handle_kill_vpn(pid: u32, gateway: Option<String>, vpn_server: Option<String>
 ///   skipped on the pre-connect sweep, where the OS reconverges the default.
 /// - Removes the VPN DNS config and flushes the resolver cache.
 fn cleanup_network(gateway: Option<&str>, vpn_server: Option<&str>) {
-    // Kill pppd — escalate to SIGKILL for ones that ignore SIGTERM.
+    // Kill pppd: escalate to SIGKILL for ones that ignore SIGTERM.
     let _ = Command::new("killall").args(["pppd"]).output();
     std::thread::sleep(std::time::Duration::from_secs(1));
     let _ = Command::new("killall").args(["-KILL", "pppd"]).output();

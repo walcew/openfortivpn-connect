@@ -13,7 +13,15 @@ interface Props {
 
 export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
   const isNew = profile === null;
-  const [form, setForm] = useState<VpnProfile>(profile ?? newProfile());
+  const [form, setForm] = useState<VpnProfile>(() => {
+    const base = profile ?? newProfile();
+    return {
+      ...newProfile(),
+      ...base,
+      two_factor_enabled: base.two_factor_enabled ?? false,
+      two_factor_type: base.two_factor_type ?? "Totp",
+    };
+  });
   const [password, setPassword] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -144,6 +152,49 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
                 placeholder={isNew ? "Enter password" : "Leave empty to keep current"}
               />
             </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.two_factor_enabled}
+                onChange={(e) =>
+                  setForm({ ...form, two_factor_enabled: e.target.checked })
+                }
+                className="accent-blue-500"
+              />
+              <span className="text-sm text-white/70">Two-factor authentication (2FA)</span>
+            </label>
+            {form.two_factor_enabled && (
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-white/40">2FA type</span>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="two_factor_type"
+                      checked={form.two_factor_type === "Totp"}
+                      onChange={() => setForm({ ...form, two_factor_type: "Totp" })}
+                      className="accent-blue-500"
+                    />
+                    <span className="text-sm text-white/70">TOTP code</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="two_factor_type"
+                      checked={form.two_factor_type === "Push"}
+                      onChange={() => setForm({ ...form, two_factor_type: "Push" })}
+                      className="accent-blue-500"
+                    />
+                    <span className="text-sm text-white/70">FortiToken push</span>
+                  </label>
+                </div>
+                <p className="text-xs text-white/30">
+                  {form.two_factor_type === "Totp"
+                    ? "The app will ask for a code from your authenticator when required."
+                    : "Approve the notification on your phone when connecting."}
+                </p>
+              </div>
+            )}
           </>
         )}
 

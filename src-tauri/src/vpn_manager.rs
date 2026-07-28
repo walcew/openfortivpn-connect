@@ -1,7 +1,9 @@
 use tauri::{AppHandle, Emitter};
 
 use crate::keychain;
-use crate::models::*;
+use crate::models::{
+    AuthType, ConnectionState, ConnectionStatusPayload, TwoFactorType, VpnProfile,
+};
 use crate::process_manager::ProcessManager;
 use crate::profile_store::ProfileStore;
 
@@ -46,6 +48,12 @@ impl VpnManager {
                 profile_id: payload.profile_id.clone().unwrap_or_default(),
                 url: payload.message.clone().unwrap_or_default(),
             },
+            "WaitingOtp" => ConnectionState::WaitingOtp {
+                profile_id: payload.profile_id.clone().unwrap_or_default(),
+            },
+            "WaitingPush" => ConnectionState::WaitingPush {
+                profile_id: payload.profile_id.clone().unwrap_or_default(),
+            },
             "Connected" => ConnectionState::Connected {
                 profile_id: payload.profile_id.clone().unwrap_or_default(),
                 ip: payload.ip.clone().unwrap_or_else(|| "unknown".into()),
@@ -76,10 +84,20 @@ impl VpnManager {
     }
 
     pub fn connect(&mut self, profile_id: &str, app_handle: AppHandle, debug_mode: bool, dns_fallback: bool) -> Result<(), String> {
-        // Validate state
+        // Validate state. Allow reconnect from mid-connect / disconnecting (e.g. Trust &
+        // Reconnect after a cert failure) by finishing cleanup first.
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
-            _ => return Err("Already connecting or connected".to_string()),
+            ConnectionState::Connected { .. } => {
+                return Err("Already connecting or connected".to_string());
+            }
+            ConnectionState::Connecting { .. }
+            | ConnectionState::WaitingSaml { .. }
+            | ConnectionState::WaitingOtp { .. }
+            | ConnectionState::WaitingPush { .. }
+            | ConnectionState::Disconnecting => {
+                self.finish_disconnect(&app_handle);
+            }
         }
 
         // Look up profile
@@ -87,6 +105,42 @@ impl VpnManager {
             .profile_store
             .get_by_id(profile_id)?
             .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+        let two_factor = if profile.two_factor_enabled && profile.auth_type == AuthType::Password {
+            Some(profile.two_factor_type.clone())
+        } else {
+            None
+        };
+
+        // 2FA needs helper >= 0.1.9 (piped stdin + write-stdin). Refuse older helpers.
+        if two_factor.is_some() {
+            match crate::helper_client::ping() {
+                Ok(version) => {
+                    if !helper_version_supports_otp(&version) {
+                        let msg = format!(
+                            "Two-factor authentication requires helper v0.1.9+ (found v{}). Reinstall the helper from Settings.",
+                            version
+                        );
+                        self.set_state(
+                            ConnectionState::Error { message: msg.clone() },
+                            &app_handle,
+                        );
+                        return Err(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "Two-factor authentication requires the helper daemon. Install it from Settings. ({})",
+                        e
+                    );
+                    self.set_state(
+                        ConnectionState::Error { message: msg.clone() },
+                        &app_handle,
+                    );
+                    return Err(msg);
+                }
+            }
+        }
 
         // Set connecting state
         self.set_state(
@@ -115,6 +169,11 @@ impl VpnManager {
             }
         }
 
+        // Force OTP entry instead of FortiToken Mobile push when TOTP is selected.
+        if matches!(two_factor, Some(TwoFactorType::Totp)) {
+            args.push("--no-ftm-push".to_string());
+        }
+
         for cert in &profile.trusted_certs {
             args.push(format!("--trusted-cert={}", cert));
         }
@@ -123,7 +182,7 @@ impl VpnManager {
             args.push(format!("--realm={}", realm));
         }
 
-        // Disable openfortivpn's DNS handling — we manage DNS via scutil on macOS
+        // Disable openfortivpn's DNS handling: we manage DNS via scutil on macOS
         // because macOS ignores /etc/resolv.conf
         args.push("--set-dns=0".to_string());
         args.push("--pppd-use-peerdns=0".to_string());
@@ -134,15 +193,43 @@ impl VpnManager {
         args.extend(profile.extra_args.clone());
 
         // Spawn the process
-        match self
-            .process_manager
-            .spawn_vpn(args, profile_id.to_string(), app_handle.clone(), debug_mode, dns_fallback)
-        {
+        match self.process_manager.spawn_vpn(
+            args,
+            profile_id.to_string(),
+            app_handle.clone(),
+            debug_mode,
+            dns_fallback,
+            two_factor,
+        ) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
                 Err(e)
             }
+        }
+    }
+
+    /// Submit a one-time password / 2FA token to the running openfortivpn process.
+    pub fn submit_otp(&mut self, code: &str, app_handle: &AppHandle) -> Result<(), String> {
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            return Err("OTP code cannot be empty".to_string());
+        }
+        if trimmed.len() > 128 {
+            return Err("OTP code is too long".to_string());
+        }
+
+        match &self.state {
+            ConnectionState::WaitingOtp { profile_id } => {
+                let profile_id = profile_id.clone();
+                self.process_manager.write_otp(trimmed)?;
+                self.set_state(
+                    ConnectionState::Connecting { profile_id },
+                    app_handle,
+                );
+                Ok(())
+            }
+            _ => Err("Not waiting for an OTP code".to_string()),
         }
     }
 
@@ -192,5 +279,30 @@ impl VpnManager {
         self.profile_store.delete(profile_id)?;
         let _ = keychain::delete_password(profile_id);
         Ok(())
+    }
+}
+
+/// Helper v0.1.9+ keeps openfortivpn stdin open and supports `write-stdin` for OTP.
+fn helper_version_supports_otp(version: &str) -> bool {
+    let mut parts = version
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u32>().ok());
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    (major, minor, patch) >= (0, 1, 9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::helper_version_supports_otp;
+
+    #[test]
+    fn otp_requires_helper_0_1_9() {
+        assert!(!helper_version_supports_otp("0.1.8"));
+        assert!(helper_version_supports_otp("0.1.9"));
+        assert!(helper_version_supports_otp("0.2.0"));
     }
 }

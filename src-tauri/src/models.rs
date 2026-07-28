@@ -13,6 +13,18 @@ impl Default for AuthType {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TwoFactorType {
+    Totp,
+    Push,
+}
+
+impl Default for TwoFactorType {
+    fn default() -> Self {
+        TwoFactorType::Totp
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnProfile {
     pub id: String,
@@ -24,6 +36,10 @@ pub struct VpnProfile {
     pub realm: Option<String>,
     pub trusted_certs: Vec<String>,
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub two_factor_enabled: bool,
+    #[serde(default)]
+    pub two_factor_type: TwoFactorType,
 }
 
 impl Default for VpnProfile {
@@ -38,6 +54,8 @@ impl Default for VpnProfile {
             realm: None,
             trusted_certs: Vec::new(),
             extra_args: Vec::new(),
+            two_factor_enabled: false,
+            two_factor_type: TwoFactorType::default(),
         }
     }
 }
@@ -47,6 +65,8 @@ pub enum ConnectionState {
     Disconnected,
     Connecting { profile_id: String },
     WaitingSaml { profile_id: String, url: String },
+    WaitingOtp { profile_id: String },
+    WaitingPush { profile_id: String },
     Connected {
         profile_id: String,
         ip: String,
@@ -94,6 +114,20 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: Some(url.clone()),
+            },
+            ConnectionState::WaitingOtp { profile_id } => ConnectionStatusPayload {
+                state: "WaitingOtp".into(),
+                profile_id: Some(profile_id.clone()),
+                ip: None,
+                since: None,
+                message: Some("Enter your authentication code".into()),
+            },
+            ConnectionState::WaitingPush { profile_id } => ConnectionStatusPayload {
+                state: "WaitingPush".into(),
+                profile_id: Some(profile_id.clone()),
+                ip: None,
+                since: None,
+                message: Some("Approve the push notification on your phone".into()),
             },
             ConnectionState::Connected {
                 profile_id,

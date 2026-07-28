@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,9 @@ use tauri::async_runtime::JoinHandle;
 
 use crate::dns_manager::{self, DnsInfo};
 use crate::helper_client;
-use crate::models::{BandwidthPayload, ConnectionState, ConnectionStatusPayload, LogLinePayload};
+use crate::models::{
+    BandwidthPayload, ConnectionState, ConnectionStatusPayload, LogLinePayload, TwoFactorType,
+};
 
 pub struct ProcessManager {
     pid: Option<u32>,
@@ -43,6 +45,7 @@ impl ProcessManager {
         app_handle: AppHandle,
         debug_mode: bool,
         dns_fallback: bool,
+        two_factor: Option<TwoFactorType>,
     ) -> Result<(), String> {
         // Resolve the VPN server IP from "host:port" (args[0]) so the helper can
         // clear any stale host route to it left by a previous session.
@@ -73,12 +76,13 @@ impl ProcessManager {
             .map_err(|e| format!("Failed to create log file: {}", e))?;
 
         let server_ip = self.vpn_server_ip.as_deref();
+        let require_helper = two_factor.is_some();
         let pid = match helper_client::spawn_vpn(&args, log_path.to_str().unwrap(), server_ip) {
             Ok(pid) => {
                 log::info!("Spawned openfortivpn via helper daemon");
                 pid
             }
-            Err(e) if helper_client::is_connection_error(&e) => {
+            Err(e) if !require_helper && helper_client::is_connection_error(&e) => {
                 log::info!("Helper unavailable ({}), falling back to osascript", e);
                 self.spawn_vpn_osascript(&args, &log_path, server_ip)?
             }
@@ -93,11 +97,29 @@ impl ProcessManager {
 
         let stop_flag = self.stop_flag.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode, fallback_dns).await;
+            start_log_monitor(
+                log_path,
+                profile_id,
+                pid,
+                app_handle,
+                stop_flag,
+                debug_mode,
+                fallback_dns,
+                two_factor,
+            )
+            .await;
         });
         self.monitor_handle = Some(handle);
 
         Ok(())
+    }
+
+    /// Write an OTP / 2FA code to the running openfortivpn stdin via the helper.
+    pub fn write_otp(&self, code: &str) -> Result<(), String> {
+        let pid = self
+            .pid
+            .ok_or_else(|| "No VPN process running".to_string())?;
+        helper_client::write_stdin(pid, code)
     }
 
     /// Fallback: spawn openfortivpn via osascript with admin privileges.
@@ -255,24 +277,24 @@ impl ProcessManager {
 
         Ok(())
     }
-
-    pub fn is_running(&self) -> bool {
-        self.pid.is_some()
-    }
 }
 
 async fn start_log_monitor(
     log_path: PathBuf,
     profile_id: String,
+    pid: u32,
     app_handle: AppHandle,
     stop_flag: Arc<AtomicBool>,
     debug_mode: bool,
     fallback_dns: Vec<String>,
+    two_factor: Option<TwoFactorType>,
 ) {
+    use std::io::Read;
+
     // Wait a moment for the log file to start receiving data
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let file = match OpenOptions::new().read(true).open(&log_path) {
+    let mut file = match OpenOptions::new().read(true).open(&log_path) {
         Ok(f) => f,
         Err(e) => {
             log::error!("Failed to open log file for monitoring: {}", e);
@@ -280,204 +302,440 @@ async fn start_log_monitor(
         }
     };
 
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut pending = Vec::<u8>::new();
     let mut dns_servers: Vec<String> = Vec::new();
     let mut dns_suffixes: Vec<String> = Vec::new();
     let mut vpn_local_ip: Option<String> = None;
+    let mut otp_prompted = false;
+    let mut push_signaled = false;
+    let mut cert_warned = false;
+    let mut reached_terminal = false;
+    let mut last_error: Option<String> = None;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        line.clear();
-        match reader.read_line(&mut line) {
+        let mut chunk = [0u8; 512];
+        match file.read(&mut chunk) {
             Ok(0) => {
-                // No new data, wait and retry
+                // If openfortivpn exited without reaching Connected/Disconnected,
+                // drain any late log lines once, then surface an error.
+                // While waiting for OTP/Push, keep listening: the process is alive
+                // and blocked on stdin.
+                if !reached_terminal && !otp_prompted && !push_signaled && !is_process_alive(pid)
+                {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    let mut drain = [0u8; 4096];
+                    if let Ok(n) = file.read(&mut drain) {
+                        if n > 0 {
+                            pending.extend_from_slice(&drain[..n]);
+                            continue;
+                        }
+                    }
+                    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        handle_log_line(
+                            trimmed,
+                            &profile_id,
+                            &app_handle,
+                            debug_mode,
+                            &mut dns_servers,
+                            &mut dns_suffixes,
+                            &mut vpn_local_ip,
+                            &fallback_dns,
+                            &stop_flag,
+                            two_factor.as_ref(),
+                            &mut otp_prompted,
+                            &mut push_signaled,
+                            &mut cert_warned,
+                            &mut reached_terminal,
+                            &mut last_error,
+                        );
+                    }
+                    if reached_terminal || otp_prompted || push_signaled {
+                        if reached_terminal {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    let message = last_error.unwrap_or_else(|| {
+                        "VPN process exited before the tunnel came up".into()
+                    });
+                    emit_connection_error(&app_handle, &message);
+                    break;
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 continue;
             }
-            Ok(_) => {
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
+            Ok(n) => {
+                pending.extend_from_slice(&chunk[..n]);
 
-                // Determine log level
-                let level = if trimmed.contains("ERROR") || trimmed.contains("error") {
-                    "error"
-                } else if trimmed.contains("WARN") || trimmed.contains("warn") {
-                    "warn"
-                } else {
-                    "info"
-                };
-
-                // Check if this is an important line that should always be shown
-                let is_important = level != "info"
-                    || trimmed.contains("Tunnel is up")
-                    || trimmed.contains("Tunnel is down")
-                    || trimmed.contains("Connected to")
-                    || trimmed.contains("saml")
-                    || trimmed.contains("SAML")
-                    || trimmed.contains("certificate")
-                    || trimmed.contains("Authenticated")
-                    || trimmed.contains("Disconnecting");
-
-                // Only emit verbose info lines when debug mode is enabled
-                if debug_mode || is_important {
-                    let _ = app_handle.emit(
-                        "log-line",
-                        LogLinePayload {
-                            timestamp: Utc::now().to_rfc3339(),
-                            level: level.to_string(),
-                            message: trimmed.clone(),
-                        },
-                    );
-                }
-
-                // Collect DNS info from log lines before tunnel comes up
-                if let Some(dns_info) = dns_manager::parse_dns_from_log(&trimmed) {
-                    match dns_info {
-                        DnsInfo::Server(s) => {
-                            if !dns_servers.contains(&s) {
-                                dns_servers.push(s);
-                            }
-                        }
-                        DnsInfo::SearchDomains(ds) => {
-                            for d in ds {
-                                if !dns_suffixes.contains(&d) {
-                                    dns_suffixes.push(d);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Capture VPN local IP from earlier log lines
-                if vpn_local_ip.is_none() {
-                    if let Some(ip) = extract_vpn_ip_from_log(&trimmed) {
-                        log::info!("Captured VPN local IP from log: {}", ip);
-                        vpn_local_ip = Some(ip);
-                    }
-                }
-
-                // Detect state changes
-                if trimmed.contains("Tunnel is up and running") {
-                    // Build final DNS server list. Fallback (DHCP + Google) is only
-                    // used when the VPN itself did not provide any DNS servers —
-                    // otherwise mixing public resolvers with the VPN's split-DNS
-                    // causes public IPs to be cached for internal hostnames, which
-                    // the VPN's firewall then blocks (hairpin/split-DNS enforcement).
-                    let mut all_dns = dns_servers.clone();
-                    if all_dns.is_empty() && !fallback_dns.is_empty() {
-                        for s in &fallback_dns {
-                            if !all_dns.contains(s) {
-                                all_dns.push(s.clone());
-                            }
-                        }
-                        for google in &["8.8.8.8", "8.8.4.4"] {
-                            let g = google.to_string();
-                            if !all_dns.contains(&g) {
-                                all_dns.push(g);
-                            }
-                        }
-                        log::info!("DNS with fallback (VPN provided none): {:?}", all_dns);
+                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
                     }
 
-                    // Configure macOS DNS via scutil
-                    if !all_dns.is_empty() {
-                        if let Err(e) = dns_manager::setup_dns(&all_dns, &dns_suffixes) {
-                            log::error!("Failed to setup DNS: {}", e);
-                        }
-                    }
-
-                    let ip = vpn_local_ip
-                        .clone()
-                        .or_else(|| extract_ip(&trimmed))
-                        .or_else(get_ppp_interface_ip)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    crate::tray::update_tray_icon(
+                    handle_log_line(
+                        trimmed,
+                        &profile_id,
                         &app_handle,
-                        &ConnectionState::Connected {
-                            profile_id: profile_id.clone(),
-                            ip: ip.clone(),
-                            since: Utc::now(),
-                        },
+                        debug_mode,
+                        &mut dns_servers,
+                        &mut dns_suffixes,
+                        &mut vpn_local_ip,
+                        &fallback_dns,
+                        &stop_flag,
+                        two_factor.as_ref(),
+                        &mut otp_prompted,
+                        &mut push_signaled,
+                        &mut cert_warned,
+                        &mut reached_terminal,
+                        &mut last_error,
                     );
-                    // Capture IP for bandwidth monitor before moving into payload
-                    let bw_ip = ip.clone();
-
-                    let _ = app_handle.emit(
-                        "connection-status-changed",
-                        ConnectionStatusPayload {
-                            state: "Connected".into(),
-                            profile_id: Some(profile_id.clone()),
-                            ip: Some(ip),
-                            since: Some(Utc::now().to_rfc3339()),
-                            message: None,
-                        },
-                    );
-
-                    // Start bandwidth monitoring
-                    let bw_app_handle = app_handle.clone();
-                    let bw_stop_flag = stop_flag.clone();
-                    tauri::async_runtime::spawn(async move {
-                        start_bandwidth_monitor(bw_app_handle, bw_stop_flag, bw_ip).await;
-                    });
-                } else if trimmed.contains("Tunnel is down") {
-                    crate::tray::update_tray_icon(&app_handle, &ConnectionState::Disconnected);
-                    let _ = app_handle.emit(
-                        "connection-status-changed",
-                        ConnectionStatusPayload {
-                            state: "Disconnected".into(),
-                            profile_id: None,
-                            ip: None,
-                            since: None,
-                            message: None,
-                        },
-                    );
-                    break;
-                } else if trimmed.contains("/remote/saml/start") || trimmed.contains("http") && trimmed.contains("saml") {
-                    if let Some(url) = extract_url(&trimmed) {
-                        crate::tray::update_tray_icon(
-                            &app_handle,
-                            &ConnectionState::WaitingSaml {
-                                profile_id: profile_id.clone(),
-                                url: url.clone(),
-                            },
-                        );
-                        let _ = app_handle.emit(
-                            "saml-url",
-                            serde_json::json!({ "url": url }),
-                        );
-                        let _ = app_handle.emit(
-                            "connection-status-changed",
-                            ConnectionStatusPayload {
-                                state: "WaitingSaml".into(),
-                                profile_id: Some(profile_id.clone()),
-                                ip: None,
-                                since: None,
-                                message: Some(url),
-                            },
-                        );
-                    }
-                } else if trimmed.contains("certificate") && trimmed.contains("digest") {
-                    // Try to extract cert digest for trusted cert flow
-                    if let Some(digest) = extract_cert_digest(&trimmed) {
-                        let _ = app_handle.emit(
-                            "cert-warning",
-                            serde_json::json!({
-                                "digest": digest,
-                                "profile_id": profile_id.clone()
-                            }),
-                        );
-                    }
                 }
+
             }
             Err(e) => {
                 log::error!("Error reading log file: {}", e);
-                // Try to recover by seeking to current position
-                let _ = reader.get_mut().seek(SeekFrom::Current(0));
+                let _ = file.seek(SeekFrom::Current(0));
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
         }
+    }
+}
+
+fn handle_log_line(
+    trimmed: &str,
+    profile_id: &str,
+    app_handle: &AppHandle,
+    debug_mode: bool,
+    dns_servers: &mut Vec<String>,
+    dns_suffixes: &mut Vec<String>,
+    vpn_local_ip: &mut Option<String>,
+    fallback_dns: &[String],
+    stop_flag: &Arc<AtomicBool>,
+    two_factor: Option<&TwoFactorType>,
+    otp_prompted: &mut bool,
+    push_signaled: &mut bool,
+    cert_warned: &mut bool,
+    reached_terminal: &mut bool,
+    last_error: &mut Option<String>,
+) {
+    let level = if trimmed.contains("ERROR") || trimmed.contains("error") {
+        "error"
+    } else if trimmed.contains("WARN") || trimmed.contains("warn") {
+        "warn"
+    } else {
+        "info"
+    };
+
+    if level == "error" {
+        // Prefer actionable lines (trusted-cert / validation) over indented cert details.
+        if trimmed.contains("trusted-cert")
+            || trimmed.contains("certificate validation failed")
+            || trimmed.contains("ERROR:")
+        {
+            let cleaned = trimmed
+                .trim_start_matches("ERROR:")
+                .trim()
+                .to_string();
+            if !cleaned.is_empty()
+                && !cleaned.starts_with("subject:")
+                && !cleaned.starts_with("issuer:")
+                && !cleaned.starts_with("C=")
+                && !cleaned.starts_with("ST=")
+                && !cleaned.starts_with("O=")
+                && !cleaned.starts_with("CN=")
+                && !cleaned.starts_with("L=")
+                && !cleaned.starts_with("sha256")
+            {
+                *last_error = Some(cleaned);
+            }
+        }
+    }
+
+    let is_important = level != "info"
+        || trimmed.contains("Tunnel is up")
+        || trimmed.contains("Tunnel is down")
+        || trimmed.contains("Connected to")
+        || trimmed.contains("saml")
+        || trimmed.contains("SAML")
+        || trimmed.contains("certificate")
+        || trimmed.contains("Authenticated")
+        || trimmed.contains("Disconnecting")
+        || trimmed.contains("Connected to gateway");
+
+    if debug_mode || is_important {
+        let _ = app_handle.emit(
+            "log-line",
+            LogLinePayload {
+                timestamp: Utc::now().to_rfc3339(),
+                level: level.to_string(),
+                message: trimmed.to_string(),
+            },
+        );
+    }
+
+    if let Some(dns_info) = dns_manager::parse_dns_from_log(trimmed) {
+        match dns_info {
+            DnsInfo::Server(s) => {
+                if !dns_servers.contains(&s) {
+                    dns_servers.push(s);
+                }
+            }
+            DnsInfo::SearchDomains(ds) => {
+                for d in ds {
+                    if !dns_suffixes.contains(&d) {
+                        dns_suffixes.push(d);
+                    }
+                }
+            }
+        }
+    }
+
+    if vpn_local_ip.is_none() {
+        if let Some(ip) = extract_vpn_ip_from_log(trimmed) {
+            log::info!("Captured VPN local IP from log: {}", ip);
+            *vpn_local_ip = Some(ip);
+        }
+    }
+
+    if trimmed.contains("Tunnel is up and running") {
+        // Build final DNS server list. Fallback (DHCP + Google) is only
+        // used when the VPN itself did not provide any DNS servers;
+        // otherwise mixing public resolvers with the VPN's split-DNS
+        // causes public IPs to be cached for internal hostnames, which
+        // the VPN's firewall then blocks (hairpin/split-DNS enforcement).
+        let mut all_dns = dns_servers.clone();
+        if all_dns.is_empty() && !fallback_dns.is_empty() {
+            for s in fallback_dns {
+                if !all_dns.contains(s) {
+                    all_dns.push(s.clone());
+                }
+            }
+            for google in &["8.8.8.8", "8.8.4.4"] {
+                let g = google.to_string();
+                if !all_dns.contains(&g) {
+                    all_dns.push(g);
+                }
+            }
+            log::info!("DNS with fallback (VPN provided none): {:?}", all_dns);
+        }
+
+        if !all_dns.is_empty() {
+            if let Err(e) = dns_manager::setup_dns(&all_dns, dns_suffixes) {
+                log::error!("Failed to setup DNS: {}", e);
+            }
+        }
+
+        let ip = vpn_local_ip
+            .clone()
+            .or_else(|| extract_ip(trimmed))
+            .or_else(get_ppp_interface_ip)
+            .unwrap_or_else(|| "unknown".to_string());
+        crate::tray::update_tray_icon(
+            app_handle,
+            &ConnectionState::Connected {
+                profile_id: profile_id.to_string(),
+                ip: ip.clone(),
+                since: Utc::now(),
+            },
+        );
+        let bw_ip = ip.clone();
+
+        *reached_terminal = true;
+        let _ = app_handle.emit(
+            "connection-status-changed",
+            ConnectionStatusPayload {
+                state: "Connected".into(),
+                profile_id: Some(profile_id.to_string()),
+                ip: Some(ip),
+                since: Some(Utc::now().to_rfc3339()),
+                message: None,
+            },
+        );
+
+        let bw_app_handle = app_handle.clone();
+        let bw_stop_flag = stop_flag.clone();
+        tauri::async_runtime::spawn(async move {
+            start_bandwidth_monitor(bw_app_handle, bw_stop_flag, bw_ip).await;
+        });
+    } else if trimmed.contains("Tunnel is down") {
+        *reached_terminal = true;
+        crate::tray::update_tray_icon(app_handle, &ConnectionState::Disconnected);
+        let _ = app_handle.emit(
+            "connection-status-changed",
+            ConnectionStatusPayload {
+                state: "Disconnected".into(),
+                profile_id: None,
+                ip: None,
+                since: None,
+                message: None,
+            },
+        );
+        stop_flag.store(true, Ordering::Relaxed);
+    } else if trimmed.contains("/remote/saml/start")
+        || (trimmed.contains("http") && trimmed.contains("saml"))
+    {
+        if let Some(url) = extract_url(trimmed) {
+            crate::tray::update_tray_icon(
+                app_handle,
+                &ConnectionState::WaitingSaml {
+                    profile_id: profile_id.to_string(),
+                    url: url.clone(),
+                },
+            );
+            let _ = app_handle.emit("saml-url", serde_json::json!({ "url": url }));
+            let _ = app_handle.emit(
+                "connection-status-changed",
+                ConnectionStatusPayload {
+                    state: "WaitingSaml".into(),
+                    profile_id: Some(profile_id.to_string()),
+                    ip: None,
+                    since: None,
+                    message: Some(url),
+                },
+            );
+        }
+    } else if !*cert_warned {
+        if let Some(digest) = extract_trusted_cert_hint(trimmed) {
+            *cert_warned = true;
+            let _ = app_handle.emit(
+                "cert-warning",
+                serde_json::json!({
+                    "digest": digest,
+                    "profile_id": profile_id
+                }),
+            );
+            focus_main_window(app_handle);
+        }
+    }
+
+    // After gateway login, OTP/push is next. Driven by profile 2FA setting, not
+    // by matching FortiGate prompt wording.
+    if trimmed.contains("Connected to gateway") {
+        match two_factor {
+            Some(TwoFactorType::Totp) if !*otp_prompted => {
+                *otp_prompted = true;
+                emit_waiting_otp(app_handle, profile_id);
+            }
+            Some(TwoFactorType::Push) if !*push_signaled => {
+                *push_signaled = true;
+                emit_waiting_push(app_handle, profile_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    // Use `ps` instead of `kill -0`: openfortivpn runs as root via the helper, and
+    // an unprivileged `kill -0` returns EPERM even when the process is alive.
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .map(|o| {
+            o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+        })
+        .unwrap_or(false)
+}
+
+fn emit_connection_error(app_handle: &AppHandle, message: &str) {
+    log::error!("VPN connection failed: {}", message);
+    crate::tray::update_tray_icon(
+        app_handle,
+        &ConnectionState::Error {
+            message: message.to_string(),
+        },
+    );
+    let _ = app_handle.emit(
+        "connection-status-changed",
+        ConnectionStatusPayload {
+            state: "Error".into(),
+            profile_id: None,
+            ip: None,
+            since: None,
+            message: Some(message.to_string()),
+        },
+    );
+    focus_main_window(app_handle);
+}
+
+/// Extract a trusted-cert digest from openfortivpn error output.
+/// Handles both `--trusted-cert <hex>` lines and bare 64-char hex digest lines.
+fn extract_trusted_cert_hint(line: &str) -> Option<String> {
+    if let Some(idx) = line.find("--trusted-cert") {
+        return extract_cert_digest(&line[idx..]);
+    }
+    if line.contains("trusted-cert") {
+        if let Some(digest) = extract_cert_digest(line) {
+            return Some(digest);
+        }
+    }
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix("ERROR:").unwrap_or(trimmed).trim();
+    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn emit_waiting_otp(app_handle: &AppHandle, profile_id: &str) {
+    log::info!("Detected OTP / 2FA prompt for profile {}", profile_id);
+    crate::tray::update_tray_icon(
+        app_handle,
+        &ConnectionState::WaitingOtp {
+            profile_id: profile_id.to_string(),
+        },
+    );
+    let _ = app_handle.emit(
+        "connection-status-changed",
+        ConnectionStatusPayload {
+            state: "WaitingOtp".into(),
+            profile_id: Some(profile_id.to_string()),
+            ip: None,
+            since: None,
+            message: Some("Enter your authentication code".into()),
+        },
+    );
+    let _ = app_handle.emit("otp-required", serde_json::json!({ "profile_id": profile_id }));
+    focus_main_window(app_handle);
+}
+
+fn emit_waiting_push(app_handle: &AppHandle, profile_id: &str) {
+    log::info!("Detected FTM push wait for profile {}", profile_id);
+    crate::tray::update_tray_icon(
+        app_handle,
+        &ConnectionState::WaitingPush {
+            profile_id: profile_id.to_string(),
+        },
+    );
+    let _ = app_handle.emit(
+        "connection-status-changed",
+        ConnectionStatusPayload {
+            state: "WaitingPush".into(),
+            profile_id: Some(profile_id.to_string()),
+            ip: None,
+            since: None,
+            message: Some("Approve the push notification on your phone".into()),
+        },
+    );
+    focus_main_window(app_handle);
+}
+
+fn focus_main_window(app_handle: &AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.unminimize();
     }
 }
 
@@ -816,4 +1074,5 @@ mod tests {
         // A non-resolvable, non-IP host yields None rather than a bogus route.
         assert_eq!(resolve_server_ip("not_a_host:10443"), None);
     }
+
 }

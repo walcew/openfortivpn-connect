@@ -109,3 +109,14 @@ pub fn teardown_dns() -> Result<(), String> {
     send_request(r#"{"cmd":"teardown-dns"}"#)?;
     Ok(())
 }
+
+/// Write data (e.g. an OTP code) to the stdin of a running openfortivpn process.
+pub fn write_stdin(pid: u32, data: &str) -> Result<(), String> {
+    let request = serde_json::json!({
+        "cmd": "write-stdin",
+        "pid": pid,
+        "data": data,
+    });
+    send_request(&request.to_string())?;
+    Ok(())
+}

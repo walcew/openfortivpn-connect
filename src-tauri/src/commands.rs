@@ -87,6 +87,16 @@ pub fn get_status(
 }
 
 #[tauri::command]
+pub fn submit_otp(
+    manager: State<'_, Mutex<VpnManager>>,
+    app_handle: tauri::AppHandle,
+    code: String,
+) -> Result<(), String> {
+    let mut mgr = manager.lock().map_err(|e| e.to_string())?;
+    mgr.submit_otp(&code, &app_handle)
+}
+
+#[tauri::command]
 pub fn get_settings() -> Result<AppSettings, String> {
     let store = SettingsStore::new()?;
     store.get()

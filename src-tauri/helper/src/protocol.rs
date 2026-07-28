@@ -34,6 +34,13 @@ pub enum Request {
 
     #[serde(rename = "teardown-dns")]
     TeardownDns,
+
+    /// Write a line to the stdin of a running openfortivpn process (OTP / 2FA).
+    #[serde(rename = "write-stdin")]
+    WriteStdin {
+        pid: u32,
+        data: String,
+    },
 }
 
 #[derive(Debug, Serialize)]

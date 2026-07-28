@@ -29,6 +29,7 @@ pub fn run() {
             commands::delete_profile,
             commands::connect,
             commands::disconnect,
+            commands::submit_otp,
             commands::get_status,
             commands::get_settings,
             commands::save_settings,

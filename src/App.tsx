@@ -10,17 +10,31 @@ import { ProfileList } from "./components/ProfileList";
 import { ProfileEditor } from "./components/ProfileEditor";
 import { LogViewer } from "./components/LogViewer";
 import { CertDialog } from "./components/CertDialog";
+import { OtpDialog } from "./components/OtpDialog";
 import { Settings } from "./components/Settings";
 import { About } from "./components/About";
 import { HelperInstallDialog } from "./components/HelperInstallDialog";
-import type { VpnProfile, CertWarningPayload } from "./types";
+import type {
+  VpnProfile,
+  CertWarningPayload,
+  ConnectionStatus as ConnectionStatusPayload,
+} from "./types";
+
+async function waitUntilIdle(timeoutMs = 8000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const status = await invoke<ConnectionStatusPayload>("get_status");
+    if (status.state === "Disconnected" || status.state === "Error") return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
 
 type EditingState = null | "new" | VpnProfile;
 type AppView = "main" | "settings" | "about";
 
 function App() {
   const { profiles, saveProfile, deleteProfile, refetch } = useProfiles();
-  const { status, logs, bandwidth, connect, disconnect, clearLogs } = useVpnConnection();
+  const { status, logs, bandwidth, connect, disconnect, submitOtp, clearLogs } = useVpnConnection();
   const appVersion = useAppVersion();
 
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
@@ -77,26 +91,46 @@ function App() {
   const handleAcceptCert = async () => {
     if (!certWarning) return;
     const profile = profiles.find((p) => p.id === certWarning.profile_id);
-    if (profile) {
-      const updated = {
-        ...profile,
-        trusted_certs: [...profile.trusted_certs, certWarning.digest],
-      };
+    if (!profile) return;
+
+    const digest = certWarning.digest;
+    const trusted = profile.trusted_certs.includes(digest)
+      ? profile.trusted_certs
+      : [...profile.trusted_certs, digest];
+    const updated = { ...profile, trusted_certs: trusted };
+
+    try {
       await invoke("save_profile", { profile: updated, password: null });
       await refetch();
       setCertWarning(null);
-      // Reconnect with the trusted cert
+
       try {
         await disconnect();
-        await connect(profile.id);
       } catch {
-        // handled by status events
+        // already dead / disconnecting
       }
+      // disconnect returns before cleanup finishes; wait so connect does not race
+      await waitUntilIdle();
+      await connect(updated.id);
+    } catch (e) {
+      console.error("Trust & reconnect failed:", e);
     }
   };
 
   const handleRejectCert = async () => {
     setCertWarning(null);
+    try {
+      await disconnect();
+    } catch {
+      // handled by status events
+    }
+  };
+
+  const handleSubmitOtp = async (code: string) => {
+    await submitOtp(code);
+  };
+
+  const handleCancelOtp = async () => {
     try {
       await disconnect();
     } catch {
@@ -267,6 +301,11 @@ function App() {
           onAccept={handleAcceptCert}
           onReject={handleRejectCert}
         />
+      )}
+
+      {/* OTP / 2FA dialog */}
+      {status.state === "WaitingOtp" && (
+        <OtpDialog onSubmit={handleSubmitOtp} onCancel={handleCancelOtp} />
       )}
 
       {/* Helper install dialog */}

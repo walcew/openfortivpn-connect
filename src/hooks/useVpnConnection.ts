@@ -93,10 +93,19 @@ export function useVpnConnection() {
     }
   }, []);
 
+  const submitOtp = useCallback(async (code: string) => {
+    try {
+      await invoke("submit_otp", { code });
+    } catch (e) {
+      console.error("Submit OTP failed:", e);
+      throw e;
+    }
+  }, []);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
   }, []);
 
-  return { status, logs, bandwidth, connect, disconnect, clearLogs };
+  return { status, logs, bandwidth, connect, disconnect, submitOtp, clearLogs };
 }

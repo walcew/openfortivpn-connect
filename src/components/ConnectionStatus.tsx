@@ -18,6 +18,8 @@ const STATUS_CONFIG: Record<
   Disconnected: { color: "bg-gray-400", bg: "bg-black/40 border border-white/10", label: "Disconnected" },
   Connecting: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Connecting..." },
   WaitingSaml: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for SAML login..." },
+  WaitingOtp: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for 2FA code..." },
+  WaitingPush: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for push approval..." },
   Connected: { color: "bg-green-400", bg: "bg-black/40 border border-green-500/20", label: "Connected" },
   Disconnecting: { color: "bg-orange-400", bg: "bg-black/40 border border-orange-500/20", label: "Disconnecting..." },
   Error: { color: "bg-red-400", bg: "bg-black/40 border border-red-500/20", label: "Error" },
@@ -54,7 +56,12 @@ export function ConnectionStatus({
   }, [status.state, status.since]);
 
   const isConnected = status.state === "Connected";
-  const isBusy = status.state === "Connecting" || status.state === "WaitingSaml" || status.state === "Disconnecting";
+  const isBusy =
+    status.state === "Connecting"
+    || status.state === "WaitingSaml"
+    || status.state === "WaitingOtp"
+    || status.state === "WaitingPush"
+    || status.state === "Disconnecting";
 
   return (
     <div className={`rounded-xl p-4 ${config.bg}`}>
@@ -75,6 +82,12 @@ export function ConnectionStatus({
       {status.state === "Error" && status.message && (
         <div className="text-sm text-red-400 mb-2 ml-5 break-words">
           {status.message}
+        </div>
+      )}
+
+      {status.state === "WaitingPush" && (
+        <div className="text-sm text-white/50 mb-2 ml-5">
+          Approve the notification on your phone to continue.
         </div>
       )}
 

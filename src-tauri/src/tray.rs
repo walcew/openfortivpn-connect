@@ -108,6 +108,8 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
         state,
         ConnectionState::Connecting { .. }
             | ConnectionState::WaitingSaml { .. }
+            | ConnectionState::WaitingOtp { .. }
+            | ConnectionState::WaitingPush { .. }
             | ConnectionState::Disconnecting
     );
 
@@ -118,6 +120,8 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
         ConnectionState::Disconnected => "Disconnected".to_string(),
         ConnectionState::Connecting { .. } => "Connecting...".to_string(),
         ConnectionState::WaitingSaml { .. } => "Waiting SAML...".to_string(),
+        ConnectionState::WaitingOtp { .. } => "Waiting for OTP...".to_string(),
+        ConnectionState::WaitingPush { .. } => "Waiting for push...".to_string(),
         ConnectionState::Connected { ip, .. } => format!("Connected ({})", ip),
         ConnectionState::Disconnecting => "Disconnecting...".to_string(),
         ConnectionState::Error { message } => format!("Error: {}", truncate(message, 30)),
