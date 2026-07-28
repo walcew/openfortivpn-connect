@@ -30,6 +30,7 @@ pub fn run() {
             commands::connect,
             commands::disconnect,
             commands::submit_otp,
+            commands::trust_cert_and_reconnect,
             commands::get_status,
             commands::get_settings,
             commands::save_settings,

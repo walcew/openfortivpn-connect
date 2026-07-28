@@ -257,6 +257,45 @@ impl VpnManager {
         Ok(())
     }
 
+    /// Persist a trusted certificate digest and reconnect the given profile.
+    /// Cleanup is synchronous so Trust & Reconnect cannot race with async disconnect.
+    pub fn trust_cert_and_reconnect(
+        &mut self,
+        profile_id: &str,
+        digest: &str,
+        app_handle: AppHandle,
+        debug_mode: bool,
+        dns_fallback: bool,
+    ) -> Result<(), String> {
+        let digest = digest.trim();
+        if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Invalid certificate digest".to_string());
+        }
+
+        let mut profile = self
+            .profile_store
+            .get_by_id(profile_id)?
+            .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+
+        if !profile.trusted_certs.iter().any(|c| c == digest) {
+            profile.trusted_certs.push(digest.to_string());
+            self.profile_store.upsert(profile)?;
+        }
+
+        self.set_selected_profile(profile_id);
+
+        // Always tear down any leftover session before reconnecting.
+        if !matches!(
+            self.state,
+            ConnectionState::Disconnected | ConnectionState::Error { .. }
+        ) {
+            self.begin_disconnect(&app_handle);
+        }
+        self.finish_disconnect(&app_handle);
+
+        self.connect(profile_id, app_handle, debug_mode, dns_fallback)
+    }
+
     pub fn get_profiles(&self) -> Result<Vec<VpnProfile>, String> {
         self.profile_store.get_all()
     }

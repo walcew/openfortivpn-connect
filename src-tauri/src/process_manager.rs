@@ -316,12 +316,10 @@ async fn start_log_monitor(
         let mut chunk = [0u8; 512];
         match file.read(&mut chunk) {
             Ok(0) => {
-                // If openfortivpn exited without reaching Connected/Disconnected,
-                // drain any late log lines once, then surface an error.
-                // While waiting for OTP/Push, keep listening: the process is alive
-                // and blocked on stdin.
-                if !reached_terminal && !otp_prompted && !push_signaled && !is_process_alive(pid)
-                {
+                // If openfortivpn exited without reaching Connected, drain late
+                // lines then surface an error. Keep polling while OTP/Push is
+                // pending AND the process is still alive.
+                if !reached_terminal && !is_process_alive(pid) {
                     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
                     let mut drain = [0u8; 4096];
                     if let Ok(n) = file.read(&mut drain) {
@@ -355,15 +353,18 @@ async fn start_log_monitor(
                             &mut last_error,
                         );
                     }
-                    if reached_terminal || otp_prompted || push_signaled {
-                        if reached_terminal {
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        continue;
+                    if reached_terminal {
+                        break;
                     }
                     let message = last_error.unwrap_or_else(|| {
-                        "VPN process exited before the tunnel came up".into()
+                        if otp_prompted {
+                            "Authentication failed after OTP. Check the code and try again."
+                                .into()
+                        } else if push_signaled {
+                            "Push authentication failed or was denied.".into()
+                        } else {
+                            "VPN process exited before the tunnel came up".into()
+                        }
                     });
                     emit_connection_error(&app_handle, &message);
                     break;
@@ -446,7 +447,11 @@ fn handle_log_line(
                 .trim_start_matches("ERROR:")
                 .trim()
                 .to_string();
+            let is_bare_digest = cleaned.len() == 64
+                && cleaned.chars().all(|c| c.is_ascii_hexdigit());
             if !cleaned.is_empty()
+                && !is_bare_digest
+                && !cleaned.starts_with("--trusted-cert")
                 && !cleaned.starts_with("subject:")
                 && !cleaned.starts_with("issuer:")
                 && !cleaned.starts_with("C=")
@@ -632,6 +637,21 @@ fn handle_log_line(
             }
             _ => {}
         }
+    }
+
+    // Auth failure after OTP/password: leave Connecting immediately.
+    if trimmed.contains("Could not authenticate to gateway")
+        || trimmed.contains("No OTP specified")
+        || trimmed.contains("No token specified")
+    {
+        let cleaned = trimmed
+            .trim_start_matches("ERROR:")
+            .trim()
+            .to_string();
+        *last_error = Some(cleaned.clone());
+        *reached_terminal = true;
+        emit_connection_error(app_handle, &cleaned);
+        stop_flag.store(true, Ordering::Relaxed);
     }
 }
 

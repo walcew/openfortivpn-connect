@@ -97,6 +97,27 @@ pub fn submit_otp(
 }
 
 #[tauri::command]
+pub fn trust_cert_and_reconnect(
+    manager: State<'_, Mutex<VpnManager>>,
+    app_handle: tauri::AppHandle,
+    profile_id: String,
+    digest: String,
+) -> Result<(), String> {
+    let settings = SettingsStore::new()
+        .and_then(|s| s.get())
+        .unwrap_or_default();
+
+    let mut mgr = manager.lock().map_err(|e| e.to_string())?;
+    mgr.trust_cert_and_reconnect(
+        &profile_id,
+        &digest,
+        app_handle,
+        settings.debug_mode,
+        settings.dns_fallback,
+    )
+}
+
+#[tauri::command]
 pub fn get_settings() -> Result<AppSettings, String> {
     let store = SettingsStore::new()?;
     store.get()
