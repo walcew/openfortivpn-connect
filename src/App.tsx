@@ -54,14 +54,19 @@ function App() {
     };
   }, []);
 
-  // Check helper status on mount
+  // Prompt to install/update the helper on mount when missing or outdated.
   useEffect(() => {
     const checkHelper = async () => {
       try {
-        const status = await invoke<{ installed: boolean; running: boolean }>("check_helper_status");
-        if (!status.running) {
+        const status = await invoke<{
+          installed: boolean;
+          running: boolean;
+          needs_update: boolean;
+        }>("check_helper_status");
+        if (!status.running || status.needs_update) {
           const settings = await invoke<{ helper_declined: boolean }>("get_settings");
-          if (!settings.helper_declined) {
+          // Still prompt for updates even if install was previously declined.
+          if (status.needs_update || !settings.helper_declined) {
             setShowHelperInstall(true);
           }
         }

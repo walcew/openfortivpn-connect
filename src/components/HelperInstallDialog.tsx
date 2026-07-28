@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface Props {
@@ -6,9 +6,23 @@ interface Props {
   onDeclined: () => void;
 }
 
+interface HelperStatus {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  needs_update: boolean;
+}
+
 export function HelperInstallDialog({ onInstalled, onDeclined }: Props) {
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isUpdate, setIsUpdate] = useState(false);
+
+  useEffect(() => {
+    invoke<HelperStatus>("check_helper_status")
+      .then((status) => setIsUpdate(status.needs_update))
+      .catch(console.error);
+  }, []);
 
   const handleInstall = async () => {
     setInstalling(true);
@@ -25,7 +39,6 @@ export function HelperInstallDialog({ onInstalled, onDeclined }: Props) {
   return (
     <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
       <div className="bg-neutral-900 border border-white/10 rounded-2xl p-6 mx-4 max-w-sm w-full shadow-2xl">
-        {/* Icon */}
         <div className="flex justify-center mb-4">
           <div className="w-12 h-12 rounded-full bg-blue-500/20 flex items-center justify-center">
             <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -34,26 +47,28 @@ export function HelperInstallDialog({ onInstalled, onDeclined }: Props) {
           </div>
         </div>
 
-        {/* Title */}
         <h3 className="text-base font-semibold text-white text-center mb-2">
-          Install Helper Component
+          {isUpdate ? "Update Helper Component" : "Install Helper Component"}
         </h3>
 
-        {/* Description */}
         <p className="text-sm text-white/50 text-center mb-5 leading-relaxed">
-          To connect and disconnect without repeatedly asking for your password, we need to
-          install a helper component. This requires your administrator password{" "}
-          <span className="text-white/70 font-medium">only once</span>.
+          {isUpdate
+            ? "A newer helper is required for this version (including 2FA support). Updating needs your administrator password once."
+            : (
+              <>
+                To connect and disconnect without repeatedly asking for your password, we need to
+                install a helper component. This requires your administrator password{" "}
+                <span className="text-white/70 font-medium">only once</span>.
+              </>
+            )}
         </p>
 
-        {/* Error */}
         {error && (
           <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3 mb-4">
             <p className="text-xs text-red-400">{error}</p>
           </div>
         )}
 
-        {/* Buttons */}
         <div className="flex gap-3">
           <button
             onClick={onDeclined}
@@ -67,7 +82,7 @@ export function HelperInstallDialog({ onInstalled, onDeclined }: Props) {
             disabled={installing}
             className="flex-1 px-4 py-2.5 text-sm text-white font-medium bg-blue-500 hover:bg-blue-600 rounded-xl transition-colors disabled:opacity-50"
           >
-            {installing ? "Installing..." : "Install"}
+            {installing ? (isUpdate ? "Updating..." : "Installing...") : (isUpdate ? "Update" : "Install")}
           </button>
         </div>
       </div>
