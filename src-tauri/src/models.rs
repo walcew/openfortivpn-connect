@@ -40,6 +40,10 @@ pub struct VpnProfile {
     pub two_factor_enabled: bool,
     #[serde(default)]
     pub two_factor_type: TwoFactorType,
+    /// With 2FA: opt-in auto-reconnect after drops (default off; re-auth may be needed).
+    /// Without 2FA: ignored; reconnect is always enabled at connect time.
+    #[serde(default)]
+    pub auto_reconnect: bool,
 }
 
 impl Default for VpnProfile {
@@ -56,6 +60,7 @@ impl Default for VpnProfile {
             extra_args: Vec::new(),
             two_factor_enabled: false,
             two_factor_type: TwoFactorType::default(),
+            auto_reconnect: false,
         }
     }
 }

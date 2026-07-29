@@ -42,6 +42,10 @@ export function ConnectionStatus({
 }: Props) {
   const [duration, setDuration] = useState(0);
   const config = STATUS_CONFIG[status.state];
+  const label =
+    status.state === "Connecting" && status.message
+      ? status.message
+      : config.label;
 
   useEffect(() => {
     if (status.state !== "Connected" || !status.since) {
@@ -67,7 +71,7 @@ export function ConnectionStatus({
     <div className={`rounded-xl p-4 ${config.bg}`}>
       <div className="flex items-center gap-2 mb-2">
         <span className={`w-3 h-3 rounded-full ${config.color} ${isBusy ? "animate-pulse" : ""}`} />
-        <span className="text-sm font-medium text-white/80">{config.label}</span>
+        <span className="text-sm font-medium text-white/80">{label}</span>
       </div>
 
       {isConnected && (

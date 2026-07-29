@@ -187,6 +187,21 @@ impl VpnManager {
         args.push("--set-dns=0".to_string());
         args.push("--pppd-use-peerdns=0".to_string());
 
+        // Auto-reconnect: always on without 2FA; with 2FA only if profile opts in
+        // (reconnect often needs a new OTP). Skip if extra_args already sets it.
+        let has_persistent = profile
+            .extra_args
+            .iter()
+            .any(|a| a.starts_with("--persistent"));
+        let auto_reconnect = if two_factor.is_some() {
+            profile.auto_reconnect
+        } else {
+            true
+        };
+        if auto_reconnect && !has_persistent {
+            args.push("--persistent=5".to_string());
+        }
+
         // Enable verbose logging so we can capture DNS server info from debug output
         args.push("-v".to_string());
 
@@ -200,6 +215,7 @@ impl VpnManager {
             debug_mode,
             dns_fallback,
             two_factor,
+            auto_reconnect,
         ) {
             Ok(()) => Ok(()),
             Err(e) => {

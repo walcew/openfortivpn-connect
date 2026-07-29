@@ -20,6 +20,7 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
       ...base,
       two_factor_enabled: base.two_factor_enabled ?? false,
       two_factor_type: base.two_factor_type ?? "Totp",
+      auto_reconnect: base.auto_reconnect ?? false,
     };
   });
   const [password, setPassword] = useState("");
@@ -156,43 +157,67 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
               <input
                 type="checkbox"
                 checked={form.two_factor_enabled}
-                onChange={(e) =>
-                  setForm({ ...form, two_factor_enabled: e.target.checked })
-                }
+                onChange={(e) => {
+                  const enabled = e.target.checked;
+                  setForm({
+                    ...form,
+                    two_factor_enabled: enabled,
+                    // Reconnect after drops often needs a fresh OTP: default off with 2FA.
+                    auto_reconnect: enabled ? false : form.auto_reconnect,
+                  });
+                }}
                 className="accent-blue-500"
               />
               <span className="text-sm text-white/70">Two-factor authentication (2FA)</span>
             </label>
             {form.two_factor_enabled && (
-              <div className="flex flex-col gap-1">
-                <span className="text-xs text-white/40">2FA type</span>
-                <div className="flex gap-4">
-                  <label className="flex items-center gap-1.5 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="two_factor_type"
-                      checked={form.two_factor_type === "Totp"}
-                      onChange={() => setForm({ ...form, two_factor_type: "Totp" })}
-                      className="accent-blue-500"
-                    />
-                    <span className="text-sm text-white/70">TOTP code</span>
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="two_factor_type"
-                      checked={form.two_factor_type === "Push"}
-                      onChange={() => setForm({ ...form, two_factor_type: "Push" })}
-                      className="accent-blue-500"
-                    />
-                    <span className="text-sm text-white/70">FortiToken push</span>
-                  </label>
+              <div className="flex flex-col gap-2">
+                <div className="flex flex-col gap-1">
+                  <span className="text-xs text-white/40">2FA type</span>
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="two_factor_type"
+                        checked={form.two_factor_type === "Totp"}
+                        onChange={() => setForm({ ...form, two_factor_type: "Totp" })}
+                        className="accent-blue-500"
+                      />
+                      <span className="text-sm text-white/70">TOTP code</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="two_factor_type"
+                        checked={form.two_factor_type === "Push"}
+                        onChange={() => setForm({ ...form, two_factor_type: "Push" })}
+                        className="accent-blue-500"
+                      />
+                      <span className="text-sm text-white/70">FortiToken push</span>
+                    </label>
+                  </div>
+                  <p className="text-xs text-white/30">
+                    {form.two_factor_type === "Totp"
+                      ? "The app will ask for a code from your authenticator when required."
+                      : "Approve the notification on your phone when connecting."}
+                  </p>
                 </div>
-                <p className="text-xs text-white/30">
-                  {form.two_factor_type === "Totp"
-                    ? "The app will ask for a code from your authenticator when required."
-                    : "Approve the notification on your phone when connecting."}
-                </p>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.auto_reconnect}
+                    onChange={(e) =>
+                      setForm({ ...form, auto_reconnect: e.target.checked })
+                    }
+                    className="accent-blue-500 mt-0.5"
+                  />
+                  <span>
+                    <span className="text-sm text-white/70">Auto-reconnect after drops</span>
+                    <p className="text-xs text-white/30">
+                      Off by default with 2FA: a reconnect may ask for a new code.
+                    </p>
+                  </span>
+                </label>
               </div>
             )}
           </>

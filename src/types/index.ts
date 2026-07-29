@@ -12,6 +12,8 @@ export interface VpnProfile {
   extra_args: string[];
   two_factor_enabled: boolean;
   two_factor_type: TwoFactorType;
+  /** With 2FA only: opt-in persistent reconnect (default off). */
+  auto_reconnect: boolean;
 }
 
 export interface ConnectionStatus {
@@ -62,5 +64,6 @@ export function newProfile(): VpnProfile {
     extra_args: [],
     two_factor_enabled: false,
     two_factor_type: "Totp",
+    auto_reconnect: false,
   };
 }

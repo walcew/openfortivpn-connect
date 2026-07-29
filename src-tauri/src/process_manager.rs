@@ -3,7 +3,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
@@ -46,6 +46,7 @@ impl ProcessManager {
         debug_mode: bool,
         dns_fallback: bool,
         two_factor: Option<TwoFactorType>,
+        auto_reconnect: bool,
     ) -> Result<(), String> {
         // Resolve the VPN server IP from "host:port" (args[0]) so the helper can
         // clear any stale host route to it left by a previous session.
@@ -106,6 +107,7 @@ impl ProcessManager {
                 debug_mode,
                 fallback_dns,
                 two_factor,
+                auto_reconnect,
             )
             .await;
         });
@@ -288,6 +290,7 @@ async fn start_log_monitor(
     debug_mode: bool,
     fallback_dns: Vec<String>,
     two_factor: Option<TwoFactorType>,
+    auto_reconnect: bool,
 ) {
     use std::io::Read;
 
@@ -306,20 +309,29 @@ async fn start_log_monitor(
     let mut dns_servers: Vec<String> = Vec::new();
     let mut dns_suffixes: Vec<String> = Vec::new();
     let mut vpn_local_ip: Option<String> = None;
+    let vpn_peer_ip: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut otp_prompted = false;
     let mut push_signaled = false;
     let mut cert_warned = false;
+    // True after Tunnel is up (or a terminal error). Used to distinguish
+    // "died before connect" from "session ended after connect".
     let mut reached_terminal = false;
     let mut last_error: Option<String> = None;
+    let tunnel_up = Arc::new(AtomicBool::new(false));
+    let monitors_started = Arc::new(AtomicBool::new(false));
+    let need_2fa_reset = Arc::new(AtomicBool::new(false));
 
     while !stop_flag.load(Ordering::Relaxed) {
+        if need_2fa_reset.swap(false, Ordering::Relaxed) {
+            otp_prompted = false;
+            push_signaled = false;
+        }
+
         let mut chunk = [0u8; 512];
         match file.read(&mut chunk) {
             Ok(0) => {
-                // If openfortivpn exited without reaching Connected, drain late
-                // lines then surface an error. Keep polling while OTP/Push is
-                // pending AND the process is still alive.
-                if !reached_terminal && !is_process_alive(pid) {
+                // Process gone: drain late lines, then update UI.
+                if !is_process_alive(pid) {
                     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
                     let mut drain = [0u8; 4096];
                     if let Ok(n) = file.read(&mut drain) {
@@ -351,9 +363,25 @@ async fn start_log_monitor(
                             &mut cert_warned,
                             &mut reached_terminal,
                             &mut last_error,
+                            &tunnel_up,
+                            &monitors_started,
+                            &need_2fa_reset,
+                            &vpn_peer_ip,
+                            pid,
+                            auto_reconnect,
                         );
                     }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if reached_terminal {
+                        // Session had been up (or already reported down): show Disconnected.
+                        emit_disconnected(
+                            &app_handle,
+                            Some("VPN session ended".into()),
+                        );
+                        let _ = dns_manager::teardown_dns();
+                        stop_flag.store(true, Ordering::Relaxed);
                         break;
                     }
                     let message = last_error.unwrap_or_else(|| {
@@ -367,6 +395,7 @@ async fn start_log_monitor(
                         }
                     });
                     emit_connection_error(&app_handle, &message);
+                    stop_flag.store(true, Ordering::Relaxed);
                     break;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -399,6 +428,12 @@ async fn start_log_monitor(
                         &mut cert_warned,
                         &mut reached_terminal,
                         &mut last_error,
+                        &tunnel_up,
+                        &monitors_started,
+                        &need_2fa_reset,
+                        &vpn_peer_ip,
+                        pid,
+                        auto_reconnect,
                     );
                 }
 
@@ -428,6 +463,12 @@ fn handle_log_line(
     cert_warned: &mut bool,
     reached_terminal: &mut bool,
     last_error: &mut Option<String>,
+    tunnel_up: &Arc<AtomicBool>,
+    monitors_started: &Arc<AtomicBool>,
+    need_2fa_reset: &Arc<AtomicBool>,
+    vpn_peer_ip: &Arc<Mutex<Option<String>>>,
+    pid: u32,
+    auto_reconnect: bool,
 ) {
     let level = if trimmed.contains("ERROR") || trimmed.contains("error") {
         "error"
@@ -511,6 +552,14 @@ fn handle_log_line(
             *vpn_local_ip = Some(ip);
         }
     }
+    if let Some(peer) = extract_vpn_peer_from_log(trimmed) {
+        if let Ok(mut slot) = vpn_peer_ip.lock() {
+            if slot.as_ref() != Some(&peer) {
+                log::info!("Captured VPN peer IP from log: {}", peer);
+                *slot = Some(peer);
+            }
+        }
+    }
 
     if trimmed.contains("Tunnel is up and running") {
         // Build final DNS server list. Fallback (DHCP + Google) is only
@@ -556,6 +605,7 @@ fn handle_log_line(
         let bw_ip = ip.clone();
 
         *reached_terminal = true;
+        tunnel_up.store(true, Ordering::Relaxed);
         let _ = app_handle.emit(
             "connection-status-changed",
             ConnectionStatusPayload {
@@ -567,25 +617,68 @@ fn handle_log_line(
             },
         );
 
-        let bw_app_handle = app_handle.clone();
-        let bw_stop_flag = stop_flag.clone();
-        tauri::async_runtime::spawn(async move {
-            start_bandwidth_monitor(bw_app_handle, bw_stop_flag, bw_ip).await;
-        });
+        // Start bandwidth + health monitors once per VPN session.
+        if monitors_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let health_ip = vpn_local_ip.clone().unwrap_or_else(|| bw_ip.clone());
+            let bw_app_handle = app_handle.clone();
+            let bw_stop_flag = stop_flag.clone();
+            let bw_ip_monitor = bw_ip;
+            tauri::async_runtime::spawn(async move {
+                start_bandwidth_monitor(bw_app_handle, bw_stop_flag, bw_ip_monitor).await;
+            });
+
+            let health_app = app_handle.clone();
+            let health_stop = stop_flag.clone();
+            let health_tunnel = tunnel_up.clone();
+            let health_2fa = need_2fa_reset.clone();
+            let health_peer = vpn_peer_ip.clone();
+            let health_profile = profile_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                start_connection_health_monitor(
+                    health_app,
+                    health_stop,
+                    health_tunnel,
+                    health_2fa,
+                    health_peer,
+                    pid,
+                    health_profile,
+                    health_ip,
+                    auto_reconnect,
+                )
+                .await;
+            });
+        }
     } else if trimmed.contains("Tunnel is down") {
         *reached_terminal = true;
-        crate::tray::update_tray_icon(app_handle, &ConnectionState::Disconnected);
-        let _ = app_handle.emit(
-            "connection-status-changed",
-            ConnectionStatusPayload {
-                state: "Disconnected".into(),
-                profile_id: None,
-                ip: None,
-                since: None,
-                message: None,
-            },
-        );
-        stop_flag.store(true, Ordering::Relaxed);
+        tunnel_up.store(false, Ordering::Relaxed);
+        *otp_prompted = false;
+        *push_signaled = false;
+        if auto_reconnect {
+            // With --persistent, openfortivpn stays alive and retries.
+            crate::tray::update_tray_icon(
+                app_handle,
+                &ConnectionState::Connecting {
+                    profile_id: profile_id.to_string(),
+                },
+            );
+            let _ = app_handle.emit(
+                "connection-status-changed",
+                ConnectionStatusPayload {
+                    state: "Connecting".into(),
+                    profile_id: Some(profile_id.to_string()),
+                    ip: None,
+                    since: None,
+                    message: Some("Reconnecting...".into()),
+                },
+            );
+        } else {
+            emit_disconnected(app_handle, Some("Tunnel is down".into()));
+            let _ = dns_manager::teardown_dns();
+            stop_flag.store(true, Ordering::Relaxed);
+        }
     } else if trimmed.contains("/remote/saml/start")
         || (trimmed.contains("http") && trimmed.contains("saml"))
     {
@@ -656,15 +749,35 @@ fn handle_log_line(
 }
 
 fn is_process_alive(pid: u32) -> bool {
+    process_state(pid).is_some()
+}
+
+/// True when the process exists but is stopped (SIGSTOP / traced), state `T`.
+/// Still listed by `ps`, so a plain alive check would miss a frozen VPN.
+fn is_process_stopped(pid: u32) -> bool {
+    matches!(process_state(pid), Some(s) if is_stopped_state(&s))
+}
+
+fn process_state(pid: u32) -> Option<String> {
     // Use `ps` instead of `kill -0`: openfortivpn runs as root via the helper, and
     // an unprivileged `kill -0` returns EPERM even when the process is alive.
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "state="])
         .output()
-        .map(|o| {
-            o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-        })
-        .unwrap_or(false)
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if state.is_empty() {
+        None
+    } else {
+        Some(state)
+    }
+}
+
+fn is_stopped_state(state: &str) -> bool {
+    state.chars().next() == Some('T')
 }
 
 fn emit_connection_error(app_handle: &AppHandle, message: &str) {
@@ -686,6 +799,229 @@ fn emit_connection_error(app_handle: &AppHandle, message: &str) {
         },
     );
     focus_main_window(app_handle);
+}
+
+fn emit_disconnected(app_handle: &AppHandle, message: Option<String>) {
+    log::info!(
+        "VPN disconnected{}",
+        message
+            .as_deref()
+            .map(|m| format!(": {}", m))
+            .unwrap_or_default()
+    );
+    crate::tray::update_tray_icon(app_handle, &ConnectionState::Disconnected);
+    let _ = app_handle.emit(
+        "connection-status-changed",
+        ConnectionStatusPayload {
+            state: "Disconnected".into(),
+            profile_id: None,
+            ip: None,
+            since: None,
+            message,
+        },
+    );
+}
+
+/// Poll process, ppp interface, and PPP peer reachability while connected.
+/// Peer IP comes from ifconfig (`inet local --> peer`), never hardcoded.
+/// If ICMP to the peer never succeeds, probing is disabled (peer may block ping)
+/// and we fall back to process + interface checks only.
+async fn start_connection_health_monitor(
+    app_handle: AppHandle,
+    stop_flag: Arc<AtomicBool>,
+    tunnel_up: Arc<AtomicBool>,
+    need_2fa_reset: Arc<AtomicBool>,
+    vpn_peer_ip: Arc<Mutex<Option<String>>>,
+    pid: u32,
+    profile_id: String,
+    vpn_ip: String,
+    auto_reconnect: bool,
+) {
+    let mut missing_iface = 0u32;
+    let mut probe_fails = 0u32;
+    let mut probe_ever_ok = false;
+    let mut probe_skipped = false;
+    let mut probe_misses_before_ok = 0u32;
+    log::info!(
+        "Connection health monitor started (pid={}, ip={}, auto_reconnect={})",
+        pid,
+        vpn_ip,
+        auto_reconnect
+    );
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        if !is_process_alive(pid) {
+            log::warn!("VPN process {} is no longer alive", pid);
+            emit_disconnected(&app_handle, Some("VPN process ended".into()));
+            let _ = dns_manager::teardown_dns();
+            stop_flag.store(true, Ordering::Relaxed);
+            break;
+        }
+        if is_process_stopped(pid) {
+            log::warn!("VPN process {} is stopped (SIGSTOP/traced)", pid);
+            emit_disconnected(&app_handle, Some("VPN process suspended".into()));
+            let _ = dns_manager::teardown_dns();
+            stop_flag.store(true, Ordering::Relaxed);
+            break;
+        }
+
+        if !tunnel_up.load(Ordering::Relaxed) {
+            missing_iface = 0;
+            probe_fails = 0;
+            continue;
+        }
+
+        if vpn_ip == "unknown" {
+            continue;
+        }
+
+        let Some((_iface, ifconfig_peer)) = find_ppp_link(&vpn_ip) else {
+            missing_iface += 1;
+            // ~15s without the VPN IP on a ppp interface.
+            if missing_iface >= 3 {
+                mark_tunnel_unhealthy(
+                    &app_handle,
+                    &stop_flag,
+                    &tunnel_up,
+                    &need_2fa_reset,
+                    &profile_id,
+                    auto_reconnect,
+                    "Tunnel lost (interface gone)",
+                );
+                if !auto_reconnect {
+                    break;
+                }
+                missing_iface = 0;
+            }
+            continue;
+        };
+        missing_iface = 0;
+
+        let peer = ifconfig_peer.or_else(|| {
+            vpn_peer_ip
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+        });
+        let Some(peer) = peer else {
+            // No peer address available; interface presence is enough.
+            continue;
+        };
+
+        if probe_skipped {
+            continue;
+        }
+
+        if probe_host_reachable(&peer).await {
+            if !probe_ever_ok {
+                log::info!("Tunnel probe OK via PPP peer {}", peer);
+            }
+            probe_ever_ok = true;
+            probe_fails = 0;
+            probe_misses_before_ok = 0;
+            continue;
+        }
+
+        if !probe_ever_ok {
+            // Never got a successful ping: peer may block ICMP. Stop probing
+            // after ~30s so we do not false-disconnect.
+            probe_misses_before_ok += 1;
+            if probe_misses_before_ok >= 6 {
+                log::info!(
+                    "PPP peer {} never answered ping; disabling reachability probe",
+                    peer
+                );
+                probe_skipped = true;
+            }
+            continue;
+        }
+
+        probe_fails += 1;
+        log::warn!(
+            "Tunnel probe failed to PPP peer {} ({}/3)",
+            peer,
+            probe_fails
+        );
+        if probe_fails < 3 {
+            continue;
+        }
+
+        mark_tunnel_unhealthy(
+            &app_handle,
+            &stop_flag,
+            &tunnel_up,
+            &need_2fa_reset,
+            &profile_id,
+            auto_reconnect,
+            "Tunnel lost (peer unreachable)",
+        );
+        if !auto_reconnect {
+            break;
+        }
+        probe_fails = 0;
+        probe_ever_ok = false;
+        probe_misses_before_ok = 0;
+    }
+
+    log::info!("Connection health monitor stopped");
+}
+
+fn mark_tunnel_unhealthy(
+    app_handle: &AppHandle,
+    stop_flag: &Arc<AtomicBool>,
+    tunnel_up: &Arc<AtomicBool>,
+    need_2fa_reset: &Arc<AtomicBool>,
+    profile_id: &str,
+    auto_reconnect: bool,
+    reason: &str,
+) {
+    tunnel_up.store(false, Ordering::Relaxed);
+    if auto_reconnect {
+        log::warn!("{}; marking reconnecting", reason);
+        need_2fa_reset.store(true, Ordering::Relaxed);
+        crate::tray::update_tray_icon(
+            app_handle,
+            &ConnectionState::Connecting {
+                profile_id: profile_id.to_string(),
+            },
+        );
+        let _ = app_handle.emit(
+            "connection-status-changed",
+            ConnectionStatusPayload {
+                state: "Connecting".into(),
+                profile_id: Some(profile_id.to_string()),
+                ip: None,
+                since: None,
+                message: Some("Reconnecting...".into()),
+            },
+        );
+    } else {
+        log::warn!("{}; marking disconnected", reason);
+        emit_disconnected(app_handle, Some(reason.into()));
+        let _ = dns_manager::teardown_dns();
+        stop_flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// ICMP echo to a dynamically discovered PPP peer. macOS: -W is ms wait per reply.
+async fn probe_host_reachable(ip: &str) -> bool {
+    if !is_valid_vpn_ip(ip) {
+        return false;
+    }
+    let ip = ip.to_string();
+    tokio::task::spawn_blocking(move || {
+        Command::new("ping")
+            .args(["-c", "1", "-W", "2000", "-t", "3", &ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Extract a trusted-cert digest from openfortivpn error output.
@@ -938,15 +1274,20 @@ async fn start_bandwidth_monitor(
 }
 
 /// Detect the ppp interface that has the given VPN IP assigned.
-/// Parses `ifconfig` output to find the matching interface, handling
-/// stale ppp interfaces from previous connections.
 fn detect_ppp_interface(vpn_ip: &str) -> Option<String> {
-    let output = Command::new("ifconfig").output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    find_ppp_link(vpn_ip).map(|(iface, _)| iface)
+}
 
+/// Find the ppp interface for `vpn_ip` and its point-to-point peer, if any.
+/// Peer comes from macOS ifconfig: `inet 10.x.x.x --> 10.y.y.y`.
+fn find_ppp_link(vpn_ip: &str) -> Option<(String, Option<String>)> {
+    let output = Command::new("ifconfig").output().ok()?;
+    parse_ppp_link_from_ifconfig(&String::from_utf8_lossy(&output.stdout), vpn_ip)
+}
+
+fn parse_ppp_link_from_ifconfig(stdout: &str, vpn_ip: &str) -> Option<(String, Option<String>)> {
     let mut current_iface: Option<String> = None;
     for line in stdout.lines() {
-        // Interface header line: "pppN: flags=..."
         if !line.starts_with('\t') && !line.starts_with(' ') {
             if let Some(name) = line.split(':').next() {
                 if name.starts_with("ppp") {
@@ -955,20 +1296,66 @@ fn detect_ppp_interface(vpn_ip: &str) -> Option<String> {
                     current_iface = None;
                 }
             }
+            continue;
         }
-        // Look for our VPN IP on this interface
-        if let Some(ref iface) = current_iface {
-            let trimmed = line.trim();
-            if trimmed.starts_with("inet ") {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 && parts[1] == vpn_ip {
-                    log::info!("Found VPN IP {} on interface {}", vpn_ip, iface);
-                    return Some(iface.clone());
-                }
+        let Some(ref iface) = current_iface else {
+            continue;
+        };
+        if let Some((local, peer)) = parse_ppp_inet_line(line) {
+            if local == vpn_ip {
+                log::info!(
+                    "Found VPN IP {} on interface {} (peer={:?})",
+                    vpn_ip,
+                    iface,
+                    peer
+                );
+                return Some((iface.clone(), peer));
             }
         }
     }
     None
+}
+
+/// Parse `inet <local> --> <peer> ...` (macOS ppp) or bare `inet <local>`.
+fn parse_ppp_inet_line(line: &str) -> Option<(String, Option<String>)> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("inet ") {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let local = parts.get(1)?.to_string();
+    if !is_valid_vpn_ip(&local) {
+        return None;
+    }
+    let peer = if parts.get(2) == Some(&"-->") {
+        parts.get(3).and_then(|p| {
+            if is_valid_vpn_ip(p) {
+                Some(p.to_string())
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    Some((local, peer))
+}
+
+/// Peer from openfortivpn verbose log: `Got addresses: [local], peer [peer]`.
+fn extract_vpn_peer_from_log(line: &str) -> Option<String> {
+    if !line.contains("Got addresses") || !line.contains("peer") {
+        return None;
+    }
+    let peer_idx = line.find("peer")?;
+    let after = &line[peer_idx..];
+    let start = after.find('[')?;
+    let end = after[start..].find(']')?;
+    let candidate = &after[start + 1..start + end];
+    if is_valid_vpn_ip(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
 }
 
 /// Read cumulative RX and TX bytes from a network interface using netstat.
@@ -1093,6 +1480,55 @@ mod tests {
     fn resolve_server_ip_rejects_garbage() {
         // A non-resolvable, non-IP host yields None rather than a bogus route.
         assert_eq!(resolve_server_ip("not_a_host:10443"), None);
+    }
+
+    #[test]
+    fn parse_ppp_inet_line_with_peer() {
+        let (local, peer) =
+            parse_ppp_inet_line("\tinet 10.212.134.200 --> 10.212.134.199 netmask 0xfffffff0")
+                .unwrap();
+        assert_eq!(local, "10.212.134.200");
+        assert_eq!(peer.as_deref(), Some("10.212.134.199"));
+    }
+
+    #[test]
+    fn parse_ppp_inet_line_without_peer() {
+        let (local, peer) = parse_ppp_inet_line("inet 10.0.1.45 netmask 0xffffff00").unwrap();
+        assert_eq!(local, "10.0.1.45");
+        assert!(peer.is_none());
+    }
+
+    #[test]
+    fn parse_ppp_link_from_ifconfig_finds_peer() {
+        let stdout = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+ppp0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1354
+	inet 10.212.134.200 --> 10.212.134.199 netmask 0xfffffff0
+";
+        let (iface, peer) = parse_ppp_link_from_ifconfig(stdout, "10.212.134.200").unwrap();
+        assert_eq!(iface, "ppp0");
+        assert_eq!(peer.as_deref(), Some("10.212.134.199"));
+    }
+
+    #[test]
+    fn extract_vpn_peer_from_got_addresses() {
+        let line = "INFO:   Got addresses: [10.0.1.45], peer [192.168.1.1]";
+        assert_eq!(
+            extract_vpn_peer_from_log(line).as_deref(),
+            Some("192.168.1.1")
+        );
+    }
+
+    #[test]
+    fn stopped_state_detects_sigstop() {
+        assert!(is_stopped_state("T"));
+        assert!(is_stopped_state("Ts"));
+        assert!(is_stopped_state("T+"));
+        assert!(!is_stopped_state("S"));
+        assert!(!is_stopped_state("Ss+"));
+        assert!(!is_stopped_state("R"));
+        assert!(!is_stopped_state(""));
     }
 
 }
