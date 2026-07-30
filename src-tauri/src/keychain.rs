@@ -1,8 +1,7 @@
+use openvpngui_common::APP_ID;
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
-
-const SERVICE: &str = "com.openvpngui.app";
 
 fn account_for(profile_id: &str) -> String {
     format!("vpn-{}", profile_id)
@@ -11,14 +10,14 @@ fn account_for(profile_id: &str) -> String {
 pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
     let account = account_for(profile_id);
     // Delete first to avoid "duplicate item" errors
-    let _ = delete_generic_password(SERVICE, &account);
-    set_generic_password(SERVICE, &account, password.as_bytes())
+    let _ = delete_generic_password(APP_ID, &account);
+    set_generic_password(APP_ID, &account, password.as_bytes())
         .map_err(|e| format!("Failed to save password to Keychain: {}", e))
 }
 
 pub fn get_password(profile_id: &str) -> Result<Option<String>, String> {
     let account = account_for(profile_id);
-    match get_generic_password(SERVICE, &account) {
+    match get_generic_password(APP_ID, &account) {
         Ok(bytes) => {
             let password = String::from_utf8(bytes.to_vec())
                 .map_err(|e| format!("Password is not valid UTF-8: {}", e))?;
@@ -37,7 +36,7 @@ pub fn get_password(profile_id: &str) -> Result<Option<String>, String> {
 
 pub fn delete_password(profile_id: &str) -> Result<(), String> {
     let account = account_for(profile_id);
-    match delete_generic_password(SERVICE, &account) {
+    match delete_generic_password(APP_ID, &account) {
         Ok(()) => Ok(()),
         Err(e) => {
             if e.code() == -25300 {

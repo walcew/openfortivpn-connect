@@ -52,12 +52,43 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Sync project identity
+        run: |
+          cd src-tauri
+          cargo build -p openvpngui --quiet
+          set -a
+          # shellcheck disable=SC1091
+          source ../project.env
+          set +a
+          echo "PRODUCT_NAME=$PRODUCT_NAME" >> "$GITHUB_ENV"
+          echo "HELPER_CRATE_NAME=$HELPER_CRATE_NAME" >> "$GITHUB_ENV"
+          echo "HELPER_BINARY_NAME=$HELPER_BINARY_NAME" >> "$GITHUB_ENV"
+          echo "REPOSITORY_SLUG=$REPOSITORY_SLUG" >> "$GITHUB_ENV"
+          echo "HOMEBREW_CASK=$HOMEBREW_CASK" >> "$GITHUB_ENV"
+          echo "HOMEBREW_TAP_REPO=$HOMEBREW_TAP_REPO" >> "$GITHUB_ENV"
+          echo "DMG_ASSET_PATTERN=$DMG_ASSET_PATTERN" >> "$GITHUB_ENV"
+
+      - name: Upload project.env
+        if: matrix.arch == 'aarch64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-env
+          path: project.env
+
+      - name: Build bundled openfortivpn
+        run: |
+          case "${{ matrix.arch }}" in
+            aarch64) ./scripts/build-openfortivpn.sh arm64 ;;
+            x86_64) ./scripts/build-openfortivpn.sh x86_64 ;;
+            *) echo "Unsupported arch ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+
       - name: Build helper binary
         run: |
           cd src-tauri
-          cargo build --release --target ${{ matrix.target }} -p openvpngui-helper
+          cargo build --release --target ${{ matrix.target }} -p "${HELPER_CRATE_NAME}"
           mkdir -p target/release
-          cp target/${{ matrix.target }}/release/openvpngui-helper target/release/openvpngui-helper
+          cp "target/${{ matrix.target }}/release/${HELPER_BINARY_NAME}" "target/release/${HELPER_BINARY_NAME}"
 
       - name: Build and release with Tauri
         uses: tauri-apps/tauri-action@v0
@@ -72,7 +103,7 @@ jobs:
           # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: v__VERSION__
-          releaseName: 'OpenFortiVpn Connect v__VERSION__'
+          releaseName: ${{ env.PRODUCT_NAME }} v__VERSION__
           releaseBody: 'See the assets to download and install this version.'
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == 'true' }}
           prerelease: false
@@ -128,22 +159,31 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
+      - name: Download project.env
+        uses: actions/download-artifact@v4
+        with:
+          name: project-env
+
       - name: Trigger Homebrew tap update
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          set -a
+          # shellcheck disable=SC1091
+          source ./project.env
+          set +a
           VERSION="${{ needs.checksums.outputs.tag }}"
           VERSION="${VERSION#v}"
           curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
-            "https://api.github.com/repos/walcew/homebrew-tap/dispatches" \
+            "https://api.github.com/repos/${HOMEBREW_TAP_REPO}/dispatches" \
             -d "{
               \"event_type\": \"update-cask\",
               \"client_payload\": {
-                \"cask\": \"openfortivpn-connect\",
+                \"cask\": \"${HOMEBREW_CASK}\",
                 \"version\": \"$VERSION\",
-                \"repo\": \"walcew/openfortivpn-connect\",
-                \"asset_pattern\": \"OpenFortiVpn.Connect_{version}_{arch}.dmg\"
+                \"repo\": \"${REPOSITORY_SLUG}\",
+                \"asset_pattern\": \"${DMG_ASSET_PATTERN}\"
               }
             }"

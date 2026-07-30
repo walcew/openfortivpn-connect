@@ -73,7 +73,7 @@ fn handle_spawn_vpn(args: Vec<String>, log_path: String, vpn_server: Option<Stri
     };
 
     // Spawn openfortivpn with a piped stdin so the app can submit OTP / 2FA codes.
-    match Command::new(validation::OPENFORTIVPN_PATH)
+    match Command::new(openvpngui_common::OPENFORTIVPN_INSTALL_PATH)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(log_file)

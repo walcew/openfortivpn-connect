@@ -2,9 +2,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+use openvpngui_common::HELPER_SOCKET_PATH;
 use serde::Deserialize;
 
-const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
@@ -16,7 +16,7 @@ pub struct HelperResponse {
 }
 
 fn send_request(json: &str) -> Result<HelperResponse, String> {
-    let stream = UnixStream::connect(SOCKET_PATH)
+    let stream = UnixStream::connect(HELPER_SOCKET_PATH)
         .map_err(|e| format!("Failed to connect to helper socket: {}", e))?;
     stream
         .set_read_timeout(Some(TIMEOUT))

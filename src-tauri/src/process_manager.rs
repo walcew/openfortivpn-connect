@@ -70,7 +70,11 @@ impl ProcessManager {
         };
 
         let log_id = uuid::Uuid::new_v4();
-        let log_path = PathBuf::from(format!("/tmp/openvpngui-{}.log", log_id));
+        let log_path = PathBuf::from(format!(
+            "{}{}.log",
+            openvpngui_common::VPN_LOG_PREFIX,
+            log_id
+        ));
 
         // Create the log file so the monitor can start reading
         File::create(&log_path)
@@ -143,7 +147,8 @@ impl ProcessManager {
             "killall pppd 2>/dev/null; sleep 1; killall -KILL pppd 2>/dev/null; \
              ifconfig ppp0 down 2>/dev/null; ifconfig ppp1 down 2>/dev/null; \
              {host_route_cleanup} \
-             /opt/homebrew/bin/openfortivpn {ovpn_args} >> {log} 2>&1 & echo $!",
+             {openfortivpn} {ovpn_args} >> {log} 2>&1 & echo $!",
+            openfortivpn = openvpngui_common::OPENFORTIVPN_INSTALL_PATH,
             host_route_cleanup = host_route_cleanup,
             ovpn_args = ovpn_args,
             log = log_path.display()

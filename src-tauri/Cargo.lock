@@ -2483,11 +2483,12 @@ dependencies = [
 
 [[package]]
 name = "openvpngui"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "dirs",
  "log",
+ "openvpngui-common",
  "security-framework",
  "serde",
  "serde_json",
@@ -2500,11 +2501,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openvpngui-common"
+version = "0.1.10"
+
+[[package]]
 name = "openvpngui-helper"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "env_logger",
  "log",
+ "openvpngui-common",
  "serde",
  "serde_json",
  "tokio",

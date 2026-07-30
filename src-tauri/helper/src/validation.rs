@@ -14,9 +14,9 @@ pub fn is_valid_hostname(s: &str) -> bool {
         && !s.starts_with('.')
 }
 
-/// Validate a log file path — must be under /tmp/ and not contain path traversal.
+/// Validate a log file path — must be under the app temp prefix and not contain path traversal.
 pub fn is_valid_log_path(s: &str) -> bool {
-    s.starts_with("/tmp/openvpngui-") && !s.contains("..")
+    s.starts_with(openvpngui_common::VPN_LOG_PREFIX) && !s.contains("..")
 }
 
 /// Check that a process with the given PID is actually openfortivpn.
@@ -60,12 +60,10 @@ pub fn validate_vpn_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The only binary we allow the helper to execute.
-pub const OPENFORTIVPN_PATH: &str = "/opt/homebrew/bin/openfortivpn";
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openvpngui_common::VPN_LOG_PREFIX;
 
     #[test]
     fn test_valid_ipv4() {
@@ -102,17 +100,17 @@ mod tests {
 
     #[test]
     fn test_valid_log_path() {
-        assert!(is_valid_log_path("/tmp/openvpngui-abc123.log"));
-        assert!(is_valid_log_path(
-            "/tmp/openvpngui-550e8400-e29b-41d4-a716-446655440000.log"
-        ));
+        assert!(is_valid_log_path(&format!("{VPN_LOG_PREFIX}abc123.log")));
+        assert!(is_valid_log_path(&format!(
+            "{VPN_LOG_PREFIX}550e8400-e29b-41d4-a716-446655440000.log"
+        )));
     }
 
     #[test]
     fn test_invalid_log_path() {
         assert!(!is_valid_log_path("/etc/passwd"));
         assert!(!is_valid_log_path("/tmp/other-file.log"));
-        assert!(!is_valid_log_path("/tmp/openvpngui-../../etc/passwd"));
+        assert!(!is_valid_log_path(&format!("{VPN_LOG_PREFIX}../../etc/passwd")));
     }
 
     #[test]

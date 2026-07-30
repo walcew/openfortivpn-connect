@@ -1,49 +1,49 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "OpenFortiVpn Connect",
-  "version": "0.1.9",
-  "identifier": "com.openfortivpn-connect.desktop",
-  "build": {
-    "frontendDist": "../dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run build:helper && npm run dev",
-    "beforeBuildCommand": "npm run build"
-  },
   "app": {
-    "withGlobalTauri": true,
     "macOSPrivateApi": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "OPENFORTIVPN CONNECT",
-        "hiddenTitle": true,
-        "width": 400,
-        "height": 560,
-        "resizable": false,
-        "fullscreen": false,
-        "visible": true,
-        "transparent": true,
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "shadow": true
-      }
-    ],
     "security": {
       "csp": null
-    }
+    },
+    "windows": [
+      {
+        "decorations": true,
+        "fullscreen": false,
+        "height": 560,
+        "hiddenTitle": true,
+        "label": "main",
+        "resizable": false,
+        "shadow": true,
+        "title": "OPENFORTIVPN CONNECT",
+        "titleBarStyle": "Overlay",
+        "transparent": true,
+        "visible": true,
+        "width": 400
+      }
+    ],
+    "withGlobalTauri": true
+  },
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build:openfortivpn && npm run build:helper && npm run dev",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "resources": {
-      "target/release/openvpngui-helper": "openvpngui-helper"
-    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
-  }
+    ],
+    "resources": {
+      "binaries/openfortivpn": "openfortivpn",
+      "target/release/openvpngui-helper": "openvpngui-helper"
+    },
+    "targets": "all"
+  },
+  "identifier": "com.openfortivpn-connect.desktop",
+  "productName": "OpenFortiVpn Connect"
 }

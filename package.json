@@ -1,13 +1,14 @@
 {
   "name": "openvpngui",
-  "version": "1.0.0",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:openfortivpn": "scripts/build-openfortivpn.sh",
     "build:helper": "cd src-tauri && cargo build --release -p openvpngui-helper",
-    "prebuild": "npm run build:helper",
+    "prebuild": "npm run build:openfortivpn && npm run build:helper",
     "preview": "vite preview",
     "tauri": "tauri"
   },

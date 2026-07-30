@@ -4,14 +4,14 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+use openvpngui_common::HELPER_SOCKET_PATH;
+
 use crate::handlers;
 use crate::protocol::Request;
 
-pub const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
-
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Remove stale socket file if it exists
-    let socket_path = Path::new(SOCKET_PATH);
+    let socket_path = Path::new(HELPER_SOCKET_PATH);
     if socket_path.exists() {
         fs::remove_file(socket_path)?;
     }
@@ -26,7 +26,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666))?;
     }
 
-    log::info!("Listening on {}", SOCKET_PATH);
+    log::info!("Listening on {}", HELPER_SOCKET_PATH);
 
     loop {
         match listener.accept().await {

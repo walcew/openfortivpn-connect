@@ -2,6 +2,9 @@ node_modules
 dist
 target
 .DS_Store
+project.env
+src-tauri/binaries/openfortivpn
+src-tauri/binaries/openfortivpn.version
 .superpowers/
 docs/superpowers/
 docs/plans/

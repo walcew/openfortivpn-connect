@@ -32,7 +32,7 @@ brew tap walcew/tap
 brew install --cask openfortivpn-connect
 ```
 
-This will automatically install [openfortivpn](https://github.com/adrienverge/openfortivpn) as a dependency.
+`openfortivpn` is bundled in the app (no separate CLI install).
 
 ### Manual
 
@@ -41,16 +41,9 @@ Download the `.dmg` for your architecture from [Releases](https://github.com/wal
 - **Apple Silicon (M1/M2/M3/M4):** `OpenFortiVpn.Connect_x.x.x_aarch64.dmg`
 - **Intel:** `OpenFortiVpn.Connect_x.x.x_x64.dmg`
 
-You will also need to install openfortivpn manually:
-
-```bash
-brew install openfortivpn
-```
-
 ## Prerequisites
 
 - macOS 12 (Monterey) or later
-- [openfortivpn](https://github.com/adrienverge/openfortivpn)
 
 ## Building from Source
 
@@ -59,15 +52,25 @@ brew install openfortivpn
 - [Rust](https://rustup.rs/) (1.77.2+)
 - [Node.js](https://nodejs.org/) (18+)
 - [Tauri CLI](https://tauri.app/)
+- A C toolchain to compile the bundled openfortivpn/OpenSSL: **Homebrew and/or Xcode Command Line Tools**
+
+`scripts/build-openfortivpn.sh` picks what is available:
+
+1. autoconf/automake already on `PATH`
+2. else **Homebrew** (`brew install autoconf automake`)
+3. else bootstrap autotools with **Xcode CLT** (`clang`/`make`/`perl`) - slower, first run only
+
+Compiling from source always needs a compiler: there is no zero-toolchain path. Installing the DMG does not need Homebrew or Xcode CLT.
 
 ### Build
 
 ```bash
 npm install
+npm run build:openfortivpn
 cargo tauri build
 ```
 
-The built `.app` will be in `src-tauri/target/release/bundle/macos/`.
+By default `npm run build:openfortivpn` fetches the latest [openfortivpn](https://github.com/adrienverge/openfortivpn) release (`OPENFORTIVPN_VERSION=latest`). Pin a tag for reproducible builds, e.g. `OPENFORTIVPN_VERSION=v1.24.1`.
 
 ### Development
 
@@ -79,9 +82,18 @@ cargo tauri dev
 
 - **Backend:** [Tauri v2](https://tauri.app/) + Rust
 - **Frontend:** React 19 + TypeScript + Tailwind CSS v4
-- **VPN engine:** [openfortivpn](https://github.com/adrienverge/openfortivpn) (CLI)
+- **VPN engine:** bundled [openfortivpn](https://github.com/adrienverge/openfortivpn) (statically linked OpenSSL)
 - **Security:** macOS Keychain for credential storage
 - **DNS:** Native macOS `scutil` integration
+
+### Where to edit identity / shared values
+
+| What | File |
+|------|------|
+| App + helper version | `src-tauri/Cargo.toml` → `[workspace.package].version` |
+| Names, paths, repo, bundle ids, cask, … | `src-tauri/common/src/lib.rs` |
+
+Derived files (frontend constants, `tauri.conf.json` fields, `package.json` name/version, `project.env`, …) are regenerated when you run `cargo tauri dev` or `cargo tauri build` (via `src-tauri/build.rs`). Do not edit those by hand.
 
 ## Credits
 
@@ -96,6 +108,8 @@ This project is **not affiliated with, endorsed by, or associated with Fortinet,
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+The bundled [openfortivpn](https://github.com/adrienverge/openfortivpn) binary is GPL-3.0; its source is available upstream. OpenSSL is linked statically into that binary.
 
 ## Author
 

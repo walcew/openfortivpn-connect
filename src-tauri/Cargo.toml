@@ -1,9 +1,13 @@
 [workspace]
-members = [".", "helper"]
+members = [".", "helper", "common"]
+
+[workspace.package]
+# Single source of truth for app + helper version (tauri.conf.json omits version).
+version = "0.1.10"
 
 [package]
 name = "openvpngui"
-version = "0.1.9"
+version.workspace = true
 description = "OpenFortiVpn Connect - A macOS VPN client"
 authors = ["you"]
 license = "MIT"
@@ -17,8 +21,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
+openvpngui-common = { path = "common" }
+serde_json = "1"
 
 [dependencies]
+openvpngui-common = { path = "common" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

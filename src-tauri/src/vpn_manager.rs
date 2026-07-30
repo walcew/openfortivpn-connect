@@ -112,13 +112,14 @@ impl VpnManager {
             None
         };
 
-        // 2FA needs helper >= 0.1.9 (piped stdin + write-stdin). Refuse older helpers.
+        // 2FA needs a helper that supports piped stdin + write-stdin. Refuse older helpers.
         if two_factor.is_some() {
             match crate::helper_client::ping() {
                 Ok(version) => {
                     if !helper_version_supports_otp(&version) {
                         let msg = format!(
-                            "Two-factor authentication requires helper v0.1.9+ (found v{}). Reinstall the helper from Settings.",
+                            "Two-factor authentication requires helper v{}+ (found v{}). Reinstall the helper from Settings.",
+                            openvpngui_common::MIN_HELPER_OTP_VERSION,
                             version
                         );
                         self.set_state(
@@ -337,17 +338,22 @@ impl VpnManager {
     }
 }
 
-/// Helper v0.1.9+ keeps openfortivpn stdin open and supports `write-stdin` for OTP.
+/// Helpers at/after MIN_HELPER_OTP_VERSION keep openfortivpn stdin open for OTP.
 fn helper_version_supports_otp(version: &str) -> bool {
+    parse_semver_triple(version) >= parse_semver_triple(openvpngui_common::MIN_HELPER_OTP_VERSION)
+}
+
+fn parse_semver_triple(version: &str) -> (u32, u32, u32) {
     let mut parts = version
         .trim()
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse::<u32>().ok());
-    let major = parts.next().unwrap_or(0);
-    let minor = parts.next().unwrap_or(0);
-    let patch = parts.next().unwrap_or(0);
-    (major, minor, patch) >= (0, 1, 9)
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
 }
 
 #[cfg(test)]
@@ -355,9 +361,9 @@ mod tests {
     use super::helper_version_supports_otp;
 
     #[test]
-    fn otp_requires_helper_0_1_9() {
+    fn otp_requires_min_helper_version() {
         assert!(!helper_version_supports_otp("0.1.8"));
-        assert!(helper_version_supports_otp("0.1.9"));
+        assert!(helper_version_supports_otp(openvpngui_common::MIN_HELPER_OTP_VERSION));
         assert!(helper_version_supports_otp("0.2.0"));
     }
 }

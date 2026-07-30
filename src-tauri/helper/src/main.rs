@@ -6,13 +6,12 @@ mod validation;
 use std::fs;
 use std::path::Path;
 
+use openvpngui_common::{HELPER_BINARY_NAME, HELPER_SOCKET_PATH};
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    log::info!(
-        "openvpngui-helper v{} starting",
-        env!("CARGO_PKG_VERSION")
-    );
+    log::info!("{} v{} starting", HELPER_BINARY_NAME, env!("CARGO_PKG_VERSION"));
 
     // Run server with graceful shutdown on SIGTERM/SIGINT
     tokio::select! {
@@ -25,14 +24,14 @@ async fn main() {
         _ = shutdown_signal() => {
             log::info!("Shutdown signal received, cleaning up");
             // Remove socket file on clean shutdown
-            let socket_path = Path::new(server::SOCKET_PATH);
+            let socket_path = Path::new(HELPER_SOCKET_PATH);
             if socket_path.exists() {
                 let _ = fs::remove_file(socket_path);
             }
         }
     }
 
-    log::info!("openvpngui-helper stopped");
+    log::info!("{} stopped", HELPER_BINARY_NAME);
 }
 
 async fn shutdown_signal() {

@@ -1,0 +1,6 @@
+[package]
+name = "openvpngui-common"
+version.workspace = true
+edition = "2021"
+description = "Shared constants for the app and privileged helper"
+publish = false
