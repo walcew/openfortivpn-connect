@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
@@ -14,6 +15,20 @@ use crate::helper_client;
 use crate::models::{
     BandwidthPayload, ConnectionState, ConnectionStatusPayload, LogLinePayload, TwoFactorType,
 };
+
+/// Event: health monitor gave up waiting for tunnel recovery. Payload: `{ "message": string }`.
+pub const SESSION_GIVE_UP_EVENT: &str = "session-give-up";
+
+const RECONNECT_GAVE_UP_MSG: &str =
+    "Reconnection timed out. The tunnel did not recover - connect again.";
+
+const HEALTH_POLL_SECS: u64 = 5;
+/// Consecutive missing-interface polls before marking the tunnel unhealthy (~15s).
+const MISSING_IFACE_THRESHOLD: u32 = 3;
+/// Consecutive peer-probe failures before marking the tunnel unhealthy (~15s).
+const PEER_FAIL_THRESHOLD: u32 = 3;
+/// Peer probes before first success; after this, ICMP probing is disabled (~30s).
+const PEER_PROBE_SKIP_AFTER: u32 = 6;
 
 pub struct ProcessManager {
     pid: Option<u32>,
@@ -47,6 +62,7 @@ impl ProcessManager {
         dns_fallback: bool,
         two_factor: Option<TwoFactorType>,
         auto_reconnect: bool,
+        reconnect_give_up: Duration,
     ) -> Result<(), String> {
         // Resolve the VPN server IP from "host:port" (args[0]) so the helper can
         // clear any stale host route to it left by a previous session.
@@ -112,6 +128,7 @@ impl ProcessManager {
                 fallback_dns,
                 two_factor,
                 auto_reconnect,
+                reconnect_give_up,
             )
             .await;
         });
@@ -296,6 +313,7 @@ async fn start_log_monitor(
     fallback_dns: Vec<String>,
     two_factor: Option<TwoFactorType>,
     auto_reconnect: bool,
+    reconnect_give_up: Duration,
 ) {
     use std::io::Read;
 
@@ -374,6 +392,7 @@ async fn start_log_monitor(
                             &vpn_peer_ip,
                             pid,
                             auto_reconnect,
+                            reconnect_give_up,
                         );
                     }
                     if stop_flag.load(Ordering::Relaxed) {
@@ -439,6 +458,7 @@ async fn start_log_monitor(
                         &vpn_peer_ip,
                         pid,
                         auto_reconnect,
+                        reconnect_give_up,
                     );
                 }
 
@@ -474,6 +494,7 @@ fn handle_log_line(
     vpn_peer_ip: &Arc<Mutex<Option<String>>>,
     pid: u32,
     auto_reconnect: bool,
+    reconnect_give_up: Duration,
 ) {
     let level = if trimmed.contains("ERROR") || trimmed.contains("error") {
         "error"
@@ -652,6 +673,7 @@ fn handle_log_line(
                     health_profile,
                     health_ip,
                     auto_reconnect,
+                    reconnect_give_up,
                 )
                 .await;
             });
@@ -831,6 +853,10 @@ fn emit_disconnected(app_handle: &AppHandle, message: Option<String>) {
 /// Peer IP comes from ifconfig (`inet local --> peer`), never hardcoded.
 /// If ICMP to the peer never succeeds, probing is disabled (peer may block ping)
 /// and we fall back to process + interface checks only.
+///
+/// While reconnecting (`tunnel_up == false` + auto_reconnect), recovery is detected
+/// via interface/peer probes (not log text). If recovery does not happen within
+/// `reconnect_give_up`, emit `session-give-up` so VpnManager can tear down cleanly.
 async fn start_connection_health_monitor(
     app_handle: AppHandle,
     stop_flag: Arc<AtomicBool>,
@@ -841,21 +867,24 @@ async fn start_connection_health_monitor(
     profile_id: String,
     vpn_ip: String,
     auto_reconnect: bool,
+    reconnect_give_up: Duration,
 ) {
     let mut missing_iface = 0u32;
     let mut probe_fails = 0u32;
     let mut probe_ever_ok = false;
     let mut probe_skipped = false;
     let mut probe_misses_before_ok = 0u32;
+    let mut reconnect_since: Option<Instant> = None;
     log::info!(
-        "Connection health monitor started (pid={}, ip={}, auto_reconnect={})",
+        "Connection health monitor started (pid={}, ip={}, auto_reconnect={}, give_up={}s)",
         pid,
         vpn_ip,
-        auto_reconnect
+        auto_reconnect,
+        reconnect_give_up.as_secs()
     );
 
     while !stop_flag.load(Ordering::Relaxed) {
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(HEALTH_POLL_SECS)).await;
 
         if !is_process_alive(pid) {
             log::warn!("VPN process {} is no longer alive", pid);
@@ -875,8 +904,43 @@ async fn start_connection_health_monitor(
         if !tunnel_up.load(Ordering::Relaxed) {
             missing_iface = 0;
             probe_fails = 0;
+            if !auto_reconnect {
+                continue;
+            }
+            let since = reconnect_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= reconnect_give_up {
+                log::warn!(
+                    "Auto-reconnect give-up after {}s (pid={})",
+                    since.elapsed().as_secs(),
+                    pid
+                );
+                stop_flag.store(true, Ordering::Relaxed);
+                let _ = app_handle.emit(
+                    SESSION_GIVE_UP_EVENT,
+                    serde_json::json!({ "message": RECONNECT_GAVE_UP_MSG }),
+                );
+                break;
+            }
+            if vpn_ip != "unknown" {
+                if tunnel_recovered(
+                    &vpn_ip,
+                    &vpn_peer_ip,
+                    probe_skipped,
+                )
+                .await
+                {
+                    log::info!("Tunnel recovered via interface/peer probe");
+                    tunnel_up.store(true, Ordering::Relaxed);
+                    reconnect_since = None;
+                    probe_fails = 0;
+                    probe_misses_before_ok = 0;
+                    emit_tunnel_restored(&app_handle, &profile_id, &vpn_ip);
+                }
+            }
             continue;
         }
+
+        reconnect_since = None;
 
         if vpn_ip == "unknown" {
             continue;
@@ -884,8 +948,7 @@ async fn start_connection_health_monitor(
 
         let Some((_iface, ifconfig_peer)) = find_ppp_link(&vpn_ip) else {
             missing_iface += 1;
-            // ~15s without the VPN IP on a ppp interface.
-            if missing_iface >= 3 {
+            if missing_iface >= MISSING_IFACE_THRESHOLD {
                 mark_tunnel_unhealthy(
                     &app_handle,
                     &stop_flag,
@@ -899,6 +962,7 @@ async fn start_connection_health_monitor(
                     break;
                 }
                 missing_iface = 0;
+                reconnect_since = Some(Instant::now());
             }
             continue;
         };
@@ -931,9 +995,9 @@ async fn start_connection_health_monitor(
 
         if !probe_ever_ok {
             // Never got a successful ping: peer may block ICMP. Stop probing
-            // after ~30s so we do not false-disconnect.
+            // so we do not false-disconnect.
             probe_misses_before_ok += 1;
-            if probe_misses_before_ok >= 6 {
+            if probe_misses_before_ok >= PEER_PROBE_SKIP_AFTER {
                 log::info!(
                     "PPP peer {} never answered ping; disabling reachability probe",
                     peer
@@ -945,11 +1009,12 @@ async fn start_connection_health_monitor(
 
         probe_fails += 1;
         log::warn!(
-            "Tunnel probe failed to PPP peer {} ({}/3)",
+            "Tunnel probe failed to PPP peer {} ({}/{})",
             peer,
-            probe_fails
+            probe_fails,
+            PEER_FAIL_THRESHOLD
         );
-        if probe_fails < 3 {
+        if probe_fails < PEER_FAIL_THRESHOLD {
             continue;
         }
 
@@ -968,9 +1033,48 @@ async fn start_connection_health_monitor(
         probe_fails = 0;
         probe_ever_ok = false;
         probe_misses_before_ok = 0;
+        reconnect_since = Some(Instant::now());
     }
 
     log::info!("Connection health monitor stopped");
+}
+
+/// True when the VPN IP is back on a ppp interface and (if known) the peer answers.
+async fn tunnel_recovered(
+    vpn_ip: &str,
+    vpn_peer_ip: &Arc<Mutex<Option<String>>>,
+    probe_skipped: bool,
+) -> bool {
+    let Some((_iface, ifconfig_peer)) = find_ppp_link(vpn_ip) else {
+        return false;
+    };
+    let peer = ifconfig_peer.or_else(|| vpn_peer_ip.lock().ok().and_then(|g| g.clone()));
+    match peer {
+        Some(peer) if !probe_skipped => probe_host_reachable(&peer).await,
+        _ => true,
+    }
+}
+
+fn emit_tunnel_restored(app_handle: &AppHandle, profile_id: &str, vpn_ip: &str) {
+    let since = Utc::now();
+    crate::tray::update_tray_icon(
+        app_handle,
+        &ConnectionState::Connected {
+            profile_id: profile_id.to_string(),
+            ip: vpn_ip.to_string(),
+            since,
+        },
+    );
+    let _ = app_handle.emit(
+        "connection-status-changed",
+        ConnectionStatusPayload {
+            state: "Connected".into(),
+            profile_id: Some(profile_id.to_string()),
+            ip: Some(vpn_ip.to_string()),
+            since: Some(since.to_rfc3339()),
+            message: None,
+        },
+    );
 }
 
 fn mark_tunnel_unhealthy(

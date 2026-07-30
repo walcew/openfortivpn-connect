@@ -6,6 +6,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Listener, Manager};
 
 use crate::models::{ConnectionState, ConnectionStatusPayload, VpnProfile};
+use crate::process_manager::SESSION_GIVE_UP_EVENT;
 use crate::vpn_manager::VpnManager;
 
 const TRAY_ICON_DISCONNECTED: &[u8] = include_bytes!("../icons/tray/disconnected@2x.png");
@@ -42,6 +43,33 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
+            }
+            refresh_tray_menu(&h);
+        });
+    });
+
+    // Health monitor give-up: tear down VPN via VpnManager (needs Mutex + cleanup paths).
+    let give_up_handle = app.handle().clone();
+    app.listen(SESSION_GIVE_UP_EVENT, move |event| {
+        let h = give_up_handle.clone();
+        let payload_str = event.payload().to_string();
+        std::thread::spawn(move || {
+            let message = serde_json::from_str::<serde_json::Value>(&payload_str)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "Reconnection timed out. Connect again.".into());
+            for _ in 0..10 {
+                let mgr_state = h.state::<Mutex<VpnManager>>();
+                if let Ok(mut mgr) = mgr_state.try_lock() {
+                    mgr.abandon_reconnect(&h, &message);
+                    drop(mgr);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             refresh_tray_menu(&h);
         });

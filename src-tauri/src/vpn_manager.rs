@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tauri::{AppHandle, Emitter};
 
 use crate::keychain;
@@ -6,6 +8,11 @@ use crate::models::{
 };
 use crate::process_manager::ProcessManager;
 use crate::profile_store::ProfileStore;
+
+/// openfortivpn `--persistent` retry interval (seconds).
+const PERSISTENT_RETRY_SECS: u64 = 5;
+/// Abandon auto-reconnect after this many retry intervals without a healthy tunnel.
+const RECONNECT_GIVE_UP_INTERVALS: u64 = 24;
 
 pub struct VpnManager {
     state: ConnectionState,
@@ -200,13 +207,16 @@ impl VpnManager {
             true
         };
         if auto_reconnect && !has_persistent {
-            args.push("--persistent=5".to_string());
+            args.push(format!("--persistent={}", PERSISTENT_RETRY_SECS));
         }
 
         // Enable verbose logging so we can capture DNS server info from debug output
         args.push("-v".to_string());
 
         args.extend(profile.extra_args.clone());
+
+        let reconnect_give_up =
+            Duration::from_secs(PERSISTENT_RETRY_SECS * RECONNECT_GIVE_UP_INTERVALS);
 
         // Spawn the process
         match self.process_manager.spawn_vpn(
@@ -217,6 +227,7 @@ impl VpnManager {
             dns_fallback,
             two_factor,
             auto_reconnect,
+            reconnect_give_up,
         ) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -272,6 +283,27 @@ impl VpnManager {
         self.begin_disconnect(&app_handle);
         self.finish_disconnect(&app_handle);
         Ok(())
+    }
+
+    /// Kill a stuck auto-reconnect session and surface a clear error.
+    /// Called when the health monitor gives up (interface/peer never recovered).
+    pub fn abandon_reconnect(&mut self, app_handle: &AppHandle, reason: &str) {
+        if matches!(
+            self.state,
+            ConnectionState::Disconnected
+                | ConnectionState::Disconnecting
+                | ConnectionState::Error { .. }
+        ) {
+            return;
+        }
+        log::warn!("Abandoning reconnect: {}", reason);
+        let _ = self.process_manager.kill_vpn();
+        self.set_state(
+            ConnectionState::Error {
+                message: reason.to_string(),
+            },
+            app_handle,
+        );
     }
 
     /// Persist a trusted certificate digest and reconnect the given profile.
