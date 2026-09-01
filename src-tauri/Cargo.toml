@@ -3,7 +3,7 @@ members = [".", "helper"]
 
 [package]
 name = "openvpngui"
-version = "0.1.8"
+version = "0.1.9"
 description = "OpenFortiVpn Connect - A macOS VPN client"
 authors = ["you"]
 license = "MIT"
@@ -30,3 +30,5 @@ window-vibrancy = "0.6"
 tauri-plugin-opener = "2"
 log = "0.4"
 dirs = "6"
+native-tls = "0.2"
+sha2 = "0.10"
