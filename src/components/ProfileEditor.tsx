@@ -157,6 +157,21 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
           />
         </label>
 
+        <label className="flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={form.ignore_cert_errors}
+            onChange={(e) => setForm({ ...form, ignore_cert_errors: e.target.checked })}
+            className="accent-blue-500 mt-0.5"
+          />
+          <span className="flex flex-col">
+            <span className="text-sm text-white/70">Ignore certificate errors</span>
+            <span className="text-xs text-white/40">
+              Trusts whatever certificate the gateway presents. Only use on gateways you control.
+            </span>
+          </span>
+        </label>
+
         <TrustedCertManager
           certs={form.trusted_certs}
           onChange={(certs) => setForm({ ...form, trusted_certs: certs })}

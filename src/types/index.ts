@@ -7,6 +7,7 @@ export interface VpnProfile {
   username: string | null;
   realm: string | null;
   trusted_certs: string[];
+  ignore_cert_errors: boolean;
   extra_args: string[];
 }
 
@@ -53,6 +54,7 @@ export function newProfile(): VpnProfile {
     username: null,
     realm: null,
     trusted_certs: [],
+    ignore_cert_errors: false,
     extra_args: [],
   };
 }

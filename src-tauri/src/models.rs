@@ -23,6 +23,8 @@ pub struct VpnProfile {
     pub username: Option<String>,
     pub realm: Option<String>,
     pub trusted_certs: Vec<String>,
+    #[serde(default)]
+    pub ignore_cert_errors: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -37,6 +39,7 @@ impl Default for VpnProfile {
             username: None,
             realm: None,
             trusted_certs: Vec::new(),
+            ignore_cert_errors: false,
             extra_args: Vec::new(),
         }
     }

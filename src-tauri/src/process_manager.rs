@@ -93,7 +93,7 @@ impl ProcessManager {
 
         let stop_flag = self.stop_flag.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode, fallback_dns).await;
+            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode, fallback_dns, pid).await;
         });
         self.monitor_handle = Some(handle);
 
@@ -268,6 +268,7 @@ async fn start_log_monitor(
     stop_flag: Arc<AtomicBool>,
     debug_mode: bool,
     fallback_dns: Vec<String>,
+    pid: u32,
 ) {
     // Wait a moment for the log file to start receiving data
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -285,11 +286,44 @@ async fn start_log_monitor(
     let mut dns_servers: Vec<String> = Vec::new();
     let mut dns_suffixes: Vec<String> = Vec::new();
     let mut vpn_local_ip: Option<String> = None;
+    let mut cert_failed = false;
+    let mut cert_reported = false;
+    let mut last_error: Option<String> = None;
+    let mut tunnel_up = false;
+    let mut idle_ticks: u32 = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
+                // openfortivpn exits on auth and connection failures, and nothing
+                // else in the log says so. Without this check the UI would sit on
+                // Connecting forever. Only polled until the tunnel is up, so a
+                // long-lived connection costs nothing.
+                idle_ticks += 1;
+                if !tunnel_up && idle_ticks % 10 == 0 && !process_alive(pid) {
+                    let message = last_error.clone().unwrap_or_else(|| {
+                        "openfortivpn exited before the tunnel came up".to_string()
+                    });
+                    log::warn!("openfortivpn (PID {}) exited: {}", pid, message);
+                    crate::tray::update_tray_icon(
+                        &app_handle,
+                        &ConnectionState::Error {
+                            message: message.clone(),
+                        },
+                    );
+                    let _ = app_handle.emit(
+                        "connection-status-changed",
+                        ConnectionStatusPayload {
+                            state: "Error".into(),
+                            profile_id: None,
+                            ip: None,
+                            since: None,
+                            message: Some(message),
+                        },
+                    );
+                    break;
+                }
                 // No new data, wait and retry
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 continue;
@@ -308,6 +342,10 @@ async fn start_log_monitor(
                 } else {
                     "info"
                 };
+
+                if level == "error" {
+                    last_error = Some(strip_log_prefix(&trimmed));
+                }
 
                 // Check if this is an important line that should always be shown
                 let is_important = level != "info"
@@ -350,6 +388,26 @@ async fn start_log_monitor(
                     }
                 }
 
+                // Detect an untrusted gateway certificate. openfortivpn prints the
+                // failure and the sha256 digest on separate lines, so we latch the
+                // failure and pick up the digest from a following line.
+                if !cert_reported {
+                    if trimmed.contains("Gateway certificate validation failed") {
+                        cert_failed = true;
+                    } else if cert_failed {
+                        if let Some(digest) = extract_cert_digest(&trimmed) {
+                            cert_reported = true;
+                            let _ = app_handle.emit(
+                                "cert-warning",
+                                serde_json::json!({
+                                    "digest": digest,
+                                    "profile_id": profile_id.clone()
+                                }),
+                            );
+                        }
+                    }
+                }
+
                 // Capture VPN local IP from earlier log lines
                 if vpn_local_ip.is_none() {
                     if let Some(ip) = extract_vpn_ip_from_log(&trimmed) {
@@ -360,6 +418,7 @@ async fn start_log_monitor(
 
                 // Detect state changes
                 if trimmed.contains("Tunnel is up and running") {
+                    tunnel_up = true;
                     // Build final DNS server list. Fallback (DHCP + Google) is only
                     // used when the VPN itself did not provide any DNS servers —
                     // otherwise mixing public resolvers with the VPN's split-DNS
@@ -458,17 +517,6 @@ async fn start_log_monitor(
                             },
                         );
                     }
-                } else if trimmed.contains("certificate") && trimmed.contains("digest") {
-                    // Try to extract cert digest for trusted cert flow
-                    if let Some(digest) = extract_cert_digest(&trimmed) {
-                        let _ = app_handle.emit(
-                            "cert-warning",
-                            serde_json::json!({
-                                "digest": digest,
-                                "profile_id": profile_id.clone()
-                            }),
-                        );
-                    }
                 }
             }
             Err(e) => {
@@ -479,6 +527,34 @@ async fn start_log_monitor(
             }
         }
     }
+}
+
+/// Whether a PID is still a live process. `kill -0` is not usable here: the VPN
+/// runs as root and would answer EPERM for a process that is very much alive.
+/// A dead child of the helper daemon lingers as a zombie, so those count as dead.
+fn process_alive(pid: u32) -> bool {
+    match Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "state="])
+        .output()
+    {
+        Ok(o) => {
+            let state = String::from_utf8_lossy(&o.stdout);
+            let state = state.trim();
+            !state.is_empty() && !state.starts_with('Z')
+        }
+        // If we cannot tell, assume it is alive rather than kill a good session.
+        Err(_) => true,
+    }
+}
+
+/// Strip the "[timestamp] LEVEL:" prefix openfortivpn puts on each log line.
+fn strip_log_prefix(line: &str) -> String {
+    for level in ["ERROR:", "WARN:", "INFO:", "DEBUG:"] {
+        if let Some((_, message)) = line.split_once(level) {
+            return message.trim().to_string();
+        }
+    }
+    line.to_string()
 }
 
 fn extract_ip(line: &str) -> Option<String> {
@@ -797,6 +873,24 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_alive_detects_dead_and_live_pids() {
+        assert!(process_alive(std::process::id()));
+        // PID 0 is never a user-visible process on macOS.
+        assert!(!process_alive(0));
+    }
+
+    #[test]
+    fn strip_log_prefix_keeps_only_the_message() {
+        assert_eq!(
+            strip_log_prefix(
+                "[2026-08-27T20:32:56.869668+00:00] ERROR:  Could not authenticate to gateway."
+            ),
+            "Could not authenticate to gateway."
+        );
+        assert_eq!(strip_log_prefix("no prefix here"), "no prefix here");
+    }
 
     #[test]
     fn resolve_server_ip_passes_through_ipv4_literal() {

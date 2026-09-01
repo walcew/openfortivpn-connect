@@ -1,3 +1,4 @@
+mod cert_fetcher;
 mod commands;
 mod dns_manager;
 mod keychain;

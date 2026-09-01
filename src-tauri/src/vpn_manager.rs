@@ -88,6 +88,20 @@ impl VpnManager {
             .get_by_id(profile_id)?
             .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
 
+        // Resolve credentials up front: without -u/-p the openfortivpn blocks
+        // waiting for input on stdin and the UI would sit on Connecting forever.
+        let password_creds = if profile.auth_type == AuthType::Password {
+            match Self::resolve_password_creds(&profile) {
+                Ok(creds) => Some(creds),
+                Err(e) => {
+                    self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
         // Set connecting state
         self.set_state(
             ConnectionState::Connecting {
@@ -99,23 +113,33 @@ impl VpnManager {
         // Build args
         let mut args = vec![format!("{}:{}", profile.host, profile.port)];
 
-        match profile.auth_type {
-            AuthType::Password => {
-                if let Some(ref username) = profile.username {
-                    args.push("-u".to_string());
-                    args.push(username.clone());
+        if let Some((username, password)) = password_creds {
+            args.push("-u".to_string());
+            args.push(username);
+            args.push("-p".to_string());
+            args.push(password);
+        } else {
+            args.push("--saml-login".to_string());
+        }
+
+        let mut trusted_certs = profile.trusted_certs.clone();
+        // O openfortivpn não tem opção de ignorar o certificado: quando o perfil
+        // pede isso, buscamos o digest sha256 direto do gateway e o passamos como
+        // --trusted-cert. Assim a conexão funciona já na primeira tentativa e
+        // continua funcionando quando o certificado é renovado.
+        if profile.ignore_cert_errors {
+            match crate::cert_fetcher::fetch_gateway_digest(&profile.host, profile.port) {
+                Ok(digest) => {
+                    log::info!("Auto-trusting gateway certificate {}", digest);
+                    if !trusted_certs.contains(&digest) {
+                        trusted_certs.push(digest);
+                    }
                 }
-                if let Ok(Some(password)) = keychain::get_password(&profile.id) {
-                    args.push("-p".to_string());
-                    args.push(password);
-                }
-            }
-            AuthType::Saml => {
-                args.push("--saml-login".to_string());
+                Err(e) => log::warn!("Could not fetch gateway certificate digest: {}", e),
             }
         }
 
-        for cert in &profile.trusted_certs {
+        for cert in &trusted_certs {
             args.push(format!("--trusted-cert={}", cert));
         }
 
@@ -144,6 +168,36 @@ impl VpnManager {
                 Err(e)
             }
         }
+    }
+
+    /// Look up the username and the keychain password of a password-auth profile.
+    /// Both are required: openfortivpn prompts on stdin when either is missing,
+    /// and the process would just hang with nothing shown to the user.
+    fn resolve_password_creds(profile: &VpnProfile) -> Result<(String, String), String> {
+        let username = profile
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "Profile '{}' uses password authentication but has no username. \
+                     Edit the profile and fill in the username.",
+                    profile.name
+                )
+            })?;
+
+        let password = keychain::get_password(&profile.id)?
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "No password stored for profile '{}'. \
+                     Edit the profile and set the password.",
+                    profile.name
+                )
+            })?;
+
+        Ok((username.to_string(), password))
     }
 
     /// Begin disconnecting: sets state to Disconnecting and returns immediately.
@@ -192,5 +246,36 @@ impl VpnManager {
         self.profile_store.delete(profile_id)?;
         let _ = keychain::delete_password(profile_id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn password_profile(username: Option<&str>) -> VpnProfile {
+        VpnProfile {
+            name: "Corp".to_string(),
+            auth_type: AuthType::Password,
+            username: username.map(str::to_string),
+            ..VpnProfile::default()
+        }
+    }
+
+    #[test]
+    fn test_password_creds_require_username() {
+        for profile in [password_profile(None), password_profile(Some("   "))] {
+            let err = VpnManager::resolve_password_creds(&profile).unwrap_err();
+            assert!(err.contains("no username"), "unexpected error: {}", err);
+        }
+    }
+
+    #[test]
+    fn test_password_creds_require_stored_password() {
+        // The profile id is a fresh uuid, so nothing is stored in the keychain.
+        let mut profile = password_profile(Some("john.doe"));
+        profile.id = uuid::Uuid::new_v4().to_string();
+        let err = VpnManager::resolve_password_creds(&profile).unwrap_err();
+        assert!(err.contains("No password stored"), "unexpected error: {}", err);
     }
 }
