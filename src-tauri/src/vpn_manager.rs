@@ -246,7 +246,8 @@ fn build_openfortivpn_args(
         args.push(username);
         args.push("-p".to_string());
         args.push(password);
-        if let Some(otp) = otp.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(otp) = otp.map(str::trim).filter(|value| profile.otp_required && !value.is_empty()) {
+            // shortcut: o OTP fica visível no ps enquanto o openfortivpn roda; passar credenciais via arquivo -c quando isso importar
             args.push(format!("--otp={}", otp));
         }
     } else {
@@ -313,6 +314,11 @@ mod tests {
     fn args_of(profile: &VpnProfile, creds: Option<(&str, &str)>, digest: Option<&str>) -> Vec<String> {
         let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
         build_openfortivpn_args(profile, creds, digest, None)
+    }
+
+    fn otp_args(profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Option<&str>) -> Vec<String> {
+        let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
+        build_openfortivpn_args(profile, creds, None, otp)
     }
 
     fn saml_profile() -> VpnProfile {
@@ -403,5 +409,47 @@ mod tests {
         profile.trusted_certs = vec!["aaa".to_string()];
         let args = args_of(&profile, None, None);
         assert_eq!(args.iter().filter(|a| a.starts_with("--trusted-cert=")).count(), 1);
+    }
+
+    #[test]
+    fn test_args_otp_included_when_required() {
+        let mut profile = password_profile(Some("john"));
+        profile.otp_required = true;
+        let args = otp_args(&profile, Some(("john", "s3cret")), Some("123456"));
+        assert!(args.contains(&"--otp=123456".to_string()));
+    }
+
+    #[test]
+    fn test_args_otp_trimmed() {
+        let mut profile = password_profile(Some("john"));
+        profile.otp_required = true;
+        let args = otp_args(&profile, Some(("john", "s3cret")), Some(" 123456 "));
+        assert!(args.contains(&"--otp=123456".to_string()));
+    }
+
+    #[test]
+    fn test_args_otp_blank_is_omitted() {
+        let mut profile = password_profile(Some("john"));
+        profile.otp_required = true;
+        for otp in [None, Some(""), Some("   ")] {
+            let args = otp_args(&profile, Some(("john", "s3cret")), otp);
+            assert!(!args.iter().any(|a| a.starts_with("--otp")), "otp {:?}", otp);
+        }
+    }
+
+    #[test]
+    fn test_args_otp_ignored_when_not_required() {
+        let profile = password_profile(Some("john"));
+        assert!(!profile.otp_required);
+        let args = otp_args(&profile, Some(("john", "s3cret")), Some("123456"));
+        assert!(!args.iter().any(|a| a.starts_with("--otp")));
+    }
+
+    #[test]
+    fn test_args_otp_never_included_for_saml() {
+        let mut profile = saml_profile();
+        profile.otp_required = true;
+        let args = otp_args(&profile, None, Some("123456"));
+        assert!(!args.iter().any(|a| a.starts_with("--otp")));
     }
 }
