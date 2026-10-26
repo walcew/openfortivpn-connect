@@ -37,7 +37,10 @@
     "targets": "all",
     "resources": {
       "target/release/openvpngui-helper": "openvpngui-helper",
-      "binaries/openfortivpn": "openfortivpn"
+      "binaries/openfortivpn": "openfortivpn",
+      "licenses/openfortivpn-LICENSE.txt": "licenses/openfortivpn-LICENSE.txt",
+      "licenses/openfortivpn-LICENSE.OpenSSL.txt": "licenses/openfortivpn-LICENSE.OpenSSL.txt",
+      "licenses/openssl-LICENSE.txt": "licenses/openssl-LICENSE.txt"
     },
     "icon": [
       "icons/32x32.png",

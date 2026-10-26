@@ -1,6 +1,10 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAppVersion } from "../hooks/useAppVersion";
 
+// Mantenha em sincronia com OPENFORTIVPN_VERSION e OPENSSL_VERSION em scripts/build-openfortivpn.sh.
+const OPENFORTIVPN_VERSION = "1.24.1";
+const OPENSSL_VERSION = "3.5.9";
+
 interface Props {
   onBack: () => void;
 }
@@ -62,6 +66,45 @@ export function About({ onBack }: Props) {
           </svg>
           View on GitHub
         </button>
+
+        <div className="w-full border-t border-white/10" />
+
+        {/* Third-party */}
+        <div className="w-full text-left">
+          <h4 className="text-xs font-semibold text-white/60 uppercase tracking-wide mb-2">
+            Third-party
+          </h4>
+          <p className="text-xs text-white/40 leading-relaxed mb-2">
+            This app includes the following open-source software. License texts are in the app
+            bundle.
+          </p>
+          <ul className="text-xs text-white/60 flex flex-col gap-1">
+            <li>
+              <button
+                onClick={() =>
+                  openUrl(
+                    `https://github.com/adrienverge/openfortivpn/tree/v${OPENFORTIVPN_VERSION}`
+                  )
+                }
+                className="text-blue-400 hover:text-blue-300 transition-colors text-left"
+              >
+                openfortivpn {OPENFORTIVPN_VERSION}, GPL-3.0
+              </button>
+            </li>
+            <li>
+              <button
+                onClick={() =>
+                  openUrl(
+                    `https://github.com/openssl/openssl/tree/openssl-${OPENSSL_VERSION}`
+                  )
+                }
+                className="text-blue-400 hover:text-blue-300 transition-colors text-left"
+              >
+                OpenSSL {OPENSSL_VERSION}, Apache-2.0
+              </button>
+            </li>
+          </ul>
+        </div>
 
         <div className="w-full border-t border-white/10" />
 
