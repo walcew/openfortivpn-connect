@@ -7,6 +7,7 @@ set -euo pipefail
 OPENFORTIVPN_VERSION=1.24.1
 OPENSSL_VERSION=3.5.9
 # Os overrides por env existem só para o teste de checksum do CI.
+# shortcut: OPENFORTIVPN_SHA256/OPENSSL_SHA256 permitem trocar o pin em qualquer ambiente, restringir ao CI se o script passar a ser usado fora do release
 OPENFORTIVPN_SHA256="${OPENFORTIVPN_SHA256:-c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465}"
 OPENSSL_SHA256="${OPENSSL_SHA256:-603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a}"
 export MACOSX_DEPLOYMENT_TARGET=12.0

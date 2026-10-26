@@ -57,7 +57,7 @@ Upgrading from 0.1.x? Reinstall the Helper once, when the app asks for it.
 - [Node.js](https://nodejs.org/) (18+)
 - [Tauri CLI](https://tauri.app/)
 - Xcode Command Line Tools (`xcode-select --install`)
-- `brew install autoconf automake` (to build the bundled openfortivpn)
+- `brew install autoconf automake pkg-config` (to build the bundled openfortivpn)
 
 `npm run build:openfortivpn` compiles openfortivpn and OpenSSL from source. It runs automatically on `tauri dev` and `tauri build`.
 

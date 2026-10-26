@@ -70,14 +70,7 @@ jobs:
           mkdir -p target/release
           cp target/${{ matrix.target }}/release/openvpngui-helper target/release/openvpngui-helper
 
-      - name: Cache openfortivpn bundlado
-        uses: actions/cache@v4
-        with:
-          path: src-tauri/binaries/openfortivpn*
-          # O hash do script cobre as versões e os sha256 do openfortivpn e do OpenSSL.
-          key: openfortivpn-${{ matrix.ofv_arch }}-${{ hashFiles('scripts/build-openfortivpn.sh') }}
-
-      - name: Build openfortivpn bundlado
+      - name: Build bundled openfortivpn
         run: |
           # Só dependência de build; o script não usa o OpenSSL do Homebrew.
           brew install autoconf automake
@@ -105,6 +98,12 @@ jobs:
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == 'true' }}
           prerelease: false
           args: '--target ${{ matrix.target }}'
+
+      # Depois do Tauri: o prebuild dele pode sobrescrever o helper com o do host.
+      - name: Verify bundled binary architectures
+        run: |
+          lipo src-tauri/binaries/openfortivpn -verify_arch ${{ matrix.ofv_arch }}
+          lipo src-tauri/target/release/openvpngui-helper -verify_arch ${{ matrix.ofv_arch }}
 
       - name: Upload DMGs (dry run)
         if: inputs.dry_run == true
