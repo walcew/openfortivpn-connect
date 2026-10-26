@@ -63,6 +63,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # O prebuild roda `cargo build --release` sem --target; sem isto ele compila o helper para o
+          # host (arm64) e sobrescreve o target/release/openvpngui-helper copiado no passo anterior.
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
           # Code signing (uncomment when ready):
           # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
