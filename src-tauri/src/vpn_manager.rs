@@ -110,52 +110,26 @@ impl VpnManager {
             &app_handle,
         );
 
-        // Build args
-        let mut args = vec![format!("{}:{}", profile.host, profile.port)];
-
-        if let Some((username, password)) = password_creds {
-            args.push("-u".to_string());
-            args.push(username);
-            args.push("-p".to_string());
-            args.push(password);
-        } else {
-            args.push("--saml-login".to_string());
-        }
-
-        let mut trusted_certs = profile.trusted_certs.clone();
         // O openfortivpn não tem opção de ignorar o certificado: quando o perfil
         // pede isso, buscamos o digest sha256 direto do gateway e o passamos como
         // --trusted-cert. Assim a conexão funciona já na primeira tentativa e
         // continua funcionando quando o certificado é renovado.
-        if profile.ignore_cert_errors {
+        let gateway_digest = if profile.ignore_cert_errors {
             match crate::cert_fetcher::fetch_gateway_digest(&profile.host, profile.port) {
                 Ok(digest) => {
                     log::info!("Auto-trusting gateway certificate {}", digest);
-                    if !trusted_certs.contains(&digest) {
-                        trusted_certs.push(digest);
-                    }
+                    Some(digest)
                 }
-                Err(e) => log::warn!("Could not fetch gateway certificate digest: {}", e),
+                Err(e) => {
+                    log::warn!("Could not fetch gateway certificate digest: {}", e);
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
 
-        for cert in &trusted_certs {
-            args.push(format!("--trusted-cert={}", cert));
-        }
-
-        if let Some(ref realm) = profile.realm {
-            args.push(format!("--realm={}", realm));
-        }
-
-        // Disable openfortivpn's DNS handling — we manage DNS via scutil on macOS
-        // because macOS ignores /etc/resolv.conf
-        args.push("--set-dns=0".to_string());
-        args.push("--pppd-use-peerdns=0".to_string());
-
-        // Enable verbose logging so we can capture DNS server info from debug output
-        args.push("-v".to_string());
-
-        args.extend(profile.extra_args.clone());
+        let args = build_openfortivpn_args(&profile, password_creds, gateway_digest.as_deref());
 
         // Spawn the process
         match self
