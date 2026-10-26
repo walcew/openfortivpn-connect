@@ -14,6 +14,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Prova que um tarball com sha256 divergente aborta antes de compilar,
+      # sem pagar o build completo do openfortivpn no PR.
+      - name: Check openfortivpn build rejects bad checksum
+        run: |
+          if out="$(OPENFORTIVPN_SHA256=0000000000000000000000000000000000000000000000000000000000000000 scripts/build-openfortivpn.sh 2>&1)"; then
+            echo "$out"; echo "expected checksum failure"; exit 1
+          fi
+          echo "$out"
+          grep -q 'error: sha256 mismatch for openfortivpn-' <<<"$out"
+          test ! -e .build-openfortivpn/arm64 -a ! -e .build-openfortivpn/x86_64
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
