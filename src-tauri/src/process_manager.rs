@@ -11,6 +11,7 @@ use tauri::async_runtime::JoinHandle;
 
 use crate::dns_manager::{self, DnsInfo};
 use crate::helper_client;
+use crate::helper_installer::OPENFORTIVPN_INSTALL_PATH;
 use crate::models::{BandwidthPayload, ConnectionState, ConnectionStatusPayload, LogLinePayload};
 
 pub struct ProcessManager {
@@ -107,6 +108,10 @@ impl ProcessManager {
         log_path: &PathBuf,
         vpn_server: Option<&str>,
     ) -> Result<u32, String> {
+        // Mesmo binário root-owned do Helper: nunca o do Homebrew (ADR 0001).
+        if !std::path::Path::new(OPENFORTIVPN_INSTALL_PATH).exists() {
+            return Err("Bundled openfortivpn not installed. Install the helper in Settings.".to_string());
+        }
         let quoted_args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
         let ovpn_args = quoted_args.join(" ");
         // Pre-connect orphan sweep (same admin prompt): kill a zombie pppd and
@@ -119,8 +124,9 @@ impl ProcessManager {
             "killall pppd 2>/dev/null; sleep 1; killall -KILL pppd 2>/dev/null; \
              ifconfig ppp0 down 2>/dev/null; ifconfig ppp1 down 2>/dev/null; \
              {host_route_cleanup} \
-             /opt/homebrew/bin/openfortivpn {ovpn_args} >> {log} 2>&1 & echo $!",
+             {openfortivpn} {ovpn_args} >> {log} 2>&1 & echo $!",
             host_route_cleanup = host_route_cleanup,
+            openfortivpn = OPENFORTIVPN_INSTALL_PATH,
             ovpn_args = ovpn_args,
             log = log_path.display()
         );

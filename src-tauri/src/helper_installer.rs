@@ -7,8 +7,8 @@ use crate::helper_client;
 
 const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.openvpngui.helper";
 const PLIST_INSTALL_PATH: &str = "/Library/LaunchDaemons/com.openvpngui.helper.plist";
-// Precisa bater com OPENFORTIVPN_PATH em helper/src/validation.rs.
-const OPENFORTIVPN_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/openfortivpn";
+// Par de OPENFORTIVPN_PATH em helper/src/validation.rs; o fallback sem Helper usa este.
+pub(crate) const OPENFORTIVPN_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/openfortivpn";
 
 const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -120,6 +120,7 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
             cp '{helper_src}' {helper_dst}; \
             chmod 755 {helper_dst}; \
             chown root:wheel {helper_dst}; \
+            rm -f {openfortivpn_dst}; \
             cp '{openfortivpn_src}' {openfortivpn_dst}; \
             chmod 755 {openfortivpn_dst}; \
             chown root:wheel {openfortivpn_dst}; \

@@ -61,7 +61,8 @@ pub fn validate_vpn_args(args: &[String]) -> Result<(), String> {
 }
 
 /// Único binário que o Helper executa: o Bundled openfortivpn, instalado como
-/// root pelo app. Sem fallback para o Homebrew (ver ADR 0001).
+/// root pelo app. Sem fallback para o Homebrew (ver ADR 0001). Par de
+/// OPENFORTIVPN_INSTALL_PATH em src-tauri/src/helper_installer.rs.
 pub const OPENFORTIVPN_PATH: &str = "/Library/PrivilegedHelperTools/openfortivpn";
 
 #[cfg(test)]
