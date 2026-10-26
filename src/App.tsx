@@ -128,6 +128,8 @@ function App() {
   const activeProfileId = status.profile_id;
   const selectedProfile = profiles.find((p) => p.id === selectedProfileId);
   const profileName = selectedProfile?.name ?? "";
+  const activeProfile = profiles.find((p) => p.id === activeProfileId);
+  const pushHint = activeProfile?.auth_type === "Password" && !activeProfile.otp_required;
 
   const handleConnect = async () => {
     if (!selectedProfileId) return;
@@ -190,6 +192,7 @@ function App() {
               profileName={profileName}
               selectedProfileId={selectedProfileId}
               bandwidth={bandwidth}
+              pushHint={pushHint}
               onConnect={handleConnect}
               onDisconnect={handleDisconnect}
             />

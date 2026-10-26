@@ -7,6 +7,7 @@ interface Props {
   profileName: string;
   selectedProfileId: string | null;
   bandwidth: BandwidthData[];
+  pushHint: boolean;
   onConnect: () => void;
   onDisconnect: () => void;
 }
@@ -35,10 +36,12 @@ export function ConnectionStatus({
   profileName,
   selectedProfileId,
   bandwidth,
+  pushHint,
   onConnect,
   onDisconnect,
 }: Props) {
   const [duration, setDuration] = useState(0);
+  const [showPushHint, setShowPushHint] = useState(false);
   const config = STATUS_CONFIG[status.state];
 
   useEffect(() => {
@@ -53,6 +56,15 @@ export function ConnectionStatus({
     return () => clearInterval(interval);
   }, [status.state, status.since]);
 
+  useEffect(() => {
+    if (status.state !== "Connecting" || !pushHint) {
+      setShowPushHint(false);
+      return;
+    }
+    const timeout = setTimeout(() => setShowPushHint(true), 5000);
+    return () => clearTimeout(timeout);
+  }, [status.state, pushHint]);
+
   const isConnected = status.state === "Connected";
   const isBusy = status.state === "Connecting" || status.state === "WaitingSaml" || status.state === "Disconnecting";
 
@@ -62,6 +74,12 @@ export function ConnectionStatus({
         <span className={`w-3 h-3 rounded-full ${config.color} ${isBusy ? "animate-pulse" : ""}`} />
         <span className="text-sm font-medium text-white/80">{config.label}</span>
       </div>
+
+      {status.state === "Connecting" && showPushHint && (
+        <div className="text-sm text-white/50 mb-2 ml-5">
+          Waiting for authentication. If your gateway uses FortiToken push, approve it on your phone.
+        </div>
+      )}
 
       {isConnected && (
         <div className="text-sm text-white/50 mb-2 ml-5">
