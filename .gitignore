@@ -6,3 +6,7 @@ target
 docs/superpowers/
 docs/plans/
 docs/specs/
+# openfortivpn bundlado (scripts/build-openfortivpn.sh)
+.build-openfortivpn/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
