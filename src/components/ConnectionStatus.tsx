@@ -83,9 +83,35 @@ export function ConnectionStatus({
 
       {isConnected && (
         <div className="text-sm text-white/50 mb-2 ml-5">
-          <div>{profileName}</div>
-          {status.ip && <div>IP: {status.ip}</div>}
-          <div>{formatDuration(duration)}</div>
+          <div className="grid grid-cols-3 gap-x-3">
+            <div className="min-w-0">
+              <div>{profileName}</div>
+              {status.ip && <div>IP: {status.ip}</div>}
+              <div>{formatDuration(duration)}</div>
+            </div>
+            <div className="min-w-0 text-xs leading-5">
+              <div>DNS:</div>
+              {status.dns_servers.length ? (
+                status.dns_servers.map((s) => (
+                  <div key={s} className="text-white/70 break-all">{s}</div>
+                ))
+              ) : (
+                <div className="text-white/70">—</div>
+              )}
+            </div>
+            <div className="min-w-0 text-xs leading-5">
+              <div>Domains:</div>
+              {!status.dns_servers.length ? (
+                <div className="text-white/70">—</div>
+              ) : status.dns_domains.length ? (
+                status.dns_domains.map((d) => (
+                  <div key={d} className="text-white/70 break-all">{d}</div>
+                ))
+              ) : (
+                <div className="text-white/70">all (global)</div>
+              )}
+            </div>
+          </div>
           {bandwidth.length > 1 && <BandwidthChart data={bandwidth} />}
         </div>
       )}

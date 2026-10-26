@@ -55,6 +55,8 @@ impl VpnManager {
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .unwrap_or_else(chrono::Utc::now),
+                dns_servers: payload.dns_servers.clone(),
+                dns_domains: payload.dns_domains.clone(),
             },
             "Disconnecting" => ConnectionState::Disconnecting,
             "Error" => ConnectionState::Error {
@@ -145,7 +147,14 @@ impl VpnManager {
         // Spawn the process
         match self
             .process_manager
-            .spawn_vpn(args, profile_id.to_string(), app_handle.clone(), debug_mode, dns_fallback)
+            .spawn_vpn(
+                args,
+                profile_id.to_string(),
+                app_handle.clone(),
+                debug_mode,
+                dns_fallback,
+                Self::normalize_dns_domains(&profile.dns_match_domains),
+            )
         {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -153,6 +162,21 @@ impl VpnManager {
                 Err(e)
             }
         }
+    }
+
+    /// Clean up the split-DNS domains typed by the user: trims, lowercases and
+    /// strips a leading `*.` or `.` (the scutil match domain is the bare suffix),
+    /// then drops empty entries and duplicates.
+    fn normalize_dns_domains(domains: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in domains {
+            let d = d.trim().to_lowercase();
+            let d = d.trim_start_matches("*.").trim_start_matches('.').to_string();
+            if !d.is_empty() && !out.contains(&d) {
+                out.push(d);
+            }
+        }
+        out
     }
 
     /// Look up the username and the keychain password of a password-auth profile.
@@ -303,6 +327,22 @@ mod tests {
             username: username.map(str::to_string),
             ..VpnProfile::default()
         }
+    }
+
+    #[test]
+    fn test_normalize_dns_domains() {
+        let input = vec![
+            " Corp.Example.com ".to_string(),
+            "*.corp.example.com".to_string(),
+            ".corp.local".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(
+            VpnManager::normalize_dns_domains(&input),
+            vec!["corp.example.com".to_string(), "corp.local".to_string()]
+        );
+        assert!(VpnManager::normalize_dns_domains(&[]).is_empty());
     }
 
     #[test]
