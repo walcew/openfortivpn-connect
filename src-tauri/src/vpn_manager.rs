@@ -249,6 +249,52 @@ impl VpnManager {
     }
 }
 
+/// Monta os argumentos do openfortivpn. `password_creds` é `Some` na auth por
+/// senha e `None` na SAML; `gateway_digest` é o digest já buscado quando o
+/// perfil ignora erros de certificado.
+fn build_openfortivpn_args(
+    profile: &VpnProfile,
+    password_creds: Option<(String, String)>,
+    gateway_digest: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![format!("{}:{}", profile.host, profile.port)];
+
+    if let Some((username, password)) = password_creds {
+        args.push("-u".to_string());
+        args.push(username);
+        args.push("-p".to_string());
+        args.push(password);
+    } else {
+        args.push("--saml-login".to_string());
+    }
+
+    let mut trusted_certs = profile.trusted_certs.clone();
+    if let Some(digest) = gateway_digest {
+        if !trusted_certs.iter().any(|c| c == digest) {
+            trusted_certs.push(digest.to_string());
+        }
+    }
+
+    for cert in &trusted_certs {
+        args.push(format!("--trusted-cert={}", cert));
+    }
+
+    if let Some(ref realm) = profile.realm {
+        args.push(format!("--realm={}", realm));
+    }
+
+    // Disable openfortivpn's DNS handling — we manage DNS via scutil on macOS
+    // because macOS ignores /etc/resolv.conf
+    args.push("--set-dns=0".to_string());
+    args.push("--pppd-use-peerdns=0".to_string());
+
+    // Enable verbose logging so we can capture DNS server info from debug output
+    args.push("-v".to_string());
+
+    args.extend(profile.extra_args.clone());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +323,100 @@ mod tests {
         profile.id = uuid::Uuid::new_v4().to_string();
         let err = VpnManager::resolve_password_creds(&profile).unwrap_err();
         assert!(err.contains("No password stored"), "unexpected error: {}", err);
+    }
+
+    fn args_of(profile: &VpnProfile, creds: Option<(&str, &str)>, digest: Option<&str>) -> Vec<String> {
+        let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
+        build_openfortivpn_args(profile, creds, digest)
+    }
+
+    fn saml_profile() -> VpnProfile {
+        VpnProfile {
+            host: "vpn.corp.test".to_string(),
+            port: 8443,
+            auth_type: AuthType::Saml,
+            ..VpnProfile::default()
+        }
+    }
+
+    #[test]
+    fn test_args_password_auth() {
+        let args = args_of(&saml_profile(), Some(("john", "s3cret")), None);
+        assert_eq!(
+            args,
+            ["vpn.corp.test:8443", "-u", "john", "-p", "s3cret", "--set-dns=0", "--pppd-use-peerdns=0", "-v"]
+        );
+    }
+
+    #[test]
+    fn test_args_saml_auth() {
+        let args = args_of(&saml_profile(), None, None);
+        assert_eq!(
+            args,
+            ["vpn.corp.test:8443", "--saml-login", "--set-dns=0", "--pppd-use-peerdns=0", "-v"]
+        );
+        assert!(!args.iter().any(|a| a == "-u" || a == "-p"));
+    }
+
+    #[test]
+    fn test_args_realm() {
+        let mut profile = saml_profile();
+        profile.realm = Some("corp".to_string());
+        assert!(args_of(&profile, None, None).contains(&"--realm=corp".to_string()));
+        profile.realm = None;
+        assert!(!args_of(&profile, None, None).iter().any(|a| a.starts_with("--realm")));
+    }
+
+    #[test]
+    fn test_args_trusted_certs() {
+        let mut profile = saml_profile();
+        profile.trusted_certs = vec!["aaa".to_string(), "bbb".to_string()];
+        let args = args_of(&profile, None, None);
+        assert!(args.contains(&"--trusted-cert=aaa".to_string()));
+        assert!(args.contains(&"--trusted-cert=bbb".to_string()));
+    }
+
+    #[test]
+    fn test_args_dns_flags_and_verbose_always_present() {
+        for args in [args_of(&saml_profile(), None, None), args_of(&saml_profile(), Some(("u", "p")), None)] {
+            for flag in ["--set-dns=0", "--pppd-use-peerdns=0", "-v"] {
+                assert!(args.contains(&flag.to_string()), "missing {}", flag);
+            }
+        }
+    }
+
+    #[test]
+    fn test_args_extra_args_come_last() {
+        let mut profile = saml_profile();
+        profile.extra_args = vec!["--foo".to_string(), "--bar=1".to_string()];
+        let args = args_of(&profile, None, None);
+        assert_eq!(&args[args.len() - 2..], ["--foo", "--bar=1"]);
+    }
+
+    #[test]
+    fn test_args_ignore_cert_adds_gateway_digest() {
+        let mut profile = saml_profile();
+        profile.ignore_cert_errors = true;
+        let args = args_of(&profile, None, Some("deadbeef"));
+        assert!(args.contains(&"--trusted-cert=deadbeef".to_string()));
+    }
+
+    #[test]
+    fn test_args_ignore_cert_does_not_duplicate_known_digest() {
+        let mut profile = saml_profile();
+        profile.ignore_cert_errors = true;
+        profile.trusted_certs = vec!["deadbeef".to_string()];
+        let args = args_of(&profile, None, Some("deadbeef"));
+        assert_eq!(args.iter().filter(|a| *a == "--trusted-cert=deadbeef").count(), 1);
+    }
+
+    #[test]
+    fn test_args_ignore_cert_without_digest_keeps_profile_certs() {
+        // Falha ao buscar o digest: segue só com os certs do perfil.
+        let mut profile = saml_profile();
+        profile.ignore_cert_errors = true;
+        profile.trusted_certs = vec!["aaa".to_string()];
+        let args = args_of(&profile, None, None);
+        assert_eq!(args.iter().filter(|a| a.starts_with("--trusted-cert=")).count(), 1);
     }
 }
