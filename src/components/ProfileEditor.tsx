@@ -151,7 +151,7 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
                 onChange={(e) => setForm({ ...form, otp_required: e.target.checked })}
                 className="accent-blue-500"
               />
-              <span className="text-sm text-white/70">Require token on connect</span>
+              <span className="text-sm text-white/70">Require OTP on connect</span>
             </label>
           </>
         )}

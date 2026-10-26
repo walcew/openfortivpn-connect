@@ -19,7 +19,7 @@ export function OtpDialog({ profileName, onSubmit, onCancel }: Props) {
     event.preventDefault();
     const value = otp.trim();
     if (!value) {
-      setError("Token is required");
+      setError("OTP is required");
       return;
     }
     onSubmit(value);
@@ -31,9 +31,9 @@ export function OtpDialog({ profileName, onSubmit, onCancel }: Props) {
         onSubmit={handleSubmit}
         className="w-full max-w-sm bg-neutral-950 border border-white/10 rounded-xl p-4 shadow-xl"
       >
-        <h2 className="text-sm font-semibold text-white/90 mb-1">VPN token</h2>
+        <h2 className="text-sm font-semibold text-white/90 mb-1">One-time password (OTP)</h2>
         <p className="text-xs text-white/40 mb-4">
-          Enter the current token for {profileName || "this profile"}.
+          Enter the current OTP for {profileName || "this profile"}.
         </p>
 
         {error && (
@@ -50,7 +50,7 @@ export function OtpDialog({ profileName, onSubmit, onCancel }: Props) {
             setError(null);
           }}
           className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/90 placeholder-white/30 focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/30"
-          placeholder="Token / OTP"
+          placeholder="OTP"
           autoComplete="one-time-code"
         />
 

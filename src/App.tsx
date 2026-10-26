@@ -299,7 +299,7 @@ function App() {
         />
       )}
 
-      {/* One-time token dialog */}
+      {/* OTP dialog */}
       {otpProfile && (
         <OtpDialog
           profileName={otpProfile.name}
