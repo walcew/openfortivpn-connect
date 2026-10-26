@@ -110,7 +110,7 @@ impl ProcessManager {
     ) -> Result<u32, String> {
         // Mesmo binário root-owned do Helper: nunca o do Homebrew (ADR 0001).
         if !std::path::Path::new(OPENFORTIVPN_INSTALL_PATH).exists() {
-            return Err("Bundled openfortivpn not installed. Install the helper in Settings.".to_string());
+            return Err("Bundled openfortivpn not installed. Install the Helper in Settings.".to_string());
         }
         let quoted_args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
         let ovpn_args = quoted_args.join(" ");
@@ -124,11 +124,12 @@ impl ProcessManager {
             "killall pppd 2>/dev/null; sleep 1; killall -KILL pppd 2>/dev/null; \
              ifconfig ppp0 down 2>/dev/null; ifconfig ppp1 down 2>/dev/null; \
              {host_route_cleanup} \
+             /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
              {openfortivpn} {ovpn_args} >> {log} 2>&1 & echo $!",
             host_route_cleanup = host_route_cleanup,
             openfortivpn = OPENFORTIVPN_INSTALL_PATH,
             ovpn_args = ovpn_args,
-            log = log_path.display()
+            log = shell_quote(&log_path.to_string_lossy())
         );
 
         let script = format!(
@@ -865,14 +866,14 @@ fn resolve_server_ip(host_port: &str) -> Option<String> {
 /// AppleScript only recognizes `\\` and `\"` as escape sequences.
 /// Shell metacharacters like `$`, `` ` ``, `&` are left as-is because
 /// `do shell script` passes the string to `/bin/sh` which interprets them.
-fn applescript_escape(s: &str) -> String {
+pub(crate) fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
 }
 
 /// Wrap a user-supplied value in single quotes for shell safety.
 /// Inside single quotes, the shell interprets nothing — only `'` needs handling.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

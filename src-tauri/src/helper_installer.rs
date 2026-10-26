@@ -4,6 +4,7 @@ use std::process::Command;
 use tauri::{AppHandle, Manager};
 
 use crate::helper_client;
+use crate::process_manager::{applescript_escape, shell_quote};
 
 const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.openvpngui.helper";
 const PLIST_INSTALL_PATH: &str = "/Library/LaunchDaemons/com.openvpngui.helper.plist";
@@ -57,7 +58,7 @@ pub fn check_status() -> HelperStatus {
         Err(_) => (false, None),
     };
 
-    let needs_update = needs_update(
+    let update_needed = needs_update(
         version.as_deref(),
         env!("CARGO_PKG_VERSION"),
         openfortivpn_installed,
@@ -67,7 +68,7 @@ pub fn check_status() -> HelperStatus {
         installed,
         running,
         version,
-        needs_update,
+        needs_update: update_needed,
     }
 }
 
@@ -79,6 +80,15 @@ fn needs_update(
     openfortivpn_installed: bool,
 ) -> bool {
     installed_version.is_some_and(|v| v != expected_version || !openfortivpn_installed)
+}
+
+/// AppleScript que roda `cmd` como root. Segunda camada do escape: os valores
+/// variáveis de `cmd` já vêm com shell_quote; aqui só `\\` e `"` do AppleScript.
+fn admin_script(cmd: &str) -> String {
+    format!(
+        "do shell script \"{}\" with administrator privileges",
+        applescript_escape(cmd)
+    )
 }
 
 /// Install the helper daemon using osascript (one-time admin password).
@@ -105,37 +115,30 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
         ));
     }
 
-    // Build the installation script
-    let helper_src = bundled_helper.to_string_lossy();
-    let openfortivpn_src = bundled_openfortivpn.to_string_lossy();
-    let plist_escaped = PLIST_CONTENT
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\'', "'\\''");
-
-    let script = format!(
-        "do shell script \"\
-            launchctl unload -w {plist_path} 2>/dev/null; \
-            mkdir -p /Library/PrivilegedHelperTools; \
-            cp '{helper_src}' {helper_dst}; \
-            chmod 755 {helper_dst}; \
-            chown root:wheel {helper_dst}; \
-            rm -f {openfortivpn_dst}; \
-            cp '{openfortivpn_src}' {openfortivpn_dst}; \
-            chmod 755 {openfortivpn_dst}; \
-            chown root:wheel {openfortivpn_dst}; \
-            echo '{plist_content}' > {plist_path}; \
-            chmod 644 {plist_path}; \
-            chown root:wheel {plist_path}; \
-            launchctl load -w {plist_path}\
-        \" with administrator privileges",
-        helper_src = helper_src,
+    // set -e: qualquer passo que falhe (ex.: cp do openfortivpn) faz o osascript falhar.
+    let cmd = format!(
+        "set -e; \
+         launchctl unload -w {plist_path} 2>/dev/null || true; \
+         mkdir -p /Library/PrivilegedHelperTools; \
+         cp {helper_src} {helper_dst}; \
+         chmod 755 {helper_dst}; \
+         chown root:wheel {helper_dst}; \
+         rm -f {openfortivpn_dst}; \
+         cp {openfortivpn_src} {openfortivpn_dst}; \
+         chmod 755 {openfortivpn_dst}; \
+         chown root:wheel {openfortivpn_dst}; \
+         echo {plist_content} > {plist_path}; \
+         chmod 644 {plist_path}; \
+         chown root:wheel {plist_path}; \
+         launchctl load -w {plist_path}",
+        helper_src = shell_quote(&bundled_helper.to_string_lossy()),
         helper_dst = HELPER_INSTALL_PATH,
-        openfortivpn_src = openfortivpn_src,
+        openfortivpn_src = shell_quote(&bundled_openfortivpn.to_string_lossy()),
         openfortivpn_dst = OPENFORTIVPN_INSTALL_PATH,
         plist_path = PLIST_INSTALL_PATH,
-        plist_content = plist_escaped,
+        plist_content = shell_quote(PLIST_CONTENT),
     );
+    let script = admin_script(&cmd);
 
     log::info!("Installing helper daemon via osascript");
 
@@ -170,18 +173,17 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
 
 /// Uninstall the helper daemon.
 pub fn uninstall() -> Result<(), String> {
-    let script = format!(
-        "do shell script \"\
-            launchctl unload -w {plist} 2>/dev/null; \
-            rm -f {helper}; \
-            rm -f {openfortivpn}; \
-            rm -f {plist}; \
-            rm -f /var/run/openvpngui-helper.sock\
-        \" with administrator privileges",
+    let script = admin_script(&format!(
+        "set -e; \
+         launchctl unload -w {plist} 2>/dev/null || true; \
+         rm -f {helper}; \
+         rm -f {openfortivpn}; \
+         rm -f {plist}; \
+         rm -f /var/run/openvpngui-helper.sock",
         helper = HELPER_INSTALL_PATH,
         openfortivpn = OPENFORTIVPN_INSTALL_PATH,
         plist = PLIST_INSTALL_PATH,
-    );
+    ));
 
     let output = Command::new("osascript")
         .args(["-e", &script])
@@ -202,7 +204,50 @@ pub fn uninstall() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::needs_update;
+    use super::{admin_script, needs_update, shell_quote};
+
+    /// Roda o AppleScript de verdade, sem o privilégio de admin, e devolve o stdout.
+    fn run_without_admin(script: &str) -> String {
+        let script = script
+            .strip_suffix(" with administrator privileges")
+            .expect("admin suffix");
+        let out = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .expect("osascript");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim_end_matches('\n').to_string()
+    }
+
+    #[test]
+    fn bundle_paths_survive_both_escape_layers() {
+        for path in [
+            "/Applications/OpenFortiVpn Connect.app/x",
+            "/tmp/it's/x",
+            "/tmp/say \"hi\"/x",
+            "/tmp/back\\slash/x",
+            "/tmp/'; touch /tmp/pwned; '\"\\$(id)`id`/x",
+        ] {
+            let script = admin_script(&format!("printf %s {}", shell_quote(path)));
+            assert_eq!(run_without_admin(&script), path);
+        }
+    }
+
+    #[test]
+    fn admin_script_escapes_applescript_quotes_and_backslashes() {
+        assert_eq!(
+            admin_script(r#"echo "a\b""#),
+            r#"do shell script "echo \"a\\b\"" with administrator privileges"#
+        );
+    }
+
+    #[test]
+    fn failing_step_fails_the_whole_command() {
+        let script = admin_script("set -e; false; echo reached");
+        let script = script.strip_suffix(" with administrator privileges").unwrap();
+        let out = std::process::Command::new("osascript").args(["-e", script]).output().unwrap();
+        assert!(!out.status.success());
+    }
 
     #[test]
     fn up_to_date_with_openfortivpn_needs_no_update() {
