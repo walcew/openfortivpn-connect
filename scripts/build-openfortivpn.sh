@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compila o openfortivpn com OpenSSL estático para o bundle (ADR 0001).
 # Uso: scripts/build-openfortivpn.sh [arm64|x86_64]
+# Sem argumento, lê OPENFORTIVPN_ARCH e, por fim, a arquitetura do host.
 set -euo pipefail
 
 OPENFORTIVPN_VERSION=1.24.1
@@ -10,7 +11,7 @@ OPENFORTIVPN_SHA256="${OPENFORTIVPN_SHA256:-c40d33acd97b89c2e943bfd839c19b69e5a7
 OPENSSL_SHA256="${OPENSSL_SHA256:-603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a}"
 export MACOSX_DEPLOYMENT_TARGET=12.0
 
-ARCH="${1:-$(uname -m)}"
+ARCH="${1:-${OPENFORTIVPN_ARCH:-$(uname -m)}}"
 case "${ARCH}" in
   arm64|x86_64) ;;
   *) echo "usage: $0 [arm64|x86_64]" >&2; exit 1 ;;

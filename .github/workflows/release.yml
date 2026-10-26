@@ -11,6 +11,11 @@ on:
         required: false
         default: true
         type: boolean
+      dry_run:
+        description: 'Validate the build only: no release, no checksums, DMGs as workflow artifacts'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -23,10 +28,16 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             arch: aarch64
+            ofv_arch: arm64
           - platform: macos-latest
             target: x86_64-apple-darwin
             arch: x86_64
+            ofv_arch: x86_64
     runs-on: ${{ matrix.platform }}
+    env:
+      # O beforeBuildCommand do Tauri roda build:openfortivpn sem argumento; sem isso o script
+      # usaria a arquitetura do host (arm64) e sobrescreveria o binário x86_64 do job cruzado.
+      OPENFORTIVPN_ARCH: ${{ matrix.ofv_arch }}
 
     steps:
       - name: Checkout repository
@@ -59,6 +70,19 @@ jobs:
           mkdir -p target/release
           cp target/${{ matrix.target }}/release/openvpngui-helper target/release/openvpngui-helper
 
+      - name: Cache openfortivpn bundlado
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries/openfortivpn*
+          # O hash do script cobre as versões e os sha256 do openfortivpn e do OpenSSL.
+          key: openfortivpn-${{ matrix.ofv_arch }}-${{ hashFiles('scripts/build-openfortivpn.sh') }}
+
+      - name: Build openfortivpn bundlado
+        run: |
+          # Só dependência de build; o script não usa o OpenSSL do Homebrew.
+          brew install autoconf automake
+          scripts/build-openfortivpn.sh "${{ matrix.ofv_arch }}"
+
       - name: Build and release with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -74,15 +98,25 @@ jobs:
           # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tagName: v__VERSION__
-          releaseName: 'OpenFortiVpn Connect v__VERSION__'
+          # Sem tagName o tauri-action só compila, sem criar release (dry_run).
+          tagName: ${{ inputs.dry_run != true && 'v__VERSION__' || '' }}
+          releaseName: ${{ inputs.dry_run != true && 'OpenFortiVpn Connect v__VERSION__' || '' }}
           releaseBody: 'See the assets to download and install this version.'
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == 'true' }}
           prerelease: false
           args: '--target ${{ matrix.target }}'
 
+      - name: Upload DMGs (dry run)
+        if: inputs.dry_run == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
   checksums:
     needs: build
+    if: inputs.dry_run != true
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
