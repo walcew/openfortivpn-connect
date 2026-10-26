@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::models::{ConnectionState, ConnectionStatusPayload, VpnProfile};
 use crate::vpn_manager::VpnManager;
@@ -201,12 +201,27 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "connect" => {
             let app = app.clone();
             std::thread::spawn(move || {
-                let profile_id = {
+                let (profile_id, needs_otp) = {
                     let mgr_state = app.state::<Mutex<VpnManager>>();
                     let mgr = mgr_state.lock().unwrap();
-                    mgr.selected_profile_id().map(|s| s.to_string())
+                    let profile_id = mgr.selected_profile_id().map(|s| s.to_string());
+                    let needs_otp = profile_id.as_deref().is_some_and(|id| {
+                        mgr.get_profiles().unwrap_or_default().iter().any(|p| {
+                            p.id == id
+                                && p.auth_type == crate::models::AuthType::Password
+                                && p.otp_required
+                        })
+                    });
+                    (profile_id, needs_otp)
                 };
-                if let Some(profile_id) = profile_id {
+                if let (Some(profile_id), true) = (&profile_id, needs_otp) {
+                    // OTP is typed in the main window; the dialog then connects.
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                    let _ = app.emit("otp-requested", serde_json::json!({ "profile_id": profile_id }));
+                } else if let Some(profile_id) = profile_id {
                     let settings = crate::settings_store::SettingsStore::new()
                         .and_then(|s| s.get())
                         .unwrap_or_default();

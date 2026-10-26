@@ -42,6 +42,21 @@ function App() {
     };
   }, []);
 
+  // Tray asked to connect a Profile that needs OTP: open the dialog for it
+  useEffect(() => {
+    const unlisten = listen<{ profile_id: string }>("otp-requested", (event) => {
+      const profile = profiles.find((p) => p.id === event.payload.profile_id);
+      if (profile) {
+        setSelectedProfileId(profile.id);
+        setCurrentView("main");
+        setOtpProfile(profile);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [profiles]);
+
   // Check helper status on mount
   useEffect(() => {
     const checkHelper = async () => {
