@@ -60,8 +60,9 @@ pub fn validate_vpn_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The only binary we allow the helper to execute.
-pub const OPENFORTIVPN_PATH: &str = "/opt/homebrew/bin/openfortivpn";
+/// Único binário que o Helper executa: o Bundled openfortivpn, instalado como
+/// root pelo app. Sem fallback para o Homebrew (ver ADR 0001).
+pub const OPENFORTIVPN_PATH: &str = "/Library/PrivilegedHelperTools/openfortivpn";
 
 #[cfg(test)]
 mod tests {

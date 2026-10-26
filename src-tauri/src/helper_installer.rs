@@ -7,6 +7,8 @@ use crate::helper_client;
 
 const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.openvpngui.helper";
 const PLIST_INSTALL_PATH: &str = "/Library/LaunchDaemons/com.openvpngui.helper.plist";
+// Precisa bater com OPENFORTIVPN_PATH em helper/src/validation.rs.
+const OPENFORTIVPN_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/openfortivpn";
 
 const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -46,6 +48,7 @@ pub struct HelperStatus {
 
 /// Check the current status of the helper daemon.
 pub fn check_status() -> HelperStatus {
+    let openfortivpn_installed = Path::new(OPENFORTIVPN_INSTALL_PATH).exists();
     let installed = Path::new(HELPER_INSTALL_PATH).exists()
         && Path::new(PLIST_INSTALL_PATH).exists();
 
@@ -54,10 +57,11 @@ pub fn check_status() -> HelperStatus {
         Err(_) => (false, None),
     };
 
-    let needs_update = version
-        .as_deref()
-        .map(|v| v != env!("CARGO_PKG_VERSION"))
-        .unwrap_or(false);
+    let needs_update = needs_update(
+        version.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        openfortivpn_installed,
+    );
 
     HelperStatus {
         installed,
@@ -67,8 +71,18 @@ pub fn check_status() -> HelperStatus {
     }
 }
 
+/// Um Helper ativo precisa ser reinstalado quando a versão difere da do app ou
+/// quando falta o Bundled openfortivpn que ele executa.
+fn needs_update(
+    installed_version: Option<&str>,
+    expected_version: &str,
+    openfortivpn_installed: bool,
+) -> bool {
+    installed_version.is_some_and(|v| v != expected_version || !openfortivpn_installed)
+}
+
 /// Install the helper daemon using osascript (one-time admin password).
-/// The helper binary is read from the app bundle's resources.
+/// The helper and openfortivpn binaries are read from the app bundle's resources.
 pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     // Locate the helper binary in the app bundle resources
     let resource_dir = app_handle
@@ -76,6 +90,7 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
         .resource_dir()
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
     let bundled_helper = resource_dir.join("openvpngui-helper");
+    let bundled_openfortivpn = resource_dir.join("openfortivpn");
 
     if !bundled_helper.exists() {
         return Err(format!(
@@ -83,9 +98,16 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
             bundled_helper
         ));
     }
+    if !bundled_openfortivpn.exists() {
+        return Err(format!(
+            "openfortivpn binary not found in bundle at {:?}",
+            bundled_openfortivpn
+        ));
+    }
 
     // Build the installation script
     let helper_src = bundled_helper.to_string_lossy();
+    let openfortivpn_src = bundled_openfortivpn.to_string_lossy();
     let plist_escaped = PLIST_CONTENT
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -98,6 +120,9 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
             cp '{helper_src}' {helper_dst}; \
             chmod 755 {helper_dst}; \
             chown root:wheel {helper_dst}; \
+            cp '{openfortivpn_src}' {openfortivpn_dst}; \
+            chmod 755 {openfortivpn_dst}; \
+            chown root:wheel {openfortivpn_dst}; \
             echo '{plist_content}' > {plist_path}; \
             chmod 644 {plist_path}; \
             chown root:wheel {plist_path}; \
@@ -105,6 +130,8 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
         \" with administrator privileges",
         helper_src = helper_src,
         helper_dst = HELPER_INSTALL_PATH,
+        openfortivpn_src = openfortivpn_src,
+        openfortivpn_dst = OPENFORTIVPN_INSTALL_PATH,
         plist_path = PLIST_INSTALL_PATH,
         plist_content = plist_escaped,
     );
@@ -146,10 +173,12 @@ pub fn uninstall() -> Result<(), String> {
         "do shell script \"\
             launchctl unload -w {plist} 2>/dev/null; \
             rm -f {helper}; \
+            rm -f {openfortivpn}; \
             rm -f {plist}; \
             rm -f /var/run/openvpngui-helper.sock\
         \" with administrator privileges",
         helper = HELPER_INSTALL_PATH,
+        openfortivpn = OPENFORTIVPN_INSTALL_PATH,
         plist = PLIST_INSTALL_PATH,
     );
 
@@ -168,4 +197,29 @@ pub fn uninstall() -> Result<(), String> {
 
     log::info!("Helper daemon uninstalled");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_update;
+
+    #[test]
+    fn up_to_date_with_openfortivpn_needs_no_update() {
+        assert!(!needs_update(Some("0.2.0"), "0.2.0", true));
+    }
+
+    #[test]
+    fn version_mismatch_needs_update() {
+        assert!(needs_update(Some("0.1.9"), "0.2.0", true));
+    }
+
+    #[test]
+    fn missing_openfortivpn_needs_update_even_when_version_matches() {
+        assert!(needs_update(Some("0.2.0"), "0.2.0", false));
+    }
+
+    #[test]
+    fn helper_not_running_is_not_an_update() {
+        assert!(!needs_update(None, "0.2.0", false));
+    }
 }

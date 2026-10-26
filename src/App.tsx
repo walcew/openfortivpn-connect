@@ -74,8 +74,9 @@ function App() {
   useEffect(() => {
     const checkHelper = async () => {
       try {
-        const status = await invoke<{ installed: boolean; running: boolean }>("check_helper_status");
-        if (!status.running) {
+        const status = await invoke<{ installed: boolean; running: boolean; needs_update: boolean }>("check_helper_status");
+        // Helper desatualizado ainda executa o openfortivpn do Homebrew: pede a reinstalação.
+        if (!status.running || status.needs_update) {
           const settings = await invoke<{ helper_declined: boolean }>("get_settings");
           if (!settings.helper_declined) {
             setShowHelperInstall(true);

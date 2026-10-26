@@ -47,6 +47,11 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # O tauri_build exige que todo bundle.resources exista. Um stub vazio evita
+      # compilar o openfortivpn no PR; o build real roda no beforeBuildCommand.
+      - name: Stub bundled openfortivpn
+        run: mkdir -p src-tauri/binaries && touch src-tauri/binaries/openfortivpn
+
       - name: Test Rust workspace
         run: cargo test --workspace
         working-directory: src-tauri

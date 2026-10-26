@@ -62,6 +62,10 @@ fn handle_spawn_vpn(args: Vec<String>, log_path: String, vpn_server: Option<Stri
     // Spawn openfortivpn directly (no shell, no quoting needed)
     match Command::new(validation::OPENFORTIVPN_PATH)
         .args(&args)
+        // Processo root: descarta o ambiente herdado para que OPENSSL_CONF ou
+        // OPENSSL_MODULES não o façam carregar arquivos do usuário. PATH fica para o pppd.
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .stdout(log_file)
         .stderr(log_file_stderr)
         .spawn()
