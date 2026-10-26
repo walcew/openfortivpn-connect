@@ -5,7 +5,7 @@ use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBui
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
-use crate::models::{ConnectionState, ConnectionStatusPayload, VpnProfile};
+use crate::models::{ConnectionState, ConnectionStatusPayload, OtpRequestedPayload, VpnProfile};
 use crate::vpn_manager::VpnManager;
 
 const TRAY_ICON_DISCONNECTED: &[u8] = include_bytes!("../icons/tray/disconnected@2x.png");
@@ -204,23 +204,28 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 let (profile_id, needs_otp) = {
                     let mgr_state = app.state::<Mutex<VpnManager>>();
                     let mgr = mgr_state.lock().unwrap();
-                    let profile_id = mgr.selected_profile_id().map(|s| s.to_string());
-                    let needs_otp = profile_id.as_deref().is_some_and(|id| {
-                        mgr.get_profiles().unwrap_or_default().iter().any(|p| {
-                            p.id == id
-                                && p.auth_type == crate::models::AuthType::Password
-                                && p.otp_required
-                        })
-                    });
+                    let selected = mgr.selected_profile_id().map(|s| s.to_string());
+                    // Sem saber se o Profile exige OTP, não conecta.
+                    let (profile_id, needs_otp) = match (selected, mgr.get_profiles()) {
+                        (Some(id), Ok(profiles)) => {
+                            let needs_otp = profiles.iter().any(|p| p.id == id && p.needs_otp());
+                            (Some(id), needs_otp)
+                        }
+                        (Some(_), Err(e)) => {
+                            log::error!("Failed to load profiles for tray connect: {}", e);
+                            (None, false)
+                        }
+                        (None, _) => (None, false),
+                    };
                     (profile_id, needs_otp)
                 };
                 if let (Some(profile_id), true) = (&profile_id, needs_otp) {
-                    // OTP is typed in the main window; the dialog then connects.
+                    // O OTP é digitado na janela principal; o diálogo então conecta.
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
-                    let _ = app.emit("otp-requested", serde_json::json!({ "profile_id": profile_id }));
+                    let _ = app.emit("otp-requested", OtpRequestedPayload { profile_id: profile_id.clone() });
                 } else if let Some(profile_id) = profile_id {
                     let settings = crate::settings_store::SettingsStore::new()
                         .and_then(|s| s.get())

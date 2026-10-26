@@ -14,6 +14,7 @@ import { Settings } from "./components/Settings";
 import { About } from "./components/About";
 import { HelperInstallDialog } from "./components/HelperInstallDialog";
 import { OtpDialog } from "./components/OtpDialog";
+import { needsOtp } from "./types";
 import type { VpnProfile, CertWarningPayload } from "./types";
 
 type EditingState = null | "new" | VpnProfile;
@@ -42,15 +43,27 @@ function App() {
     };
   }, []);
 
-  // Tray asked to connect a Profile that needs OTP: open the dialog for it
+  // O tray pediu para conectar um Profile que precisa de OTP: abre o diálogo dele
   useEffect(() => {
-    const unlisten = listen<{ profile_id: string }>("otp-requested", (event) => {
-      const profile = profiles.find((p) => p.id === event.payload.profile_id);
-      if (profile) {
-        setSelectedProfileId(profile.id);
-        setCurrentView("main");
-        setOtpProfile(profile);
+    const unlisten = listen<{ profile_id: string }>("otp-requested", async (event) => {
+      const id = event.payload.profile_id;
+      let profile = profiles.find((p) => p.id === id);
+      if (!profile) {
+        // A lista pode estar desatualizada (Profile criado ou editado há pouco)
+        try {
+          const fresh = await invoke<VpnProfile[]>("get_profiles");
+          profile = fresh.find((p) => p.id === id);
+        } catch (e) {
+          console.error("Failed to fetch profiles:", e);
+        }
       }
+      if (!profile) {
+        console.warn("otp-requested for unknown profile:", id);
+        return;
+      }
+      setSelectedProfileId(profile.id);
+      setCurrentView("main");
+      setOtpProfile(profile);
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -91,6 +104,15 @@ function App() {
     }
   };
 
+  // Profile com OTP abre o diálogo (que conecta ao enviar); os demais conectam direto
+  const startConnect = async (profile: VpnProfile) => {
+    if (needsOtp(profile)) {
+      setOtpProfile(profile);
+      return;
+    }
+    await connect(profile.id);
+  };
+
   const handleAcceptCert = async () => {
     if (!certWarning) return;
     const profile = profiles.find((p) => p.id === certWarning.profile_id);
@@ -105,11 +127,7 @@ function App() {
       // Reconnect with the trusted cert
       try {
         await disconnect();
-        if (profile.auth_type === "Password" && profile.otp_required) {
-          setOtpProfile(profile);
-        } else {
-          await connect(profile.id);
-        }
+        await startConnect(profile);
       } catch {
         // handled by status events
       }
@@ -129,17 +147,14 @@ function App() {
   const selectedProfile = profiles.find((p) => p.id === selectedProfileId);
   const profileName = selectedProfile?.name ?? "";
   const activeProfile = profiles.find((p) => p.id === activeProfileId);
-  const pushHint = activeProfile?.auth_type === "Password" && !activeProfile.otp_required;
+  const pushHint = activeProfile?.auth_type === "Password" && !needsOtp(activeProfile);
 
   const handleConnect = async () => {
     if (!selectedProfileId) return;
     const profile = profiles.find((p) => p.id === selectedProfileId);
-    if (profile?.auth_type === "Password" && profile.otp_required) {
-      setOtpProfile(profile);
-      return;
-    }
+    if (!profile) return;
     try {
-      await connect(selectedProfileId);
+      await startConnect(profile);
     } catch {
       // Error is handled via status events
     }
@@ -317,7 +332,7 @@ function App() {
         />
       )}
 
-      {/* OTP dialog */}
+      {/* Diálogo de OTP */}
       {otpProfile && (
         <OtpDialog
           profileName={otpProfile.name}

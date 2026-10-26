@@ -95,6 +95,10 @@ impl VpnManager {
             .get_by_id(profile_id)?
             .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
 
+        // Sem OTP o openfortivpn ficaria preso esperando o código: barra antes
+        // de qualquer mudança de estado ou spawn.
+        check_otp_provided(&profile, otp.as_deref())?;
+
         // Resolve credentials up front: without -u/-p the openfortivpn blocks
         // waiting for input on stdin and the UI would sit on Connecting forever.
         let password_creds = if profile.auth_type == AuthType::Password {
@@ -230,9 +234,16 @@ impl VpnManager {
     }
 }
 
+fn check_otp_provided(profile: &VpnProfile, otp: Option<&str>) -> Result<(), String> {
+    if profile.needs_otp() && otp.map(str::trim).unwrap_or("").is_empty() {
+        return Err("OTP is required for this profile".into());
+    }
+    Ok(())
+}
+
 /// Monta os argumentos do openfortivpn. `password_creds` é `Some` na auth por
 /// senha e `None` na SAML; `gateway_digest` é o digest já buscado quando o
-/// perfil ignora erros de certificado.
+/// Profile ignora erros de certificado.
 fn build_openfortivpn_args(
     profile: &VpnProfile,
     password_creds: Option<(String, String)>,
@@ -246,8 +257,8 @@ fn build_openfortivpn_args(
         args.push(username);
         args.push("-p".to_string());
         args.push(password);
-        if let Some(otp) = otp.map(str::trim).filter(|value| profile.otp_required && !value.is_empty()) {
-            // shortcut: o OTP fica visível no ps enquanto o openfortivpn roda; passar credenciais via arquivo -c quando isso importar
+        if let Some(otp) = otp.map(str::trim).filter(|value| profile.needs_otp() && !value.is_empty()) {
+            // shortcut: o OTP fica visível no ps enquanto o openfortivpn roda, trocar por arquivo -c se credenciais em argv virarem problema
             args.push(format!("--otp={}", otp));
         }
     } else {
@@ -311,17 +322,31 @@ mod tests {
         assert!(err.contains("No password stored"), "unexpected error: {}", err);
     }
 
-    fn args_of(profile: &VpnProfile, creds: Option<(&str, &str)>, digest: Option<&str>) -> Vec<String> {
+    fn args_of(
+        profile: &VpnProfile,
+        creds: Option<(&str, &str)>,
+        digest: Option<&str>,
+        otp: Option<&str>,
+    ) -> Vec<String> {
         let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
-        build_openfortivpn_args(profile, creds, digest, None)
+        build_openfortivpn_args(profile, creds, digest, otp)
     }
 
-    fn otp_args(profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Option<&str>) -> Vec<String> {
-        let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
-        build_openfortivpn_args(profile, creds, None, otp)
+    #[test]
+    fn test_check_otp_provided() {
+        let mut profile = password_profile(Some("john"));
+        profile.otp_required = true;
+        for otp in [None, Some(""), Some("   ")] {
+            let err = check_otp_provided(&profile, otp).unwrap_err();
+            assert_eq!(err, "OTP is required for this profile");
+        }
+        assert!(check_otp_provided(&profile, Some(" 123456 ")).is_ok());
+        // Sem otp_required, a ausência de OTP é aceita.
+        profile.otp_required = false;
+        assert!(check_otp_provided(&profile, None).is_ok());
     }
 
-    fn saml_profile() -> VpnProfile {
+    fn base_profile() -> VpnProfile {
         VpnProfile {
             host: "vpn.corp.test".to_string(),
             port: 8443,
@@ -332,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_args_password_auth() {
-        let args = args_of(&saml_profile(), Some(("john", "s3cret")), None);
+        let args = args_of(&base_profile(), Some(("john", "s3cret")), None, None);
         assert_eq!(
             args,
             ["vpn.corp.test:8443", "-u", "john", "-p", "s3cret", "--set-dns=0", "--pppd-use-peerdns=0", "-v"]
@@ -341,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_args_saml_auth() {
-        let args = args_of(&saml_profile(), None, None);
+        let args = args_of(&base_profile(), None, None, None);
         assert_eq!(
             args,
             ["vpn.corp.test:8443", "--saml-login", "--set-dns=0", "--pppd-use-peerdns=0", "-v"]
@@ -351,25 +376,25 @@ mod tests {
 
     #[test]
     fn test_args_realm() {
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.realm = Some("corp".to_string());
-        assert!(args_of(&profile, None, None).contains(&"--realm=corp".to_string()));
+        assert!(args_of(&profile, None, None, None).contains(&"--realm=corp".to_string()));
         profile.realm = None;
-        assert!(!args_of(&profile, None, None).iter().any(|a| a.starts_with("--realm")));
+        assert!(!args_of(&profile, None, None, None).iter().any(|a| a.starts_with("--realm")));
     }
 
     #[test]
     fn test_args_trusted_certs() {
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.trusted_certs = vec!["aaa".to_string(), "bbb".to_string()];
-        let args = args_of(&profile, None, None);
+        let args = args_of(&profile, None, None, None);
         assert!(args.contains(&"--trusted-cert=aaa".to_string()));
         assert!(args.contains(&"--trusted-cert=bbb".to_string()));
     }
 
     #[test]
     fn test_args_dns_flags_and_verbose_always_present() {
-        for args in [args_of(&saml_profile(), None, None), args_of(&saml_profile(), Some(("u", "p")), None)] {
+        for args in [args_of(&base_profile(), None, None, None), args_of(&base_profile(), Some(("u", "p")), None, None)] {
             for flag in ["--set-dns=0", "--pppd-use-peerdns=0", "-v"] {
                 assert!(args.contains(&flag.to_string()), "missing {}", flag);
             }
@@ -378,36 +403,36 @@ mod tests {
 
     #[test]
     fn test_args_extra_args_come_last() {
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.extra_args = vec!["--foo".to_string(), "--bar=1".to_string()];
-        let args = args_of(&profile, None, None);
+        let args = args_of(&profile, None, None, None);
         assert_eq!(&args[args.len() - 2..], ["--foo", "--bar=1"]);
     }
 
     #[test]
     fn test_args_ignore_cert_adds_gateway_digest() {
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.ignore_cert_errors = true;
-        let args = args_of(&profile, None, Some("deadbeef"));
+        let args = args_of(&profile, None, Some("deadbeef"), None);
         assert!(args.contains(&"--trusted-cert=deadbeef".to_string()));
     }
 
     #[test]
     fn test_args_ignore_cert_does_not_duplicate_known_digest() {
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.ignore_cert_errors = true;
         profile.trusted_certs = vec!["deadbeef".to_string()];
-        let args = args_of(&profile, None, Some("deadbeef"));
+        let args = args_of(&profile, None, Some("deadbeef"), None);
         assert_eq!(args.iter().filter(|a| *a == "--trusted-cert=deadbeef").count(), 1);
     }
 
     #[test]
     fn test_args_ignore_cert_without_digest_keeps_profile_certs() {
         // Falha ao buscar o digest: segue só com os certs do perfil.
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.ignore_cert_errors = true;
         profile.trusted_certs = vec!["aaa".to_string()];
-        let args = args_of(&profile, None, None);
+        let args = args_of(&profile, None, None, None);
         assert_eq!(args.iter().filter(|a| a.starts_with("--trusted-cert=")).count(), 1);
     }
 
@@ -415,7 +440,7 @@ mod tests {
     fn test_args_otp_included_when_required() {
         let mut profile = password_profile(Some("john"));
         profile.otp_required = true;
-        let args = otp_args(&profile, Some(("john", "s3cret")), Some("123456"));
+        let args = args_of(&profile, Some(("john", "s3cret")), None, Some("123456"));
         assert!(args.contains(&"--otp=123456".to_string()));
     }
 
@@ -423,7 +448,7 @@ mod tests {
     fn test_args_otp_trimmed() {
         let mut profile = password_profile(Some("john"));
         profile.otp_required = true;
-        let args = otp_args(&profile, Some(("john", "s3cret")), Some(" 123456 "));
+        let args = args_of(&profile, Some(("john", "s3cret")), None, Some(" 123456 "));
         assert!(args.contains(&"--otp=123456".to_string()));
     }
 
@@ -432,7 +457,7 @@ mod tests {
         let mut profile = password_profile(Some("john"));
         profile.otp_required = true;
         for otp in [None, Some(""), Some("   ")] {
-            let args = otp_args(&profile, Some(("john", "s3cret")), otp);
+            let args = args_of(&profile, Some(("john", "s3cret")), None, otp);
             assert!(!args.iter().any(|a| a.starts_with("--otp")), "otp {:?}", otp);
         }
     }
@@ -441,15 +466,15 @@ mod tests {
     fn test_args_otp_ignored_when_not_required() {
         let profile = password_profile(Some("john"));
         assert!(!profile.otp_required);
-        let args = otp_args(&profile, Some(("john", "s3cret")), Some("123456"));
+        let args = args_of(&profile, Some(("john", "s3cret")), None, Some("123456"));
         assert!(!args.iter().any(|a| a.starts_with("--otp")));
     }
 
     #[test]
     fn test_args_otp_never_included_for_saml() {
-        let mut profile = saml_profile();
+        let mut profile = base_profile();
         profile.otp_required = true;
-        let args = otp_args(&profile, None, Some("123456"));
+        let args = args_of(&profile, None, None, Some("123456"));
         assert!(!args.iter().any(|a| a.starts_with("--otp")));
     }
 }

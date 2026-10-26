@@ -48,6 +48,13 @@ impl Default for VpnProfile {
     }
 }
 
+impl VpnProfile {
+    /// Profile com senha que exige OTP a cada conexão.
+    pub fn needs_otp(&self) -> bool {
+        self.auth_type == AuthType::Password && self.otp_required
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConnectionState {
     Disconnected,
@@ -144,4 +151,28 @@ pub struct BandwidthPayload {
     pub rx_speed: f64,
     pub tx_speed: f64,
     pub timestamp: String,
+}
+
+/// Emitido pelo tray para a janela principal pedir o OTP de um Profile.
+#[derive(Debug, Clone, Serialize)]
+pub struct OtpRequestedPayload {
+    pub profile_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_needs_otp() {
+        let profile = |auth_type, otp_required| VpnProfile {
+            auth_type,
+            otp_required,
+            ..VpnProfile::default()
+        };
+        assert!(profile(AuthType::Password, true).needs_otp());
+        assert!(!profile(AuthType::Password, false).needs_otp());
+        assert!(!profile(AuthType::Saml, true).needs_otp());
+        assert!(!profile(AuthType::Saml, false).needs_otp());
+    }
 }

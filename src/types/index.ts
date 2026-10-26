@@ -45,6 +45,10 @@ export interface BandwidthData {
   timestamp: string;
 }
 
+export function needsOtp(p: VpnProfile): boolean {
+  return p.auth_type === "Password" && p.otp_required;
+}
+
 export function newProfile(): VpnProfile {
   return {
     id: "",
