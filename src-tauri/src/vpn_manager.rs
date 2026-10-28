@@ -101,6 +101,16 @@ impl VpnManager {
         // de qualquer mudança de estado ou spawn.
         check_otp_provided(&profile, otp.as_deref())?;
 
+        // Um domínio inválido faria o helper recusar todo o DNS da VPN, então
+        // falha aqui, antes de conectar, com uma mensagem visível.
+        let dns_match_domains = match Self::normalize_dns_domains(&profile.dns_match_domains) {
+            Ok(domains) => domains,
+            Err(e) => {
+                self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
+                return Err(e);
+            }
+        };
+
         // Resolve credentials up front: without -u/-p the openfortivpn blocks
         // waiting for input on stdin and the UI would sit on Connecting forever.
         let password_creds = if profile.auth_type == AuthType::Password {
@@ -153,7 +163,7 @@ impl VpnManager {
                 app_handle.clone(),
                 debug_mode,
                 dns_fallback,
-                Self::normalize_dns_domains(&profile.dns_match_domains),
+                dns_match_domains,
             )
         {
             Ok(()) => Ok(()),
@@ -166,17 +176,26 @@ impl VpnManager {
 
     /// Clean up the split-DNS domains typed by the user: trims, lowercases and
     /// strips a leading `*.` or `.` (the scutil match domain is the bare suffix),
-    /// then drops empty entries and duplicates.
-    fn normalize_dns_domains(domains: &[String]) -> Vec<String> {
+    /// then drops empty entries and duplicates. Rejects anything the helper's
+    /// hostname validation would refuse.
+    fn normalize_dns_domains(domains: &[String]) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = Vec::new();
         for d in domains {
             let d = d.trim().to_lowercase();
             let d = d.trim_start_matches("*.").trim_start_matches('.').to_string();
-            if !d.is_empty() && !out.contains(&d) {
-                out.push(d);
+            if d.is_empty() || out.contains(&d) {
+                continue;
             }
+            // Mesma regra do is_valid_hostname do helper.
+            let valid = d.len() <= 253
+                && !d.starts_with('-')
+                && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            if !valid {
+                return Err(format!("Invalid DNS domain: {}", d));
+            }
+            out.push(d);
         }
-        out
+        Ok(out)
     }
 
     /// Look up the username and the keychain password of a password-auth profile.
@@ -242,6 +261,10 @@ impl VpnManager {
         profile: VpnProfile,
         password: Option<String>,
     ) -> Result<VpnProfile, String> {
+        let profile = VpnProfile {
+            dns_match_domains: Self::normalize_dns_domains(&profile.dns_match_domains)?,
+            ..profile
+        };
         let saved = self.profile_store.upsert(profile)?;
         if let Some(pwd) = password {
             if !pwd.is_empty() {
@@ -340,9 +363,12 @@ mod tests {
         ];
         assert_eq!(
             VpnManager::normalize_dns_domains(&input),
-            vec!["corp.example.com".to_string(), "corp.local".to_string()]
+            Ok(vec!["corp.example.com".to_string(), "corp.local".to_string()])
         );
-        assert!(VpnManager::normalize_dns_domains(&[]).is_empty());
+        assert_eq!(VpnManager::normalize_dns_domains(&[]), Ok(vec![]));
+        for bad in ["corp_example.com", "-corp.com", "a;b.com"] {
+            assert!(VpnManager::normalize_dns_domains(&[bad.to_string()]).is_err());
+        }
     }
 
     #[test]

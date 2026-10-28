@@ -459,12 +459,21 @@ async fn start_log_monitor(
                         dns_match_domains.clone()
                     };
 
-                    // Configure macOS DNS via scutil
+                    // Configure macOS DNS via scutil. Se falhar, o estado não
+                    // anuncia DNS nenhum, para o painel não mostrar algo que não
+                    // foi aplicado.
+                    let mut dns_applied = false;
                     if !all_dns.is_empty() {
-                        if let Err(e) = dns_manager::setup_dns(&all_dns, &match_domains) {
-                            log::error!("Failed to setup DNS: {}", e);
+                        match dns_manager::setup_dns(&all_dns, &match_domains) {
+                            Ok(()) => dns_applied = true,
+                            Err(e) => log::error!("Failed to setup DNS: {}", e),
                         }
                     }
+                    let (all_dns, match_domains) = if dns_applied {
+                        (all_dns, match_domains)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
 
                     let ip = vpn_local_ip
                         .clone()
