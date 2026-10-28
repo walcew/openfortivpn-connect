@@ -9,6 +9,7 @@ export interface VpnProfile {
   realm: string | null;
   trusted_certs: string[];
   ignore_cert_errors: boolean;
+  dns_match_domains: string[];
   extra_args: string[];
 }
 
@@ -24,6 +25,8 @@ export interface ConnectionStatus {
   ip: string | null;
   since: string | null;
   message: string | null;
+  dns_servers: string[];
+  dns_domains: string[];
 }
 
 export interface LogLine {
@@ -61,6 +64,7 @@ export function newProfile(): VpnProfile {
     realm: null,
     trusted_certs: [],
     ignore_cert_errors: false,
+    dns_match_domains: [],
     extra_args: [],
   };
 }

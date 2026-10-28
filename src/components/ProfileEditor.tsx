@@ -14,6 +14,9 @@ interface Props {
 export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
   const isNew = profile === null;
   const [form, setForm] = useState<VpnProfile>(profile ?? newProfile());
+  const [dnsDomainsText, setDnsDomainsText] = useState(
+    (profile?.dns_match_domains ?? []).join(", "),
+  );
   const [password, setPassword] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,6 +167,26 @@ export function ProfileEditor({ profile, onSave, onCancel, onDelete }: Props) {
             onChange={(e) => setForm({ ...form, realm: e.target.value || null })}
             placeholder="optional"
           />
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-xs text-white/40">DNS domains (optional)</span>
+          <input
+            className={inputClass}
+            value={dnsDomainsText}
+            onChange={(e) => {
+              setDnsDomainsText(e.target.value);
+              setForm({
+                ...form,
+                dns_match_domains: e.target.value.split(/[,\s]+/).filter(Boolean),
+              });
+            }}
+            placeholder="corp.example.com, intranet.local"
+          />
+          <span className="text-xs text-white/40">
+            Only these domains use the VPN DNS; everything else keeps your normal DNS.
+            Leave empty to use the gateway's DNS suffixes.
+          </span>
         </label>
 
         <label className="flex items-start gap-2 cursor-pointer">

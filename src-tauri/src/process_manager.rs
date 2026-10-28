@@ -44,6 +44,7 @@ impl ProcessManager {
         app_handle: AppHandle,
         debug_mode: bool,
         dns_fallback: bool,
+        dns_match_domains: Vec<String>,
     ) -> Result<(), String> {
         // Resolve the VPN server IP from "host:port" (args[0]) so the helper can
         // clear any stale host route to it left by a previous session.
@@ -94,7 +95,7 @@ impl ProcessManager {
 
         let stop_flag = self.stop_flag.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode, fallback_dns, pid).await;
+            start_log_monitor(log_path, profile_id, app_handle, stop_flag, debug_mode, fallback_dns, dns_match_domains, pid).await;
         });
         self.monitor_handle = Some(handle);
 
@@ -275,6 +276,7 @@ async fn start_log_monitor(
     stop_flag: Arc<AtomicBool>,
     debug_mode: bool,
     fallback_dns: Vec<String>,
+    dns_match_domains: Vec<String>,
     pid: u32,
 ) {
     // Wait a moment for the log file to start receiving data
@@ -327,6 +329,7 @@ async fn start_log_monitor(
                             ip: None,
                             since: None,
                             message: Some(message),
+                            ..Default::default()
                         },
                     );
                     break;
@@ -447,12 +450,30 @@ async fn start_log_monitor(
                         log::info!("DNS with fallback (VPN provided none): {:?}", all_dns);
                     }
 
-                    // Configure macOS DNS via scutil
+                    // Domains configured on the profile take precedence over the
+                    // gateway's suffixes: they restrict the VPN's DNS to those
+                    // domains instead of making it the global resolver.
+                    let match_domains: Vec<String> = if dns_match_domains.is_empty() {
+                        dns_suffixes.clone()
+                    } else {
+                        dns_match_domains.clone()
+                    };
+
+                    // Configure macOS DNS via scutil. Se falhar, o estado não
+                    // anuncia DNS nenhum, para o painel não mostrar algo que não
+                    // foi aplicado.
+                    let mut dns_applied = false;
                     if !all_dns.is_empty() {
-                        if let Err(e) = dns_manager::setup_dns(&all_dns, &dns_suffixes) {
-                            log::error!("Failed to setup DNS: {}", e);
+                        match dns_manager::setup_dns(&all_dns, &match_domains) {
+                            Ok(()) => dns_applied = true,
+                            Err(e) => log::error!("Failed to setup DNS: {}", e),
                         }
                     }
+                    let (all_dns, match_domains) = if dns_applied {
+                        (all_dns, match_domains)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
 
                     let ip = vpn_local_ip
                         .clone()
@@ -465,6 +486,8 @@ async fn start_log_monitor(
                             profile_id: profile_id.clone(),
                             ip: ip.clone(),
                             since: Utc::now(),
+                            dns_servers: all_dns.clone(),
+                            dns_domains: match_domains.clone(),
                         },
                     );
                     // Capture IP for bandwidth monitor before moving into payload
@@ -478,6 +501,9 @@ async fn start_log_monitor(
                             ip: Some(ip),
                             since: Some(Utc::now().to_rfc3339()),
                             message: None,
+                            dns_servers: all_dns,
+                            dns_domains: match_domains,
+                            ..Default::default()
                         },
                     );
 
@@ -497,6 +523,7 @@ async fn start_log_monitor(
                             ip: None,
                             since: None,
                             message: None,
+                            ..Default::default()
                         },
                     );
                     break;
@@ -521,6 +548,7 @@ async fn start_log_monitor(
                                 ip: None,
                                 since: None,
                                 message: Some(url),
+                                ..Default::default()
                             },
                         );
                     }

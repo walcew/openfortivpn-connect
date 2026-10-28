@@ -10,6 +10,8 @@ const INITIAL_STATUS: ConnectionStatus = {
   ip: null,
   since: null,
   message: null,
+  dns_servers: [],
+  dns_domains: [],
 };
 
 export function useVpnConnection() {

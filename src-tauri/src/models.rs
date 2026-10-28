@@ -27,6 +27,12 @@ pub struct VpnProfile {
     pub trusted_certs: Vec<String>,
     #[serde(default)]
     pub ignore_cert_errors: bool,
+    /// Split-DNS domains that should use the VPN's DNS. When set, only these
+    /// domains go to the VPN's DNS and everything else keeps the system DNS;
+    /// empty keeps the previous behavior (suffixes sent by the gateway, or
+    /// global DNS if the gateway sends none).
+    #[serde(default)]
+    pub dns_match_domains: Vec<String>,
     pub extra_args: Vec<String>,
 }
 
@@ -43,6 +49,7 @@ impl Default for VpnProfile {
             realm: None,
             trusted_certs: Vec::new(),
             ignore_cert_errors: false,
+            dns_match_domains: Vec::new(),
             extra_args: Vec::new(),
         }
     }
@@ -64,6 +71,10 @@ pub enum ConnectionState {
         profile_id: String,
         ip: String,
         since: DateTime<Utc>,
+        /// DNS servers applied by the app on connect.
+        dns_servers: Vec<String>,
+        /// Domains that use this DNS; empty = the VPN's DNS is the global resolver.
+        dns_domains: Vec<String>,
     },
     Disconnecting,
     Error { message: String },
@@ -75,13 +86,17 @@ impl Default for ConnectionState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectionStatusPayload {
     pub state: String,
     pub profile_id: Option<String>,
     pub ip: Option<String>,
     pub since: Option<String>,
     pub message: Option<String>,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    #[serde(default)]
+    pub dns_domains: Vec<String>,
 }
 
 impl From<&ConnectionState> for ConnectionStatusPayload {
@@ -93,6 +108,7 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: None,
+                ..Default::default()
             },
             ConnectionState::Connecting { profile_id } => ConnectionStatusPayload {
                 state: "Connecting".into(),
@@ -100,6 +116,7 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: None,
+                ..Default::default()
             },
             ConnectionState::WaitingSaml { profile_id, url } => ConnectionStatusPayload {
                 state: "WaitingSaml".into(),
@@ -107,17 +124,23 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: Some(url.clone()),
+                ..Default::default()
             },
             ConnectionState::Connected {
                 profile_id,
                 ip,
                 since,
+                dns_servers,
+                dns_domains,
             } => ConnectionStatusPayload {
                 state: "Connected".into(),
                 profile_id: Some(profile_id.clone()),
                 ip: Some(ip.clone()),
                 since: Some(since.to_rfc3339()),
                 message: None,
+                dns_servers: dns_servers.clone(),
+                dns_domains: dns_domains.clone(),
+                ..Default::default()
             },
             ConnectionState::Disconnecting => ConnectionStatusPayload {
                 state: "Disconnecting".into(),
@@ -125,6 +148,7 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: None,
+                ..Default::default()
             },
             ConnectionState::Error { message } => ConnectionStatusPayload {
                 state: "Error".into(),
@@ -132,6 +156,7 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: Some(message.clone()),
+                ..Default::default()
             },
         }
     }
