@@ -18,7 +18,7 @@ const STATUS_CONFIG: Record<
 > = {
   Disconnected: { color: "bg-gray-400", bg: "bg-black/40 border border-white/10", label: "Disconnected" },
   Connecting: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Connecting..." },
-  WaitingSaml: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for SAML login..." },
+  WaitingSaml: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for login in your browser..." },
   WaitingPush: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for approval on your phone..." },
   Connected: { color: "bg-green-400", bg: "bg-black/40 border border-green-500/20", label: "Connected" },
   Disconnecting: { color: "bg-orange-400", bg: "bg-black/40 border border-orange-500/20", label: "Disconnecting..." },
