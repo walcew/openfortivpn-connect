@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -132,12 +132,18 @@ pub struct Gateway {
 }
 
 /// A task do túnel; abortá-la (ou soltá-la) fecha a conexão TLS.
-pub struct Tunnel(JoinHandle<String>);
+pub struct Tunnel(JoinHandle<String>, Arc<Notify>);
 
 impl Tunnel {
     /// Espera o túnel cair e devolve o motivo.
     pub async fn closed(&mut self) -> String {
         (&mut self.0).await.unwrap_or_else(|e| format!("Tunnel task failed: {}", e))
+    }
+
+    /// Manda um LCP Echo-Request agora, sem esperar o próximo intervalo; sem resposta, o túnel
+    /// cai como em qualquer echo perdido.
+    pub fn probe(&self) {
+        self.1.notify_one();
     }
 }
 
@@ -345,7 +351,9 @@ impl Gateway {
         let (to_iface, rx) = mpsc::channel(256);
         let (tx, from_iface) = mpsc::channel(256);
         let (up_tx, up_rx) = oneshot::channel();
-        let mut tunnel = Tunnel(tokio::spawn(ppp::run(stream, mtu, self.echo_interval, up_tx, to_iface, from_iface)));
+        let probe = Arc::new(Notify::new());
+        let ppp = ppp::run(stream, mtu, self.echo_interval, probe.clone(), up_tx, to_iface, from_iface);
+        let mut tunnel = Tunnel(tokio::spawn(ppp), probe);
         let up = match tokio::time::timeout(STEP_TIMEOUT, up_rx).await {
             Ok(Ok(up)) => up,
             Ok(Err(_)) => return Err(tunnel.closed().await),

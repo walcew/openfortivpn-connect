@@ -1,6 +1,8 @@
 //! Fake da camada de SO: registra cada chamada e guarda o canal de pacotes.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::net::{Os, Packets, Route};
@@ -25,16 +27,43 @@ pub enum Failure {
     Panic,
 }
 
-#[derive(Default)]
 pub struct FakeOs {
     calls: Mutex<Vec<OsCall>>,
     packets: Mutex<Option<Packets>>,
     add_route: Failure,
     add_gateway_route: Failure,
     set_dns: Failure,
+    state_file: PathBuf,
+}
+
+static NEXT: AtomicU32 = AtomicU32::new(0);
+
+impl Default for FakeOs {
+    /// Arquivo de estado próprio no diretório temporário, para os testes não se cruzarem.
+    fn default() -> Self {
+        let name = format!("ovg-state-{}-{}.json", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        Self {
+            calls: Mutex::default(),
+            packets: Mutex::default(),
+            add_route: Failure::None,
+            add_gateway_route: Failure::None,
+            set_dns: Failure::None,
+            state_file: std::env::temp_dir().join(name),
+        }
+    }
 }
 
 impl FakeOs {
+    /// Fake com o arquivo de estado neste caminho (ex.: com resíduo de um crash).
+    pub fn with_state_file(state_file: PathBuf) -> Self {
+        Self { state_file, ..Default::default() }
+    }
+
+    /// Conteúdo do arquivo de estado, ou None se não existe.
+    pub fn saved_state(&self) -> Option<serde_json::Value> {
+        std::fs::read(&self.state_file).ok().map(|d| serde_json::from_slice(&d).unwrap())
+    }
+
     /// Fake cujo `add_route` falha (erro ou pânico) depois de registrar a chamada.
     pub fn failing_add_route(failure: Failure) -> Self {
         Self { add_route: failure, ..Default::default() }
@@ -113,6 +142,9 @@ impl Os for FakeOs {
     }
     fn remove_gateway_route(&self, gateway: IpAddr) {
         self.record(OsCall::RemoveGatewayRoute(gateway));
+    }
+    fn state_file(&self) -> PathBuf {
+        self.state_file.clone()
     }
     fn down(&self) {
         self.record(OsCall::Down);

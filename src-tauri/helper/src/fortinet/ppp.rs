@@ -2,10 +2,11 @@
 
 use std::hash::{BuildHasher, Hasher};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::MissedTickBehavior;
 
 const LCP: u16 = 0xc021;
@@ -55,11 +56,13 @@ enum Action {
 /// Conduz o túnel até ele cair e devolve o motivo. `up` dispara quando o IPCP abre;
 /// a partir daí os pacotes IP fluem entre o stream e o canal da interface, e um LCP
 /// Echo-Request sai a cada `echo_interval`. `ECHO_MISSES` intervalos seguidos sem LCP do gateway,
-/// ou uma escrita que não termina em `ECHO_MISSES` intervalos, derrubam o túnel.
+/// ou uma escrita que não termina em `ECHO_MISSES` intervalos, derrubam o túnel. `probe` manda um
+/// Echo-Request na hora (troca de rede, wake), sem mexer na contagem: sem resposta, a queda sai pelos ticks.
 pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     mtu: u16,
     echo_interval: Duration,
+    probe: Arc<Notify>,
     up: oneshot::Sender<Up>,
     to_iface: mpsc::Sender<Vec<u8>>,
     mut from_iface: mpsc::Receiver<Vec<u8>>,
@@ -76,7 +79,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     let mut echo = tokio::time::interval_at(tokio::time::Instant::now() + echo_interval, echo_interval);
     echo.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        // Só `read`, `recv` e `tick` dentro do select: os três podem ser cancelados sem perder dados.
+        // Só `read`, `recv`, `tick` e `notified` dentro do select: podem ser cancelados sem perder dados.
         tokio::select! {
             r = stream.read(&mut chunk) => {
                 match r {
@@ -113,8 +116,12 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                 if ppp.missed == ECHO_MISSES {
                     return "Tunnel dropped: no response from the gateway".into();
                 }
-                ppp.echo_id = ppp.echo_id.wrapping_add(1);
-                if let Err(e) = write(&mut stream, &packet(LCP, ECHO_REQ, ppp.echo_id, &ppp.magic), deadline).await {
+                if let Err(e) = ppp.echo(&mut stream, deadline).await {
+                    return e;
+                }
+            }
+            _ = probe.notified(), if ppp.up.is_none() => {
+                if let Err(e) = ppp.echo(&mut stream, deadline).await {
                     return e;
                 }
             }
@@ -213,6 +220,11 @@ impl Ppp {
         let lcp = Cp::new(LCP, vec![(LCP_MRU, mtu.to_be_bytes().to_vec()), (LCP_MAGIC, magic.to_vec())]);
         let ipcp = Cp::new(IPCP, vec![(IPCP_ADDRESS, vec![0; 4]), (IPCP_DNS1, vec![0; 4]), (IPCP_DNS2, vec![0; 4])]);
         Self { magic, lcp, ipcp, ipcp_started: false, peer: None, up: Some(up), missed: 0, echo_id: 0 }
+    }
+
+    async fn echo<S: AsyncWrite + Unpin>(&mut self, stream: &mut S, deadline: Duration) -> Result<(), String> {
+        self.echo_id = self.echo_id.wrapping_add(1);
+        write(stream, &packet(LCP, ECHO_REQ, self.echo_id, &self.magic), deadline).await
     }
 
     fn handle(&mut self, payload: &[u8]) -> Vec<Action> {
@@ -394,7 +406,7 @@ mod tests {
         let (up, _) = oneshot::channel();
         let (to_iface, _) = mpsc::channel(1);
         let (_, from_iface) = mpsc::channel(1);
-        let reason = run(BrokenWrite, 1354, Duration::from_secs(10), up, to_iface, from_iface).await;
+        let reason = run(BrokenWrite, 1354, Duration::from_secs(10), Arc::default(), up, to_iface, from_iface).await;
         assert!(reason.starts_with("Tunnel dropped: write failed:"), "{}", reason);
     }
 }
