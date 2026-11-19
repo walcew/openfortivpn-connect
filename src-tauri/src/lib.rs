@@ -1,11 +1,8 @@
-mod cert_fetcher;
 mod commands;
 mod dns_manager;
-#[cfg(feature = "engine-v2")]
 mod engine_v2;
 mod keychain;
 mod models;
-mod process_manager;
 mod profile_store;
 mod settings_store;
 pub mod tray;
@@ -23,10 +20,9 @@ use vpn_manager::VpnManager;
 pub fn run() {
     let vpn_manager = VpnManager::new().expect("Failed to initialize VPN manager");
 
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
-    #[cfg(feature = "engine-v2")]
-    let builder = builder.plugin(tauri_plugin_notification::init());
-    builder
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(Mutex::new(vpn_manager))
         .invoke_handler(tauri::generate_handler![
             commands::get_profiles,
@@ -44,8 +40,7 @@ pub fn run() {
         .setup(|app| {
             tray::setup_tray(app)?;
 
-            // Conexão longa de eventos do Helper v2: sincroniza o estado ao abrir o app.
-            #[cfg(feature = "engine-v2")]
+            // Conexão longa de eventos do Helper: sincroniza o estado ao abrir o app.
             engine_v2::start(app.handle().clone());
 
             #[cfg(target_os = "macos")]

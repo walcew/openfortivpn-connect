@@ -55,7 +55,7 @@ pub fn connect(
 
     let mut mgr = manager.lock().map_err(|e| e.to_string())?;
     mgr.set_selected_profile(&profile_id);
-    mgr.connect(&profile_id, app_handle, settings.debug_mode, settings.dns_fallback, otp)
+    mgr.connect(&profile_id, &app_handle, settings.dns_fallback, otp.as_deref())
 }
 
 #[tauri::command]

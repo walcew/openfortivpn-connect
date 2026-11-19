@@ -75,8 +75,8 @@ function App() {
     const checkHelper = async () => {
       try {
         const status = await invoke<{ installed: boolean; running: boolean; needs_update: boolean }>("check_helper_status");
-        // Helper desatualizado (versão antiga, que executa o openfortivpn do Homebrew) ou sem o
-        // Bundled openfortivpn instalado: pede a reinstalação.
+        // Helper parado ou desatualizado (inclui o da 0.3.0, que não responde no socket novo):
+        // pede a instalação.
         if (!status.running || status.needs_update) {
           const settings = await invoke<{ helper_declined: boolean }>("get_settings");
           if (!settings.helper_declined) {
@@ -97,7 +97,7 @@ function App() {
   const handleHelperDeclined = async () => {
     setShowHelperInstall(false);
     try {
-      const currentSettings = await invoke<{ debug_mode: boolean; helper_declined: boolean }>("get_settings");
+      const currentSettings = await invoke<{ helper_declined: boolean }>("get_settings");
       await invoke("save_settings", {
         settings: { ...currentSettings, helper_declined: true },
       });

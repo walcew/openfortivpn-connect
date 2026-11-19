@@ -11,7 +11,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 pub struct HelperResponse {
     pub ok: bool,
     pub error: Option<String>,
-    pub pid: Option<u32>,
     pub version: Option<String>,
 }
 
@@ -55,57 +54,8 @@ fn send_request(json: &str) -> Result<HelperResponse, String> {
     Ok(response)
 }
 
-/// Check if an error message indicates a connection failure (helper not running).
-pub fn is_connection_error(err: &str) -> bool {
-    err.contains("Failed to connect to helper socket")
-}
-
 /// Ping the helper and return its version.
 pub fn ping() -> Result<String, String> {
     let resp = send_request(r#"{"cmd":"ping"}"#)?;
     Ok(resp.version.unwrap_or_else(|| "unknown".to_string()))
-}
-
-/// Spawn openfortivpn via the helper. Returns the PID.
-/// `vpn_server` is the resolved server IP, used for the pre-connect orphan sweep.
-pub fn spawn_vpn(args: &[String], log_path: &str, vpn_server: Option<&str>) -> Result<u32, String> {
-    let request = serde_json::json!({
-        "cmd": "spawn-vpn",
-        "args": args,
-        "log_path": log_path,
-        "vpn_server": vpn_server,
-    });
-    let resp = send_request(&request.to_string())?;
-    resp.pid
-        .ok_or_else(|| "Helper did not return PID".to_string())
-}
-
-/// Kill openfortivpn and perform full cleanup via the helper.
-/// `vpn_server` is the resolved server IP whose stale host route must be removed.
-pub fn kill_vpn(pid: u32, gateway: Option<&str>, vpn_server: Option<&str>) -> Result<(), String> {
-    let request = serde_json::json!({
-        "cmd": "kill-vpn",
-        "pid": pid,
-        "gateway": gateway,
-        "vpn_server": vpn_server,
-    });
-    send_request(&request.to_string())?;
-    Ok(())
-}
-
-/// Configure macOS DNS via the helper.
-pub fn setup_dns(servers: &[String], suffixes: &[String]) -> Result<(), String> {
-    let request = serde_json::json!({
-        "cmd": "setup-dns",
-        "servers": servers,
-        "suffixes": suffixes,
-    });
-    send_request(&request.to_string())?;
-    Ok(())
-}
-
-/// Remove VPN DNS configuration via the helper.
-pub fn teardown_dns() -> Result<(), String> {
-    send_request(r#"{"cmd":"teardown-dns"}"#)?;
-    Ok(())
 }

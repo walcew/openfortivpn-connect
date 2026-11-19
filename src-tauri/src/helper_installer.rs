@@ -4,7 +4,6 @@ use std::process::Command;
 use tauri::{AppHandle, Manager};
 
 use crate::helper_client;
-use crate::process_manager::{applescript_escape, shell_quote};
 
 const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.openvpngui.helper";
 const PLIST_INSTALL_PATH: &str = "/Library/LaunchDaemons/com.openvpngui.helper.plist";
@@ -80,6 +79,20 @@ fn needs_update(
     openfortivpn_installed: bool,
 ) -> bool {
     installed_version.is_some_and(|v| v != expected_version || !openfortivpn_installed)
+}
+
+/// Escape a string for inclusion in an AppleScript double-quoted string.
+/// AppleScript only recognizes `\\` and `\"` as escape sequences.
+/// Shell metacharacters like `$`, `` ` ``, `&` are left as-is because
+/// `do shell script` passes the string to `/bin/sh` which interprets them.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Wrap a user-supplied value in single quotes for shell safety.
+/// Inside single quotes, the shell interprets nothing — only `'` needs handling.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// AppleScript que roda `cmd` como root. Segunda camada do escape: os valores
