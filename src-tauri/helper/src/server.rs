@@ -10,6 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::handlers;
+use crate::net::SystemOs;
 use crate::protocol::{Frame, FrameKind, Request, RequestV2, Response, ResponseV2, VERSION_V2};
 use crate::session::{Event, Session};
 
@@ -48,7 +49,7 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = bind(Path::new(SOCKET_PATH))?;
     log::info!("Listening on {}", SOCKET_PATH);
-    serve(listener, Arc::new(Session::new()), console_authorizer()).await;
+    serve(listener, Arc::new(Session::new(Arc::new(SystemOs))), console_authorizer()).await;
     Ok(())
 }
 
@@ -101,12 +102,12 @@ async fn handle_connection(
     if first.is_empty() {
         return Ok(());
     }
-    log::debug!("Received: {}", first);
-
     let parsed = serde_json::from_str::<Value>(&first);
     let is_v2 = parsed.as_ref().map_or(false, |v| v.get("v").is_some());
 
     if !is_v2 {
+        // Só o v1 vai ao log: no v2 a linha pode trazer a senha.
+        log::debug!("Received: {}", first);
         let request = parsed
             .map_err(|e| e.to_string())
             .and_then(|v| serde_json::from_value::<Request>(v).map_err(|e| e.to_string()));
@@ -160,7 +161,7 @@ async fn handle_connection(
     }
 }
 
-fn handle_v2(session: &Session, parsed: serde_json::Result<Value>) -> ResponseV2 {
+fn handle_v2(session: &Arc<Session>, parsed: serde_json::Result<Value>) -> ResponseV2 {
     let request = parsed
         .map_err(|e| format!("Invalid request: {}", e))
         .and_then(RequestV2::from_value);
@@ -170,6 +171,10 @@ fn handle_v2(session: &Session, parsed: serde_json::Result<Value>) -> ResponseV2
             session.disconnect();
             ResponseV2::ok(None)
         }
+        Ok(RequestV2::Connect { profile, password, .. }) => match session.connect(profile, password) {
+            Ok(()) => ResponseV2::ok(None),
+            Err(e) => ResponseV2::error(e),
+        },
         Err(msg) => ResponseV2::error(msg),
     }
 }
@@ -197,57 +202,10 @@ async fn write_frame<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Event, Session};
-    use serde_json::{json, Value};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Duration;
-    use tokio::io::Lines;
-    use tokio::net::unix::OwnedWriteHalf;
-
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-
-    struct Client {
-        lines: Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-        writer: OwnedWriteHalf,
-    }
-
-    impl Client {
-        async fn send(&mut self, msg: Value) {
-            let _ = self.writer.write_all(format!("{}\n", msg).as_bytes()).await;
-        }
-
-        /// Próxima linha do servidor, ou None no EOF.
-        async fn recv(&mut self) -> Option<Value> {
-            let line = tokio::time::timeout(Duration::from_secs(2), self.lines.next_line())
-                .await
-                .expect("timeout waiting for the server")
-                .unwrap()?;
-            Some(serde_json::from_str(&line).unwrap())
-        }
-    }
-
-    /// Sobe o servidor num socket temporário (nunca em /var/run).
-    async fn start(authorizer: Authorizer) -> (PathBuf, Arc<Session>) {
-        let path = std::env::temp_dir().join(format!(
-            "ovg-{}-{}.sock",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let listener = bind(&path).unwrap();
-        let session = Arc::new(Session::new());
-        tokio::spawn(serve(listener, session.clone(), authorizer));
-        (path, session)
-    }
-
-    async fn connect(path: &PathBuf) -> Client {
-        let (r, writer) = tokio::net::UnixStream::connect(path).await.unwrap().into_split();
-        Client { lines: BufReader::new(r).lines(), writer }
-    }
-
-    fn allow_all() -> Authorizer {
-        Arc::new(|_| true)
-    }
+    use crate::session::Event;
+    use crate::testing::{allow_all, connect, start};
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn v1_ping_keeps_working() {

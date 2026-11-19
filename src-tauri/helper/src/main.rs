@@ -1,7 +1,11 @@
+mod fortinet;
 mod handlers;
+mod net;
 mod protocol;
 mod server;
 mod session;
+#[cfg(test)]
+mod testing;
 mod validation;
 
 use std::fs;
