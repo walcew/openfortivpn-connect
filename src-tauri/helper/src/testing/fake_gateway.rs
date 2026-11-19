@@ -14,8 +14,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::crypto::ring;
-use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio_rustls::rustls::ServerConfig;
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
 pub const PROFILE_ID: &str = "8d3c1f5e-0000-4000-8000-000000000001";
@@ -38,6 +39,8 @@ pub struct GatewayOptions {
     pub full_tunnel: bool,
     /// Aceita o `logout` e nunca responde.
     pub mute_logout: bool,
+    /// Certificado assinado por uma CA de teste (ver `FakeGateway::roots`) em vez de autoassinado.
+    pub ca_signed: bool,
 }
 
 struct Shared {
@@ -52,6 +55,7 @@ pub struct FakeGateway {
     pub port: u16,
     /// sha256 hex do DER do certificado, como em `trusted_certs`.
     pub digest: String,
+    ca: Option<CertificateDer<'static>>,
     shared: Arc<Shared>,
     from_client: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     to_client: mpsc::UnboundedSender<Vec<u8>>,
@@ -59,10 +63,23 @@ pub struct FakeGateway {
 
 impl FakeGateway {
     pub async fn start(options: GatewayOptions) -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let der = cert.cert.der().clone();
+        let (der, key_pair, ca) = if options.ca_signed {
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            params.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+            let key_pair = KeyPair::generate().unwrap();
+            let cert = params.signed_by(&key_pair, &ca_cert, &ca_key).unwrap();
+            (cert.der().clone(), key_pair, Some(ca_cert.der().clone()))
+        } else {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            (cert.cert.der().clone(), cert.key_pair, None)
+        };
         let digest = Sha256::digest(der.as_ref()).iter().map(|b| format!("{:02x}", b)).collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
         let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -94,7 +111,7 @@ impl FakeGateway {
                 });
             }
         });
-        Self { port, digest, shared, from_client: tokio::sync::Mutex::new(from_rx), to_client: to_tx }
+        Self { port, digest, ca, shared, from_client: tokio::sync::Mutex::new(from_rx), to_client: to_tx }
     }
 
     /// O Profile do comando `connect` apontando para este gateway.
@@ -108,6 +125,15 @@ impl FakeGateway {
             "trusted_certs": [self.digest],
             "ignore_cert_errors": false,
         })
+    }
+
+    /// Raízes de teste que confiam na CA deste gateway (vazias se o certificado é autoassinado).
+    pub fn roots(&self) -> RootCertStore {
+        let mut roots = RootCertStore::empty();
+        if let Some(ca) = &self.ca {
+            roots.add(ca.clone()).unwrap();
+        }
+        roots
     }
 
     pub fn logouts(&self) -> usize {

@@ -13,6 +13,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+use tokio_rustls::rustls::RootCertStore;
+
+use crate::fortinet::Trust;
 use crate::server::{bind, serve, Authorizer};
 use crate::session::Session;
 use fake_os::FakeOs;
@@ -61,14 +64,23 @@ pub async fn start_with_os(os: FakeOs) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
     (path, session, os)
 }
 
+/// Como `start_with_os`, mas a validação de certificado usa estas raízes em vez das do sistema.
+pub async fn start_with_roots(roots: RootCertStore) -> (PathBuf, Arc<Session>) {
+    start_session(allow_all(), Session::with_trust(Arc::new(FakeOs::default()), Trust::with_roots(roots))).await
+}
+
 async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<Session>) {
+    start_session(authorizer, Session::new(os)).await
+}
+
+async fn start_session(authorizer: Authorizer, session: Session) -> (PathBuf, Arc<Session>) {
     let path = std::env::temp_dir().join(format!(
         "ovg-{}-{}.sock",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let listener = bind(&path).unwrap();
-    let session = Arc::new(Session::new(os));
+    let session = Arc::new(session);
     tokio::spawn(serve(listener, session.clone(), authorizer));
     (path, session)
 }

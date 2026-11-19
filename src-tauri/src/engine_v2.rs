@@ -192,11 +192,28 @@ fn apply_state(manager: &Mutex<VpnManager>, state: &ConnectionState) {
         .sync_state_from_payload(&ConnectionStatusPayload::from(state));
 }
 
+/// O digest do erro de certificado do Helper (`... sha256 digest <hex>`).
+fn cert_digest(message: &str) -> Option<String> {
+    let rest = message.split("sha256 digest ").nth(1)?;
+    let digest: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    (digest.len() == 64).then_some(digest)
+}
+
 /// Liga o canal de eventos ao manager, aos eventos do Tauri e à tray.
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
+        let mut profile_id = String::new();
         run_events(socket_path(), |incoming| match incoming {
             Incoming::State(state) => {
+                if let ConnectionState::Connecting { profile_id: id } = &state {
+                    profile_id = id.clone();
+                }
+                // Mesmo diálogo "Trust & Reconnect" do caminho do openfortivpn.
+                if let ConnectionState::Error { message } = &state {
+                    if let Some(digest) = cert_digest(message) {
+                        let _ = app.emit("cert-warning", json!({"digest": digest, "profile_id": profile_id}));
+                    }
+                }
                 crate::tray::update_tray_icon(&app, &state);
                 let _ = app.emit("connection-status-changed", ConnectionStatusPayload::from(&state));
                 apply_state(&app.state::<Mutex<VpnManager>>(), &state);
@@ -291,6 +308,15 @@ mod tests {
                 "password": "s3cret", "otp": null
             })
         );
+    }
+
+    #[test]
+    fn certificate_error_digest_is_extracted() {
+        let digest = "ab".repeat(32);
+        let message = format!("TLS handshake failed: untrusted gateway certificate, sha256 digest {}", digest);
+        assert_eq!(cert_digest(&message), Some(digest));
+        assert_eq!(cert_digest("Login failed: invalid username or password"), None);
+        assert_eq!(cert_digest("sha256 digest 00"), None);
     }
 
     #[test]
