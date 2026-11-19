@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::session::State;
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Request {
@@ -96,17 +98,22 @@ impl Response {
 
 pub const VERSION_V2: u32 = 2;
 
-/// Lê só o campo de versão de uma linha, para escolher o protocolo.
-#[derive(Debug, Deserialize)]
-pub struct VersionProbe {
-    pub v: Option<u32>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum RequestV2 {
     Status,
     Disconnect,
+}
+
+impl RequestV2 {
+    /// Valida a versão e o comando de uma linha já lida como JSON.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        match value.get("v").and_then(|v| v.as_u64()) {
+            Some(v) if v == u64::from(VERSION_V2) => {}
+            other => return Err(format!("Unsupported protocol version: {:?}", other)),
+        }
+        serde_json::from_value(value).map_err(|e| format!("Invalid request: {}", e))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -115,7 +122,24 @@ pub struct ResponseV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pub state: Option<crate::session::State>,
+    pub state: Option<State>,
+}
+
+impl ResponseV2 {
+    pub fn ok(state: Option<State>) -> Self {
+        Self { ok: true, error: None, state }
+    }
+
+    pub fn error(msg: String) -> Self {
+        Self { ok: false, error: Some(msg), state: None }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameKind {
+    Response,
+    Event,
 }
 
 /// Envelope de tudo que o servidor escreve numa conexão v2.
@@ -123,7 +147,7 @@ pub struct ResponseV2 {
 pub struct Frame<T: Serialize> {
     pub v: u32,
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: FrameKind,
     #[serde(flatten)]
     pub body: T,
 }
