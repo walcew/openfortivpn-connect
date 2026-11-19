@@ -13,15 +13,17 @@ Cada passo HTTP abre uma conexão TLS nova com `Connection: close`. O certificad
 `POST /remote/logincheck` com corpo `application/x-www-form-urlencoded`:
 
 ```
-username=<usuário>&credential=<senha>&realm=&ajax=1&just_logged_in=1
+username=<usuário>&credential=<senha>&realm=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1
 ```
+
+Os campos e a ordem são os do passo comum do FortiClient (**obs**), que lá vai com `username` e `credential` vazios, depois do SAML. Preencher os dois com usuário e senha no login por senha é **inf**.
 
 - Sucesso: `Set-Cookie: SVPNCOOKIE=<valor>` com valor não vazio (**obs**).
 - Falha: o cookie não vem ou vem vazio, e o corpo traz `ret=0` (**inf**). O Engine trata qualquer ausência de cookie como credencial inválida. OTP e push (`ret=2` com pedido de token) ficam para o ticket próprio.
 
 ## 2. Configuração do túnel
 
-`GET /remote/fortisslvpn_xml` com `Cookie: SVPNCOOKIE=<valor>`, sem `dual_stack` (**obs**). O Engine lê do XML, em qualquer nível do documento:
+`GET /remote/fortisslvpn_xml` com `Host: sslvpn` e `Cookie: SVPNCOOKIE=<valor>`, sem `dual_stack` (**obs**). Login e logout usam o host do gateway no `Host`. O Engine lê do XML, em qualquer nível do documento:
 
 | Elemento | Uso |
 |---|---|
