@@ -5,9 +5,12 @@ mod http;
 mod ppp;
 mod xml;
 
-pub use http::Trust;
+pub use http::CertTrust;
 
-use std::sync::Arc;
+/// Emite uma linha como evento de log da sessão.
+pub type LogFn = Arc<dyn Fn(String) + Send + Sync>;
+
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -54,6 +57,12 @@ pub struct Gateway {
     port: u16,
     server_name: ServerName<'static>,
     tls: TlsConnector,
+    /// Só o auto-trust registra o digest de cada conexão.
+    auto_trust: bool,
+    trust: Arc<CertTrust>,
+    log: LogFn,
+    /// Digest do último certificado que o verificador recusou.
+    refused: Arc<Mutex<Option<String>>>,
 }
 
 /// A task do túnel; abortá-la (ou soltá-la) fecha a conexão TLS.
@@ -73,33 +82,49 @@ impl Drop for Tunnel {
 }
 
 impl Gateway {
-    pub fn new(profile: &Profile, trust: &Arc<Trust>, log: Arc<dyn Fn(String) + Send + Sync>) -> Result<Self, String> {
+    pub fn new(profile: &Profile, trust: &Arc<CertTrust>, log: LogFn) -> Result<Self, String> {
         if !is_valid_hostname(&profile.host) {
             return Err(format!("Invalid host: {}", profile.host));
         }
         let server_name = ServerName::try_from(profile.host.clone()).map_err(|e| format!("Invalid host: {}", e))?;
+        let refused = Arc::new(Mutex::new(None));
         Ok(Self {
             host: profile.host.clone(),
             port: profile.port,
             server_name,
-            tls: TlsConnector::from(Arc::new(http::client_config(
-                &profile.host,
-                &profile.trusted_certs,
-                profile.ignore_cert_errors,
-                trust,
-                log,
-            )?)),
+            tls: TlsConnector::from(Arc::new(http::client_config(profile, trust, refused.clone())?)),
+            auto_trust: profile.ignore_cert_errors,
+            trust: trust.clone(),
+            log,
+            refused,
         })
+    }
+
+    /// Digest do certificado que o verificador recusou, se foi o caso.
+    pub fn refused_digest(&self) -> Option<String> {
+        self.refused.lock().unwrap().clone()
     }
 
     async fn connect(&self) -> Result<TlsStream<TcpStream>, String> {
         let tcp = TcpStream::connect((self.host.as_str(), self.port))
             .await
             .map_err(|e| format!("Cannot reach {}:{}: {}", self.host, self.port, e))?;
-        self.tls
+        let stream = self
+            .tls
             .connect(self.server_name.clone(), tcp)
             .await
-            .map_err(|e| format!("TLS handshake failed: {}", e))
+            .map_err(|e| format!("TLS handshake failed: {}", e))?;
+        // Só depois do handshake, que prova a posse da chave: um certificado copiado não vira "troca".
+        if self.auto_trust {
+            if let Some(cert) = stream.get_ref().1.peer_certificates().and_then(|c| c.first()) {
+                if let Some((old, new)) = self.trust.record(&self.host, cert) {
+                    let line = format!("gateway certificate of {} changed: sha256 {} -> {}", self.host, old, new);
+                    log::warn!("{}", line);
+                    (self.log)(line);
+                }
+            }
+        }
+        Ok(stream)
     }
 
     fn host_header(&self) -> String {

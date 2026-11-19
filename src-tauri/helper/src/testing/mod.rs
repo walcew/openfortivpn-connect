@@ -15,7 +15,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use tokio_rustls::rustls::RootCertStore;
 
-use crate::fortinet::Trust;
+use crate::fortinet::CertTrust;
 use crate::server::{bind, serve, Authorizer};
 use crate::session::Session;
 use fake_os::FakeOs;
@@ -64,9 +64,9 @@ pub async fn start_with_os(os: FakeOs) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
     (path, session, os)
 }
 
-/// Como `start_with_os`, mas a validação de certificado usa estas raízes em vez das do sistema.
+/// Servidor com o fake de SO padrão e a validação de certificado usando estas raízes em vez das do sistema.
 pub async fn start_with_roots(roots: RootCertStore) -> (PathBuf, Arc<Session>) {
-    start_session(allow_all(), Session::with_trust(Arc::new(FakeOs::default()), Trust::with_roots(roots))).await
+    start_session(allow_all(), Session::with_trust(Arc::new(FakeOs::default()), CertTrust::with_roots(roots))).await
 }
 
 async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<Session>) {
