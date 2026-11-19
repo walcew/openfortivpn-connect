@@ -293,10 +293,10 @@ impl Session {
         Ok(())
     }
 
-    /// Aviso do observador de rede (troca de rota default ou wake). Só conta com sessão
-    /// conectada; a rajada é agrupada na sessão.
+    /// Aviso do observador de rede (troca de rota default ou wake). Só conta com o /32 do gateway
+    /// aplicado, mesmo antes do `connected`; a rajada é agrupada na sessão.
     pub fn network_changed(&self) {
-        if matches!(self.inner.lock().unwrap().state, State::Connected { .. }) {
+        if net::has_gateway_route(&self.applied) {
             self.network.notify_one();
         }
     }
@@ -444,7 +444,7 @@ impl Session {
                 _ = cancel.notified() => break End::Stopped,
                 _ = self.network_settled() => {
                     self.log("network changed: moving the gateway route to the current default and checking the tunnel");
-                    if let Err(e) = net::rehome_gateway_route(&*self.os, &self.applied) {
+                    if let Err(e) = net::rehome_gateway_route(&*self.os, config.gateway, &self.applied) {
                         self.log(format!("gateway route not restored, the tunnel may drop: {}", e));
                     }
                     tunnel.probe();
@@ -538,7 +538,7 @@ mod tests {
     use crate::net::Route;
     use super::{Clock, Session};
     use crate::testing::fake_gateway::*;
-    use crate::testing::fake_os::{Failure, FakeOs, OsCall};
+    use crate::testing::fake_os::{Failure, FakeOs, OsCall, FIRST_VIA, NEW_VIA};
     use crate::testing::{allow_all, connect, start_session, SAML_PORTS, start_with_bandwidth_interval, start_with_echo_interval, start_with_os, start_with_push_timeout, start_with_roots, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
@@ -585,12 +585,18 @@ mod tests {
     }
 
     async fn connected(options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value) {
+        let (gw, c, os, state, _) = connected_session(crate::fortinet::ECHO_INTERVAL, options).await;
+        (gw, c, os, state)
+    }
+
+    /// Conectada com o echo neste intervalo; devolve também a sessão, para injetar a troca de rede.
+    async fn connected_session(echo: Duration, options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value, std::sync::Arc<Session>) {
         let gw = FakeGateway::start(options).await;
-        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let (path, session, os) = start_with_echo_interval(echo).await;
         let mut c = client(&path).await;
         let state = connect_with(&mut c, &gw, PASSWORD).await;
         assert_eq!(state["state"], "connected", "{}", state);
-        (gw, c, os, state)
+        (gw, c, os, state, session)
     }
 
     fn assert_connected_state(state: &Value) {
@@ -989,7 +995,7 @@ mod tests {
     async fn disconnect_logs_out_and_tears_everything_down() {
         let (gw, mut c, os, _state) = connected(GatewayOptions::default()).await;
         // O arquivo de estado da recuperação de crash guarda o /32 e o DNS aplicados.
-        assert_eq!(os.saved_state(), Some(json!({"gateway_route": "127.0.0.1", "dns": true})));
+        assert_eq!(os.saved_state(), Some(json!({"gateway_route": "127.0.0.1", "gateway_via": "192.0.2.1", "dns": true})));
         let state = disconnect(&mut c).await;
         assert_eq!(state, json!({"v": 2, "type": "event", "event": "state", "state": "disconnected"}));
         assert_eq!(gw.logouts(), 1);
@@ -1402,11 +1408,7 @@ mod tests {
     }
 
     async fn connected_with_echo(options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value) {
-        let (path, _session, os) = start_with_echo_interval(ECHO).await;
-        let gw = FakeGateway::start(options).await;
-        let mut c = client(&path).await;
-        let state = connect_with(&mut c, &gw, PASSWORD).await;
-        assert_eq!(state["state"], "connected", "{}", state);
+        let (gw, c, os, state, _) = connected_session(ECHO, options).await;
         (gw, c, os, state)
     }
 
@@ -1423,9 +1425,12 @@ mod tests {
         let state = c.recv_skipping_logs().await;
         assert_dropped(&state, "tunnel-dropped", "Tunnel dropped: no response from the gateway");
         // O último LCP do gateway é o Echo-Request dele, logo depois do IPCP: echos nos ticks 1 e 2,
-        // queda no 3.
-        assert_eq!(gw.echo_requests(), 2);
-        assert!(started.elapsed() >= ECHO * 2 && started.elapsed() < ECHO * 5, "took {:?}", started.elapsed());
+        // queda no 3. Sob carga, o Echo-Request do gateway pode chegar depois do tick 1 e adiar a
+        // queda em um tick. Os ticks contam do IPCP, antes do `connected` que `started` marca: daí
+        // o piso de um intervalo, e não de dois.
+        let echoes = gw.echo_requests();
+        assert!((2..=3).contains(&echoes), "{} echo requests", echoes);
+        assert!(started.elapsed() >= ECHO && started.elapsed() < ECHO * 8, "took {:?}", started.elapsed());
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
         assert_eq!(os.saved_state(), None);
         assert!(os.calls().contains(&OsCall::Down));
@@ -1561,17 +1566,8 @@ mod tests {
 
     // ---- Troca de rede, wake e recuperação de crash ----
 
-    /// Conectada com o echo neste intervalo; devolve também a sessão, para injetar a troca de rede.
-    async fn connected_session(echo: Duration, options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, std::sync::Arc<Session>) {
-        let gw = FakeGateway::start(options).await;
-        let (path, session, os) = start_with_echo_interval(echo).await;
-        let mut c = client(&path).await;
-        let state = connect_with(&mut c, &gw, PASSWORD).await;
-        assert_eq!(state["state"], "connected", "{}", state);
-        (gw, c, os, session)
-    }
-
     const GW: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const ECHO_10S: Duration = Duration::from_secs(10);
 
     /// Chamadas ao SO depois do apply.
     fn calls_after_connect(os: &FakeOs) -> Vec<OsCall> {
@@ -1580,29 +1576,51 @@ mod tests {
         calls[start..].to_vec()
     }
 
+    async fn wait_for_echoes(gw: &FakeGateway, n: usize) {
+        let started = Instant::now();
+        while gw.echo_requests() < n {
+            assert!(started.elapsed() < Duration::from_secs(3), "only {} echo requests", gw.echo_requests());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn network_change_moves_the_gateway_route_and_probes_the_tunnel_at_once() {
         // Echo no intervalo de produção (10 s): o echo que chega é o da troca de rede.
-        let (gw, _c, os, session) = connected_session(Duration::from_secs(10), GatewayOptions::default()).await;
-        let started = Instant::now();
+        let (gw, _c, os, _, session) = connected_session(ECHO_10S, GatewayOptions::default()).await;
         session.network_changed();
-        while gw.echo_requests() == 0 {
-            assert!(started.elapsed() < Duration::from_secs(3), "no echo after the network change");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(calls_after_connect(&os), [OsCall::RemoveGatewayRoute(GW), OsCall::AddGatewayRoute(GW)]);
-        assert_eq!(os.saved_state().unwrap()["gateway_route"], "127.0.0.1");
+        wait_for_echoes(&gw, 1).await;
+        // O /32 é levado ao default novo sem sair da tabela.
+        assert_eq!(calls_after_connect(&os), [OsCall::MoveGatewayRoute(GW)]);
+        assert_eq!(os.saved_state().unwrap()["gateway_via"], NEW_VIA.to_string());
+    }
+
+    #[tokio::test]
+    async fn gateway_route_comes_back_on_the_next_change_after_a_failed_move() {
+        // Troca de Wi-Fi: a default some antes da nova chegar, e o primeiro refazer falha.
+        let (gw, _c, os, _, session) = connected_session(ECHO_10S, GatewayOptions::default()).await;
+        os.fail_next_move();
+        session.network_changed();
+        wait_for_echoes(&gw, 1).await;
+        assert!(calls_after_connect(&os).is_empty(), "{:?}", os.calls());
+        // O registro continua com o /32 antigo, para o teardown e a recuperação.
+        assert_eq!(os.saved_state().unwrap()["gateway_via"], FIRST_VIA.to_string());
+
+        session.network_changed();
+        wait_for_echoes(&gw, 2).await;
+        assert_eq!(calls_after_connect(&os), [OsCall::MoveGatewayRoute(GW)]);
+        assert_eq!(os.saved_state().unwrap()["gateway_via"], NEW_VIA.to_string());
     }
 
     #[tokio::test]
     async fn burst_of_network_changes_moves_the_route_once() {
-        let (gw, mut c, os, session) = connected_session(Duration::from_secs(10), GatewayOptions::default()).await;
+        let (gw, mut c, os, _, session) = connected_session(ECHO_10S, GatewayOptions::default()).await;
         for _ in 0..5 {
             session.network_changed();
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         tokio::time::sleep(super::NETWORK_SETTLE * 2).await;
-        assert_eq!(calls_after_connect(&os), [OsCall::RemoveGatewayRoute(GW), OsCall::AddGatewayRoute(GW)]);
+        assert_eq!(calls_after_connect(&os), [OsCall::MoveGatewayRoute(GW)]);
         assert_eq!(gw.echo_requests(), 1);
         c.send(json!({"v": 2, "cmd": "status"})).await;
         assert_eq!(c.recv_skipping_logs().await["state"], "connected");
@@ -1611,11 +1629,14 @@ mod tests {
     #[tokio::test]
     async fn network_change_with_a_mute_gateway_drops_the_tunnel() {
         // Echo a cada 600 ms: o refazer (~1 s depois do aviso) vem antes da queda (~1,8 s).
-        let (_gw, mut c, os, session) = connected_session(Duration::from_millis(600), GatewayOptions { mute_echo: true, ..Default::default() }).await;
+        let options = GatewayOptions { mute_echo: true, ..Default::default() };
+        let (_gw, mut c, os, _, session) = connected_session(Duration::from_millis(600), options).await;
         session.network_changed();
         let state = c.recv_skipping_logs().await;
         assert_dropped(&state, "tunnel-dropped", "Tunnel dropped: no response from the gateway");
-        assert!(calls_after_connect(&os).starts_with(&[OsCall::RemoveGatewayRoute(GW), OsCall::AddGatewayRoute(GW)]), "{:?}", os.calls());
+        assert_eq!(calls_after_connect(&os)[0], OsCall::MoveGatewayRoute(GW), "{:?}", os.calls());
+        // O teardown remove o /32 pelo next-hop atual.
+        assert!(os.calls().contains(&OsCall::RemoveGatewayRoute(GW, NEW_VIA)), "{:?}", os.calls());
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
         assert_eq!(os.saved_state(), None);
     }
@@ -1628,16 +1649,49 @@ mod tests {
         assert!(os.calls().is_empty());
     }
 
+    /// Sobe o Helper sobre um arquivo de estado com este conteúdo e devolve o fake e se o arquivo sobrou.
+    async fn start_over_state_file(name: &str, contents: &str) -> (std::sync::Arc<FakeOs>, bool) {
+        let file = std::env::temp_dir().join(format!("ovg-crash-{}-{}.json", name, std::process::id()));
+        std::fs::write(&file, contents).unwrap();
+        let (_path, _session, os) = start_with_os(FakeOs::with_state_file(file.clone())).await;
+        (os, file.exists())
+    }
+
     #[tokio::test]
     async fn helper_start_undoes_the_leftovers_of_a_crash() {
-        let file = std::env::temp_dir().join(format!("ovg-crash-{}.json", std::process::id()));
-        std::fs::write(&file, r#"{"gateway_route":"203.0.113.5","dns":true}"#).unwrap();
-        let (_path, _session, os) = start_with_os(FakeOs::with_state_file(file.clone())).await;
-        assert_eq!(os.calls(), [OsCall::RemoveDns, OsCall::RemoveGatewayRoute("203.0.113.5".parse().unwrap())]);
-        assert!(!file.exists());
+        let gw: IpAddr = "203.0.113.5".parse().unwrap();
+        let via: IpAddr = "192.168.1.1".parse().unwrap();
+        let (os, left) = start_over_state_file("full", r#"{"gateway_route":"203.0.113.5","gateway_via":"192.168.1.1","dns":true}"#).await;
+        assert_eq!(os.calls(), [OsCall::RemoveDns, OsCall::RemoveGatewayRoute(gw, via)]);
+        assert!(!left);
+
+        let (os, left) = start_over_state_file("route", r#"{"gateway_route":"203.0.113.5","gateway_via":"192.168.1.1","dns":false}"#).await;
+        assert_eq!(os.calls(), [OsCall::RemoveGatewayRoute(gw, via)]);
+        assert!(!left);
+
+        let (os, left) = start_over_state_file("dns", r#"{"gateway_route":null,"gateway_via":null,"dns":true}"#).await;
+        assert_eq!(os.calls(), [OsCall::RemoveDns]);
+        assert!(!left);
 
         // Sem arquivo, nada a desfazer.
         let (_path, _session, os) = start_with_os(FakeOs::default()).await;
         assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_file_without_the_next_hop_keeps_the_route() {
+        // Formato anterior ao next-hop: o /32 do mesmo IP pode ser de outro software.
+        let (os, left) = start_over_state_file("old", r#"{"gateway_route":"203.0.113.5","dns":true}"#).await;
+        assert_eq!(os.calls(), [OsCall::RemoveDns]);
+        assert!(!left);
+    }
+
+    #[tokio::test]
+    async fn unreadable_state_file_is_discarded_without_touching_the_network() {
+        for (name, contents) in [("corrupt", "{\"gateway_ro"), ("bad-ip", r#"{"gateway_route":"not-an-ip","gateway_via":"192.168.1.1","dns":true}"#)] {
+            let (os, left) = start_over_state_file(name, contents).await;
+            assert!(os.calls().is_empty(), "{}: {:?}", name, os.calls());
+            assert!(!left, "{}", name);
+        }
     }
 }

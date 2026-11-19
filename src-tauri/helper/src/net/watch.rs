@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::io::unix::AsyncFd;
 
 /// De quanto em quanto o relógio é conferido; o wake é notado até esse tempo depois.
+// shortcut: polling de 5 s em vez da notificação de power do IOKit (que pede runloop), e um ajuste
+// de NTP maior que isso vira um refazer extra, inofensivo; evoluir se o atraso ou o falso wake pesarem.
 const WAKE_CHECK: Duration = Duration::from_secs(5);
 
 /// Avisa `changed` a cada troca de rota default IPv4 e a cada wake. Avisos chegam em rajada:
@@ -41,13 +43,19 @@ async fn watch_wakes(changed: &impl Fn()) {
     loop {
         tokio::time::sleep(WAKE_CHECK).await;
         let (m, w) = (Instant::now(), SystemTime::now());
-        let slept = w.duration_since(wall).unwrap_or_default().saturating_sub(m - mono);
-        if slept > WAKE_CHECK {
+        // Relógio de parede para trás (ajuste manual ou NTP) não é wake.
+        if let Some(slept) = slept(m - mono, w.duration_since(wall).unwrap_or_default()) {
             log::info!("woke up after about {} s asleep", slept.as_secs());
             changed();
         }
         (mono, wall) = (m, w);
     }
+}
+
+/// Quanto tempo a máquina dormiu entre duas conferências, se dormiu: o relógio de parede andou
+/// mais que o monotônico, com folga de um intervalo para atrasos do agendador.
+fn slept(mono: Duration, wall: Duration) -> Option<Duration> {
+    Some(wall.saturating_sub(mono)).filter(|s| *s > WAKE_CHECK)
 }
 
 fn open_route_socket() -> Result<AsyncFd<File>, String> {
@@ -71,8 +79,10 @@ fn open_route_socket() -> Result<AsyncFd<File>, String> {
 }
 
 /// Se a mensagem do route socket adiciona, remove ou muda uma rota default IPv4 (destino 0.0.0.0,
-/// máscara zero). As nossas rotas ficam de fora: o /32 é de host e as metades do full tunnel têm
-/// máscara 128.0.0.0.
+/// máscara zero), inclusive as default por interface (`RTF_IFSCOPE`). As nossas rotas ficam de
+/// fora: o /32 é de host e as metades do full tunnel têm máscara 128.0.0.0.
+// shortcut: só IPv4 (o socket é aberto com AF_INET), como o resto da camada de rede; evoluir junto
+// com o suporte a gateway IPv6.
 fn is_default_route_change(msg: &[u8]) -> bool {
     let header = std::mem::size_of::<libc::rt_msghdr>();
     if msg.len() < header || msg[2] != libc::RTM_VERSION as u8 {
@@ -149,6 +159,32 @@ mod tests {
         }
         let no_mask = message(libc::RTM_ADD, libc::RTF_GATEWAY, libc::RTA_DST | libc::RTA_GATEWAY, &[&sockaddr_in([0; 4]), &gw]);
         assert!(is_default_route_change(&no_mask));
+    }
+
+    #[test]
+    fn interface_scoped_default_is_a_change() {
+        let msg = message(libc::RTM_ADD, libc::RTF_GATEWAY | libc::RTF_IFSCOPE, DST_GW_MASK, &[&sockaddr_in([0; 4]), &sockaddr_in([10, 0, 0, 1]), &[0, 0, 0, 0]]);
+        assert!(is_default_route_change(&msg));
+    }
+
+    #[test]
+    fn sockaddr_cut_in_the_middle_of_the_message_is_ignored() {
+        // O gateway anuncia 16 bytes e a mensagem acaba no 6º; a máscara nem chega.
+        let cut = &sockaddr_in([192, 168, 1, 1])[..6];
+        assert!(!is_default_route_change(&message(libc::RTM_ADD, libc::RTF_GATEWAY, DST_GW_MASK, &[&sockaddr_in([0; 4]), cut])));
+        // O destino anuncia 16 bytes e só 6 chegam.
+        assert!(!is_default_route_change(&message(libc::RTM_ADD, 0, libc::RTA_DST, &[&sockaddr_in([0; 4])[..6]])));
+    }
+
+    #[test]
+    fn wall_clock_ahead_of_the_monotonic_clock_is_a_wake() {
+        let s = Duration::from_secs;
+        assert_eq!(slept(s(5), s(65)), Some(s(60)));
+        // Atraso do agendador ou ajuste pequeno do NTP: não é wake.
+        assert_eq!(slept(s(5), s(9)), None);
+        assert_eq!(slept(s(5), s(10)), None);
+        // Relógio de parede para trás chega aqui como zero.
+        assert_eq!(slept(s(5), s(0)), None);
     }
 
     #[test]
