@@ -657,11 +657,15 @@ mod tests {
         let mut c = client(&path).await;
         assert_eq!(connect_with(&mut c, &gw, PASSWORD).await["state"], "connected");
         drop(os.take_packets());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Descarta os eventos acumulados no socket durante a espera.
-        while tokio::time::timeout(Duration::from_millis(5), c.recv()).await.is_ok() {}
+        // O runtime do teste tem uma thread só: ceder a vez deixa o medidor ver o fechamento antes do pacote.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         gw.send_ip(vec![0x45; 40]);
+        // Dá tempo ao pacote de chegar e descarta os eventos acumulados no socket até lá.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while tokio::time::timeout(Duration::from_millis(5), c.recv()).await.is_ok() {}
         for _ in 0..4 {
             assert_eq!(next_bandwidth(&mut c).await, (0, 0));
         }
