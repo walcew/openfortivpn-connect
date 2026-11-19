@@ -277,6 +277,10 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.trim().to_string())
     };
+    // Como o gateway do CNJ: sem `User-Agent` ele fecha a conexão sem responder (o túnel não precisa).
+    if header("user-agent").is_none() && !request_line.starts_with("GET /remote/sslvpn-tunnel ") {
+        return;
+    }
     let has_cookie = header("cookie").as_deref() == Some(&format!("SVPNCOOKIE={}", COOKIE));
 
     let response = if request_line.starts_with("POST /remote/logincheck ") {
