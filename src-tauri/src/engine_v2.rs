@@ -7,25 +7,33 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::helper_client::SOCKET_PATH;
 use crate::models::*;
+use crate::vpn_manager::VpnManager;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
-pub enum Incoming {
+enum Incoming {
     State(ConnectionState),
     Log(String),
 }
 
+/// Caminho do socket do Helper.
+pub fn socket_path() -> &'static Path {
+    Path::new(SOCKET_PATH)
+}
+
 /// Recusa o que o Engine ainda não suporta, antes de qualquer tentativa.
+// shortcut: só autenticação por senha sem OTP, evolui nos tickets #13 (OTP/push) e #15 (SAML)
 pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
     if profile.auth_type == AuthType::Saml {
         return Err("SAML authentication is not supported yet by the v2 engine".into());
@@ -37,7 +45,7 @@ pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
 }
 
 /// Corpo do `connect`: a senha só viaja aqui, nunca em argv.
-pub fn connect_request(profile: &VpnProfile, username: &str, password: &str) -> Value {
+fn connect_request(profile: &VpnProfile, username: &str, password: &str) -> Value {
     json!({
         "v": 2,
         "cmd": "connect",
@@ -112,7 +120,7 @@ fn str_list(v: &Value) -> Vec<String> {
 
 /// Converte o estado do contrato v2 (evento ou resposta de `status`) no
 /// `ConnectionState` que a janela e a tray já consomem.
-pub fn parse_state(v: &Value) -> Option<ConnectionState> {
+fn parse_state(v: &Value) -> Option<ConnectionState> {
     let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
     Some(match v["state"].as_str()? {
         // `reason` presente = o Helper desconectou por um motivo (ex.: login recusado).
@@ -160,7 +168,7 @@ fn listen_once(path: &Path, on: &mut impl FnMut(Incoming)) -> Result<(), String>
 
 /// Mantém a conexão de eventos aberta para sempre, reabrindo com espera
 /// crescente (1s a 15s) quando o Helper some.
-pub fn run_events(path: &Path, mut on: impl FnMut(Incoming)) {
+fn run_events(path: &Path, mut on: impl FnMut(Incoming)) {
     let mut delay = RECONNECT_MIN;
     loop {
         delay = match listen_once(path, &mut on) {
@@ -174,17 +182,31 @@ pub fn run_events(path: &Path, mut on: impl FnMut(Incoming)) {
     }
 }
 
-/// Liga o canal de eventos aos eventos do Tauri e ao ícone da tray.
+/// No caminho v2 os eventos são a única fonte da verdade do estado. O lock é
+/// bloqueante (e não `try_lock`) para que um evento chegando durante um
+/// connect/disconnect em andamento espere o comando soltar o manager em vez de se perder.
+fn apply_state(manager: &Mutex<VpnManager>, state: &ConnectionState) {
+    manager
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sync_state_from_payload(&ConnectionStatusPayload::from(state));
+}
+
+/// Liga o canal de eventos ao manager, aos eventos do Tauri e à tray.
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
-        run_events(Path::new(SOCKET_PATH), |incoming| match incoming {
+        run_events(socket_path(), |incoming| match incoming {
             Incoming::State(state) => {
                 crate::tray::update_tray_icon(&app, &state);
                 let _ = app.emit("connection-status-changed", ConnectionStatusPayload::from(&state));
+                apply_state(&app.state::<Mutex<VpnManager>>(), &state);
+                // Depois do sync, para o menu refletir o estado novo.
+                crate::tray::refresh_tray_menu(&app);
             }
             Incoming::Log(message) => {
                 let _ = app.emit(
                     "log-line",
+                    // shortcut: o Helper não manda nível, tudo vai como info; evolui se o evento de log ganhar nível
                     LogLinePayload { timestamp: Utc::now().to_rfc3339(), level: "info".into(), message },
                 );
             }
@@ -355,6 +377,24 @@ mod tests {
             Incoming::State(ConnectionState::Disconnected)
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn state_event_during_a_running_command_is_not_lost() {
+        let manager = Mutex::new(VpnManager::new().unwrap());
+        let held = manager.lock().unwrap(); // connect/disconnect em andamento
+        std::thread::scope(|s| {
+            let event = s.spawn(|| {
+                apply_state(&manager, &ConnectionState::Connecting { profile_id: "p1".into() })
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!event.is_finished(), "event must wait for the lock, not give up");
+            drop(held);
+        });
+        assert!(matches!(
+            manager.lock().unwrap().get_state(),
+            ConnectionState::Connecting { profile_id } if profile_id == "p1"
+        ));
     }
 
     #[test]
