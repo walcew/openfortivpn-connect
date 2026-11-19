@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::process::Command;
 
+use crate::net;
 use crate::protocol::{Request, Response};
 use crate::validation;
 
@@ -186,95 +187,15 @@ fn cleanup_network(gateway: Option<&str>, vpn_server: Option<&str>) {
 }
 
 fn handle_setup_dns(servers: Vec<String>, suffixes: Vec<String>) -> Response {
-    // Validate servers
-    if servers.is_empty() {
-        return Response::error("No DNS servers provided".to_string());
-    }
-    for server in &servers {
-        if !validation::is_valid_ipv4(server) {
-            return Response::error(format!("Invalid DNS server IP: {}", server));
-        }
-    }
-
-    // Validate each suffix individually (rejecting e.g. strings containing ';')
-    for s in &suffixes {
-        if !validation::is_valid_hostname(s) {
-            return Response::error(format!("Invalid DNS suffix: {}", s));
-        }
-    }
-
-    let servers_str = servers.join(" ");
-
-    let scutil_input = if suffixes.is_empty() {
-        format!(
-            "d.init\n\
-             d.add ServerAddresses * {servers}\n\
-             d.add SupplementalMatchDomains * \"\"\n\
-             set State:/Network/Service/OpenFortiVPN/DNS\n\
-             quit\n",
-            servers = servers_str,
-        )
-    } else {
-        let domains = suffixes.join(" ");
-        format!(
-            "d.init\n\
-             d.add ServerAddresses * {servers}\n\
-             d.add SupplementalMatchDomains * {domains}\n\
-             d.add SearchDomains * {domains}\n\
-             set State:/Network/Service/OpenFortiVPN/DNS\n\
-             quit\n",
-            servers = servers_str,
-            domains = domains,
-        )
-    };
-
-    log::info!(
-        "Setting up DNS with servers: {} suffixes: {:?}",
-        servers_str,
-        suffixes
-    );
-
-    let result = Command::new("/usr/sbin/scutil")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(scutil_input.as_bytes())?;
-                // stdin is dropped here, closing the pipe so scutil processes input
-            }
-            child.wait()
-        });
-
-    match result {
-        Ok(status) if status.success() => {
-            log::info!("DNS configured successfully");
-            Response::success()
-        }
-        Ok(status) => Response::error(format!("scutil exited with status: {}", status)),
-        Err(e) => Response::error(format!("Failed to run scutil: {}", e)),
+    match net::system::set_dns(&servers, &suffixes) {
+        Ok(()) => Response::success(),
+        Err(e) => Response::error(e),
     }
 }
 
 fn handle_teardown_dns() -> Response {
-    log::info!("Tearing down DNS configuration");
-
-    let result = Command::new("/usr/sbin/scutil")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(b"remove State:/Network/Service/OpenFortiVPN/DNS\nquit\n")?;
-            }
-            child.wait()
-        });
-
-    match result {
-        Ok(_) => {
-            log::info!("DNS configuration removed");
-            Response::success()
-        }
+    match net::system::remove_dns() {
+        Ok(()) => Response::success(),
         Err(e) => Response::error(format!("Failed to teardown DNS: {}", e)),
     }
 }

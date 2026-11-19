@@ -49,7 +49,7 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = bind(Path::new(SOCKET_PATH))?;
     log::info!("Listening on {}", SOCKET_PATH);
-    serve(listener, Arc::new(Session::new(Arc::new(SystemOs))), console_authorizer()).await;
+    serve(listener, Arc::new(Session::new(Arc::new(SystemOs::default()))), console_authorizer()).await;
     Ok(())
 }
 
