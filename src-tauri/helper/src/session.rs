@@ -1,17 +1,22 @@
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::task::JoinSet;
 
 use crate::fortinet::{CertTrust, Gateway, LogFn, Login, Profile};
-use crate::net::{self, Os};
+use crate::net::{self, Os, Packets};
 
 const GOOGLE_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Intervalo do evento de banda.
+const BANDWIDTH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
@@ -46,6 +51,42 @@ pub enum State {
 pub enum Event {
     State(State),
     Log { line: String },
+    /// Totais da sessão, em bytes de pacotes IP, a cada intervalo (também sem tráfego, para a GUI ver a velocidade cair a zero).
+    Bandwidth { rx_bytes: u64, tx_bytes: u64 },
+}
+
+/// Bytes IP que passaram pelo túnel desde o início da sessão (rx = do gateway, tx = para ele).
+#[derive(Default)]
+struct Traffic {
+    rx: AtomicU64,
+    tx: AtomicU64,
+}
+
+/// Troca o canal de pacotes por outro, de mesmo formato, que conta o que passa por ele.
+// shortcut: um salto extra por pacote em cada sentido, para não mexer no PPP; mover a contagem para `ppp::run` se pesar.
+fn meter(packets: Packets, traffic: &Arc<Traffic>, tasks: &mut JoinSet<()>) -> Packets {
+    let Packets { tx: to_gateway, rx: mut from_gateway } = packets;
+    let (tx, mut from_os) = mpsc::channel::<Vec<u8>>(256);
+    let (to_os, rx) = mpsc::channel::<Vec<u8>>(256);
+    let t = traffic.clone();
+    tasks.spawn(async move {
+        while let Some(p) = from_os.recv().await {
+            t.tx.fetch_add(p.len() as u64, Ordering::Relaxed);
+            if to_gateway.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    let t = traffic.clone();
+    tasks.spawn(async move {
+        while let Some(p) = from_gateway.recv().await {
+            t.rx.fetch_add(p.len() as u64, Ordering::Relaxed);
+            if to_os.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+    Packets { tx, rx }
 }
 
 struct Inner {
@@ -64,6 +105,7 @@ pub struct Session {
     applied: Mutex<net::Applied>,
     events: broadcast::Sender<Event>,
     push_timeout: Option<Duration>,
+    bandwidth_interval: Duration,
 }
 
 impl Session {
@@ -85,7 +127,15 @@ impl Session {
             applied: Mutex::default(),
             events: broadcast::channel(256).0,
             push_timeout: None,
+            bandwidth_interval: BANDWIDTH_INTERVAL,
         }
+    }
+
+    /// Intervalo curto da banda, só para testes.
+    #[cfg(test)]
+    pub fn with_bandwidth_interval(mut self, interval: Duration) -> Self {
+        self.bandwidth_interval = interval;
+        self
     }
 
     /// Prazo curto do push, só para testes.
@@ -218,6 +268,10 @@ impl Session {
         if !profile.dns_match_domains.is_empty() {
             config.dns_suffixes = profile.dns_match_domains.clone();
         }
+        // Ao sair do `drive`, o JoinSet aborta o medidor e o emissor de banda.
+        let mut tasks = JoinSet::new();
+        let traffic = Arc::new(Traffic::default());
+        let packets = meter(packets, &traffic, &mut tasks);
         match net::apply(&*self.os, &config, packets, &self.applied) {
             Ok(None) => {}
             Ok(Some(warning)) => {
@@ -246,6 +300,17 @@ impl Session {
             };
             Self::set_state(&mut inner, &self.events, connected);
         }
+        let events = self.events.clone();
+        let mut ticker = tokio::time::interval(self.bandwidth_interval);
+        tasks.spawn(async move {
+            loop {
+                ticker.tick().await;
+                let _ = events.send(Event::Bandwidth {
+                    rx_bytes: traffic.rx.load(Ordering::Relaxed),
+                    tx_bytes: traffic.tx.load(Ordering::Relaxed),
+                });
+            }
+        });
 
         let reason = tokio::select! {
             r = tunnel.closed() => Some(r),
@@ -301,7 +366,7 @@ mod tests {
     use crate::net::Route;
     use crate::testing::fake_gateway::*;
     use crate::testing::fake_os::{Failure, FakeOs, OsCall};
-    use crate::testing::{connect, start_with_os, start_with_push_timeout, start_with_roots, Client};
+    use crate::testing::{connect, start_with_bandwidth_interval, start_with_os, start_with_push_timeout, start_with_roots, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
         json!({"v": 2, "cmd": "connect", "profile": gw.profile(), "password": password, "otp": null})
@@ -570,6 +635,43 @@ mod tests {
         assert_eq!(got, Some(inbound));
 
         assert!(gw.echo_replies() >= 1, "gateway echo request was not answered");
+    }
+
+    /// Próximo evento de banda, como (rx, tx).
+    async fn next_bandwidth(c: &mut Client) -> (u64, u64) {
+        loop {
+            let v = c.recv().await.expect("server closed the connection");
+            if v["event"] == "bandwidth" {
+                assert_eq!(v["type"], "event");
+                return (v["rx_bytes"].as_u64().unwrap(), v["tx_bytes"].as_u64().unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bandwidth_events_carry_the_growing_ip_byte_totals() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_bandwidth_interval(Duration::from_millis(50)).await;
+        let mut c = client(&path).await;
+        assert_eq!(connect_with(&mut c, &gw, PASSWORD).await["state"], "connected");
+        let mut iface = os.take_packets();
+
+        iface.tx.send(vec![0x45; 100]).await.unwrap();
+        gw.recv_ip().await;
+        gw.send_ip(vec![0x45; 40]);
+        assert!(tokio::time::timeout(Duration::from_secs(5), iface.rx.recv()).await.unwrap().is_some());
+        // Um tick pode cair entre os dois sentidos; o total final é o que importa.
+        loop {
+            let (rx, tx) = next_bandwidth(&mut c).await;
+            assert!(rx <= 40 && tx <= 100, "{} {}", rx, tx);
+            if (rx, tx) == (40, 100) {
+                break;
+            }
+        }
+
+        gw.send_ip(vec![0x45; 60]);
+        assert!(tokio::time::timeout(Duration::from_secs(5), iface.rx.recv()).await.unwrap().is_some());
+        assert_eq!(next_bandwidth(&mut c).await, (100, 100));
     }
 
     async fn disconnect(c: &mut Client) -> Value {
