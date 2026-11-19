@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::fortinet::Profile;
 use crate::session::State;
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +104,14 @@ pub const VERSION_V2: u32 = 2;
 pub enum RequestV2 {
     Status,
     Disconnect,
+    /// Senha e OTP só no corpo, nunca em argv nem em log.
+    Connect {
+        profile: Profile,
+        password: String,
+        #[allow(dead_code)] // shortcut: OTP entra no ticket do OTP
+        #[serde(default)]
+        otp: Option<String>,
+    },
 }
 
 impl RequestV2 {
