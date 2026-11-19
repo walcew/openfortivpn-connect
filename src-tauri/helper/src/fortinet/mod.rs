@@ -34,6 +34,8 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Intervalo do LCP Echo-Request com o túnel de pé; 3 sem resposta = túnel morto (~30 s).
 pub const ECHO_INTERVAL: Duration = Duration::from_secs(10);
+/// Alguns gateways (o do CNJ) fecham a conexão do `logincheck` sem `User-Agent`; é o mesmo do openfortivpn.
+const USER_AGENT: &str = "Mozilla/5.0 SV1";
 /// Valores do pedido de token que o segundo passo do login devolve ao gateway.
 const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
 // shortcut: sem `sso_port` e `remoteauthtimeout` no `/remote/info` valem 8020 e 120 s, os do gateway testado; trocar por erro se aparecer gateway com outros valores e sem os campos.
@@ -239,7 +241,7 @@ impl Gateway {
 
     /// Uma troca HTTP sem prazo próprio; quem chama decide quanto esperar.
     async fn exchange(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
-        let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path, host);
+        let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nConnection: close\r\n", method, path, host, USER_AGENT);
         if let Some(c) = cookie {
             req.push_str(&format!("Cookie: {}\r\n", c));
         }
