@@ -242,12 +242,33 @@ fn parse_form(body: &[u8]) -> Vec<(String, String)> {
 
 // ---- PPP do lado servidor ----
 
+// Constantes próprias do fake, escritas de novo a partir das RFCs, para não testar o
+// Engine contra ele mesmo.
 const LCP: u16 = 0xc021;
 const IPCP: u16 = 0x8021;
 const IP: u16 = 0x0021;
+const FRAME_MAGIC: [u8; 2] = [0x50, 0x50];
+const ADDRESS_CONTROL: [u8; 2] = [0xff, 0x03];
+
+const CONFIGURE_REQUEST: u8 = 1;
+const CONFIGURE_ACK: u8 = 2;
+const CONFIGURE_NAK: u8 = 3;
+const ECHO_REQUEST: u8 = 9;
+const ECHO_REPLY: u8 = 10;
+
+const LCP_MAGIC_NUMBER: u8 = 5;
+const IPCP_IP_ADDRESS: u8 = 3;
+const IPCP_PRIMARY_DNS: u8 = 129;
+const IPCP_SECONDARY_DNS: u8 = 131;
+
+const GATEWAY_MAGIC: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+fn option(kind: u8, value: &[u8]) -> Vec<u8> {
+    [kind, (value.len() + 2) as u8].into_iter().chain(value.iter().copied()).collect()
+}
 
 fn ppp_frame(proto: u16, code: u8, id: u8, data: &[u8]) -> Vec<u8> {
-    let mut ppp = vec![0xff, 0x03];
+    let mut ppp = ADDRESS_CONTROL.to_vec();
     ppp.extend_from_slice(&proto.to_be_bytes());
     if proto != IP {
         ppp.extend_from_slice(&[code, id]);
@@ -256,7 +277,7 @@ fn ppp_frame(proto: u16, code: u8, id: u8, data: &[u8]) -> Vec<u8> {
     ppp.extend_from_slice(data);
     let mut f = Vec::new();
     f.extend_from_slice(&((ppp.len() + 6) as u16).to_be_bytes());
-    f.extend_from_slice(&[0x50, 0x50]);
+    f.extend_from_slice(&FRAME_MAGIC);
     f.extend_from_slice(&(ppp.len() as u16).to_be_bytes());
     f.extend_from_slice(&ppp);
     f
@@ -282,7 +303,7 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
             if rd.read_exact(&mut header).await.is_err() {
                 return;
             }
-            assert_eq!(&header[2..4], &[0x50, 0x50], "bad frame magic from client");
+            assert_eq!(header[2..4], FRAME_MAGIC, "bad frame magic from client");
             let len = u16::from_be_bytes([header[4], header[5]]) as usize;
             assert_eq!(u16::from_be_bytes([header[0], header[1]]) as usize, len + 6);
             let mut ppp = vec![0u8; len];
@@ -294,12 +315,12 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
     let mut to_client = shared.to_client.lock().unwrap().take().expect("one tunnel at a time");
 
     let assigned: Vec<(u8, Vec<u8>)> = vec![
-        (3, ASSIGNED_IP.octets().to_vec()),
-        (129, IPCP_DNS.octets().to_vec()),
-        (131, IPCP_DNS.octets().to_vec()),
+        (IPCP_IP_ADDRESS, ASSIGNED_IP.octets().to_vec()),
+        (IPCP_PRIMARY_DNS, IPCP_DNS.octets().to_vec()),
+        (IPCP_SECONDARY_DNS, IPCP_DNS.octets().to_vec()),
     ];
     let (mut lcp_open, mut ipcp_ours, mut ipcp_theirs, mut echo_sent) = (false, false, false, false);
-    let _ = wr.write_all(&ppp_frame(LCP, 1, 1, &[5, 6, 0x11, 0x22, 0x33, 0x44])).await;
+    let _ = wr.write_all(&ppp_frame(LCP, CONFIGURE_REQUEST, 1, &option(LCP_MAGIC_NUMBER, &GATEWAY_MAGIC))).await;
 
     loop {
         let ppp = tokio::select! {
@@ -309,7 +330,7 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
                 continue;
             }
         };
-        assert_eq!(&ppp[..2], &[0xff, 0x03], "client frames carry address and control");
+        assert_eq!(ppp[..2], ADDRESS_CONTROL, "client frames carry address and control");
         let proto = u16::from_be_bytes([ppp[2], ppp[3]]);
         if proto == IP {
             let _ = shared.from_client.send(ppp[4..].to_vec());
@@ -319,34 +340,34 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
         let data = &ppp[8..];
         let mut reply = Vec::new();
         match (proto, code) {
-            (LCP, 1) => reply.push(ppp_frame(LCP, 2, id, data)),
-            (LCP, 2) => {
+            (LCP, CONFIGURE_REQUEST) => reply.push(ppp_frame(LCP, CONFIGURE_ACK, id, data)),
+            (LCP, CONFIGURE_ACK) => {
                 lcp_open = true;
-                reply.push(ppp_frame(IPCP, 1, 1, &[3, 6, PEER_IP.octets()[0], PEER_IP.octets()[1], PEER_IP.octets()[2], PEER_IP.octets()[3]]));
+                reply.push(ppp_frame(IPCP, CONFIGURE_REQUEST, 1, &option(IPCP_IP_ADDRESS, &PEER_IP.octets())));
             }
-            (LCP, 10) => {
+            (LCP, ECHO_REPLY) => {
                 shared.echo_replies.fetch_add(1, Ordering::SeqCst);
             }
-            (IPCP, 1) if lcp_open => {
+            (IPCP, CONFIGURE_REQUEST) if lcp_open => {
                 let wanted = opts(data);
                 let nak: Vec<u8> = wanted
                     .iter()
                     .filter_map(|(t, v)| assigned.iter().find(|(a, _)| a == t).filter(|(_, av)| av != v))
-                    .flat_map(|(t, v)| [*t, (v.len() + 2) as u8].into_iter().chain(v.iter().copied()))
+                    .flat_map(|(t, v)| option(*t, v))
                     .collect();
                 if nak.is_empty() {
                     ipcp_ours = true;
-                    reply.push(ppp_frame(IPCP, 2, id, data));
+                    reply.push(ppp_frame(IPCP, CONFIGURE_ACK, id, data));
                 } else {
-                    reply.push(ppp_frame(IPCP, 3, id, &nak));
+                    reply.push(ppp_frame(IPCP, CONFIGURE_NAK, id, &nak));
                 }
             }
-            (IPCP, 2) => ipcp_theirs = true,
+            (IPCP, CONFIGURE_ACK) => ipcp_theirs = true,
             _ => {}
         }
         if ipcp_ours && ipcp_theirs && !echo_sent {
             echo_sent = true;
-            reply.push(ppp_frame(LCP, 9, 7, &[0x11, 0x22, 0x33, 0x44, b'p', b'i', b'n', b'g']));
+            reply.push(ppp_frame(LCP, ECHO_REQUEST, 7, &[&GATEWAY_MAGIC[..], b"ping"].concat()));
         }
         for f in reply {
             let _ = wr.write_all(&f).await;

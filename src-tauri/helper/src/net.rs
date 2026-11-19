@@ -80,7 +80,8 @@ pub fn teardown(os: &dyn Os, config: &TunnelConfig) {
     os.remove_gateway_route(config.gateway);
 }
 
-/// A implementação real, que o ticket #10 preenche.
+/// A implementação real da camada de SO.
+// shortcut: todo apply falha com "not implemented" e as remoções não fazem nada, o ticket #10 implementa utun, rotas e DNS.
 pub struct SystemOs;
 
 const NOT_IMPLEMENTED: &str = "network layer not implemented yet";

@@ -123,8 +123,7 @@ impl Cp {
     }
 
     fn opt(&self, kind: u8) -> Option<Ipv4Addr> {
-        let (_, v) = self.opts.iter().find(|(t, _)| *t == kind)?;
-        <[u8; 4]>::try_from(v.as_slice()).ok().map(Ipv4Addr::from)
+        ipv4_opt(&self.opts, kind)
     }
 
     /// Trata Configure-Request/Ack/Nak/Reject. Devolve as opções do pedido do outro
@@ -189,11 +188,13 @@ impl Ppp {
         let (proto, body) = (u16::from_be_bytes([p[0], p[1]]), &p[2..]);
         match proto {
             IP if self.up.is_none() => out.push(Action::Deliver(body.to_vec())),
-            LCP | IPCP => {
-                let Some((code, id, data)) = parse_cp(body) else { return out };
-                if proto == LCP {
+            LCP => {
+                if let Some((code, id, data)) = parse_cp(body) {
                     self.lcp_packet(code, id, data, &mut out);
-                } else {
+                }
+            }
+            IPCP => {
+                if let Some((code, id, data)) = parse_cp(body) {
                     self.ipcp_packet(code, id, data, &mut out);
                 }
             }
@@ -231,7 +232,7 @@ impl Ppp {
 
     fn ipcp_packet(&mut self, code: u8, id: u8, data: &[u8], out: &mut Vec<Action>) {
         if let Some(opts) = self.ipcp.configure(code, id, data, |t| t == IPCP_ADDRESS, out) {
-            self.peer = opts.iter().find(|(t, _)| *t == IPCP_ADDRESS).and_then(|(_, v)| <[u8; 4]>::try_from(v.as_slice()).ok()).map(Ipv4Addr::from);
+            self.peer = ipv4_opt(&opts, IPCP_ADDRESS);
         }
         if !self.ipcp.opened() || self.up.is_none() {
             return;
@@ -307,6 +308,12 @@ fn parse_opts(mut data: &[u8]) -> Option<Opts> {
         data = &data[len..];
     }
     Some(opts)
+}
+
+/// Valor IPv4 de uma opção, se ela existir e tiver 4 bytes.
+fn ipv4_opt(opts: &Opts, kind: u8) -> Option<Ipv4Addr> {
+    let (_, v) = opts.iter().find(|(t, _)| *t == kind)?;
+    <[u8; 4]>::try_from(v.as_slice()).ok().map(Ipv4Addr::from)
 }
 
 fn encode_opts(opts: &Opts) -> Vec<u8> {
