@@ -15,7 +15,7 @@ const GOOGLE_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Intervalo do evento de banda.
+/// Resolução da velocidade que a GUI calcula; mais curto pesa sem ganho visível.
 const BANDWIDTH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,35 +58,37 @@ pub enum Event {
 /// Bytes IP que passaram pelo túnel desde o início da sessão (rx = do gateway, tx = para ele).
 #[derive(Default)]
 struct Traffic {
-    rx: AtomicU64,
-    tx: AtomicU64,
+    rx: Arc<AtomicU64>,
+    tx: Arc<AtomicU64>,
+}
+
+/// Repassa os pacotes de `from` para `to`, somando os bytes em `counter`. Termina quando
+/// qualquer um dos lados fecha, o que propaga o fechamento para o outro lado do canal.
+async fn pump(mut from: mpsc::Receiver<Vec<u8>>, to: mpsc::Sender<Vec<u8>>, counter: Arc<AtomicU64>) {
+    loop {
+        tokio::select! {
+            packet = from.recv() => match packet {
+                Some(packet) => {
+                    counter.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    if to.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            _ = to.closed() => break,
+        }
+    }
 }
 
 /// Troca o canal de pacotes por outro, de mesmo formato, que conta o que passa por ele.
 // shortcut: um salto extra por pacote em cada sentido, para não mexer no PPP; mover a contagem para `ppp::run` se pesar.
-fn meter(packets: Packets, traffic: &Arc<Traffic>, tasks: &mut JoinSet<()>) -> Packets {
-    let Packets { tx: to_gateway, rx: mut from_gateway } = packets;
-    let (tx, mut from_os) = mpsc::channel::<Vec<u8>>(256);
-    let (to_os, rx) = mpsc::channel::<Vec<u8>>(256);
-    let t = traffic.clone();
-    tasks.spawn(async move {
-        while let Some(p) = from_os.recv().await {
-            t.tx.fetch_add(p.len() as u64, Ordering::Relaxed);
-            if to_gateway.send(p).await.is_err() {
-                break;
-            }
-        }
-    });
-    let t = traffic.clone();
-    tasks.spawn(async move {
-        while let Some(p) = from_gateway.recv().await {
-            t.rx.fetch_add(p.len() as u64, Ordering::Relaxed);
-            if to_os.send(p).await.is_err() {
-                break;
-            }
-        }
-    });
-    Packets { tx, rx }
+fn meter(packets: Packets, traffic: &Traffic, tasks: &mut JoinSet<()>) -> Packets {
+    let (os_tx, from_os) = mpsc::channel(256);
+    let (to_os, os_rx) = mpsc::channel(256);
+    tasks.spawn(pump(from_os, packets.tx, traffic.tx.clone()));
+    tasks.spawn(pump(packets.rx, to_os, traffic.rx.clone()));
+    Packets { tx: os_tx, rx: os_rx }
 }
 
 struct Inner {
@@ -270,7 +272,7 @@ impl Session {
         }
         // Ao sair do `drive`, o JoinSet aborta o medidor e o emissor de banda.
         let mut tasks = JoinSet::new();
-        let traffic = Arc::new(Traffic::default());
+        let traffic = Traffic::default();
         let packets = meter(packets, &traffic, &mut tasks);
         match net::apply(&*self.os, &config, packets, &self.applied) {
             Ok(None) => {}
@@ -645,6 +647,23 @@ mod tests {
                 assert_eq!(v["type"], "event");
                 return (v["rx_bytes"].as_u64().unwrap(), v["tx_bytes"].as_u64().unwrap());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn bandwidth_stops_counting_the_gateway_once_the_os_side_closes() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_bandwidth_interval(Duration::from_millis(20)).await;
+        let mut c = client(&path).await;
+        assert_eq!(connect_with(&mut c, &gw, PASSWORD).await["state"], "connected");
+        drop(os.take_packets());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Descarta os eventos acumulados no socket durante a espera.
+        while tokio::time::timeout(Duration::from_millis(5), c.recv()).await.is_ok() {}
+
+        gw.send_ip(vec![0x45; 40]);
+        for _ in 0..4 {
+            assert_eq!(next_bandwidth(&mut c).await, (0, 0));
         }
     }
 
