@@ -20,4 +20,5 @@ O app depende do openfortivpn, um processo externo que o Helper dispara e só ac
 
 - O Helper ganha rustls, tokio e o protocolo PPP para manter. O escopo do MVP exclui DTLS, IPv6, os métodos `tun`/`websocket` e a reconexão automática.
 - Na 0.4.0 saíram o binário do openfortivpn, o build dele no CI e a licença GPL do bundle. O protocolo antigo do socket (`spawn-vpn`, `kill-vpn`, `setup-dns`, `teardown-dns`) foi removido, e o socket e o label do launchd ganharam nomes neutros (`com.vpnconnect.helper`).
+- As opções extras do openfortivpn (`extra_args` do Profile) não têm equivalente no Engine e deixam de valer. A GUI registra um aviso no log, uma linha, ao conectar um Profile salvo com `extra_args`.
 - Instalações existentes reinstalam o Helper uma vez (senha de admin): o instalador da 0.4.0 remove o Helper antigo (label, binário, plist, socket e log) e o openfortivpn bundlado no mesmo passo.

@@ -44,7 +44,7 @@ Download the `.dmg` for your architecture from [Releases](https://github.com/wal
 
 On first run, the app installs its privileged Helper with a single admin password prompt. The Helper owns the VPN session: it logs in to the gateway, opens the tunnel and applies routes and DNS. There is nothing else to install.
 
-Upgrading from 0.3.x or earlier? Reinstall the Helper once, when the app asks for it: the installer also removes the previous Helper.
+Upgrading from 0.3.x or earlier? Reinstall the Helper once, when the app asks for it: the installer also removes the previous Helper. Extra openfortivpn options saved in a profile (`extra_args`) no longer apply; the app logs a warning when you connect such a profile.
 
 ## Prerequisites
 

@@ -108,6 +108,10 @@ impl VpnManager {
                 ConnectionState::Connecting { profile_id: profile_id.to_string() },
                 app_handle,
             );
+            if let Some(message) = extra_args_notice(&profile) {
+                let payload = LogLinePayload { timestamp: chrono::Utc::now().to_rfc3339(), level: "warn".into(), message };
+                let _ = app_handle.emit("log-line", &payload);
+            }
             crate::helper_client::connect(
                 crate::helper_client::socket_path(),
                 &profile,
@@ -230,6 +234,13 @@ impl VpnManager {
     }
 }
 
+/// Aviso de uma linha para o Profile salvo com `extra_args`, que o Engine próprio não lê.
+fn extra_args_notice(profile: &VpnProfile) -> Option<String> {
+    (!profile.extra_args.is_empty()).then(|| {
+        format!("Ignoring extra_args of profile '{}': extra options no longer apply since 0.4.0", profile.name)
+    })
+}
+
 fn check_otp_provided(profile: &VpnProfile, otp: Option<&str>) -> Result<(), String> {
     if profile.needs_otp() && profile.otp_to_send(otp).is_none() {
         return Err("OTP is required for this profile".into());
@@ -284,6 +295,15 @@ mod tests {
         profile.id = uuid::Uuid::new_v4().to_string();
         let err = VpnManager::resolve_password_creds(&profile).unwrap_err();
         assert!(err.contains("No password stored"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn extra_args_warn_only_when_present() {
+        let mut profile = password_profile(Some("john"));
+        assert_eq!(extra_args_notice(&profile), None);
+        profile.extra_args = vec!["--foo".to_string()];
+        let notice = extra_args_notice(&profile).unwrap();
+        assert!(notice.contains("extra_args") && notice.contains("Corp"), "{}", notice);
     }
 
     #[test]
