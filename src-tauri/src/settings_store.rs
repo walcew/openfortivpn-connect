@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// Recusa do pedido de instalar o Helper. Chave nova na 0.4.0: a `helper_declined` da 0.3.0
+    /// valia para um app que funcionava sem Helper, e agora ele é obrigatório.
     #[serde(default)]
-    pub helper_declined: bool,
+    pub helper_install_declined: bool,
     #[serde(default = "default_true")]
     pub dns_fallback: bool,
 }
@@ -13,7 +15,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            helper_declined: false,
+            helper_install_declined: false,
             dns_fallback: true,
         }
     }
@@ -52,5 +54,24 @@ impl SettingsStore {
             .map_err(|e| format!("Failed to serialize settings: {}", e))?;
         fs::write(&self.settings_path, data)
             .map_err(|e| format!("Failed to write settings: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_declined_from_0_3_0_does_not_suppress_the_install_prompt() {
+        let old = r#"{"debug_mode":true,"helper_declined":true,"dns_fallback":false}"#;
+        let settings: AppSettings = serde_json::from_str(old).unwrap();
+        assert!(!settings.helper_install_declined);
+        assert!(!settings.dns_fallback);
+    }
+
+    #[test]
+    fn new_decline_is_kept() {
+        let settings: AppSettings = serde_json::from_str(r#"{"helper_install_declined":true}"#).unwrap();
+        assert!(settings.helper_install_declined);
     }
 }

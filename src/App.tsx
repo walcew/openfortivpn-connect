@@ -78,8 +78,8 @@ function App() {
         // Helper parado ou desatualizado (inclui o da 0.3.0, que não responde no socket novo):
         // pede a instalação.
         if (!status.running || status.needs_update) {
-          const settings = await invoke<{ helper_declined: boolean }>("get_settings");
-          if (!settings.helper_declined) {
+          const settings = await invoke<{ helper_install_declined: boolean }>("get_settings");
+          if (!settings.helper_install_declined) {
             setShowHelperInstall(true);
           }
         }
@@ -97,9 +97,9 @@ function App() {
   const handleHelperDeclined = async () => {
     setShowHelperInstall(false);
     try {
-      const currentSettings = await invoke<{ helper_declined: boolean }>("get_settings");
+      const currentSettings = await invoke<{ helper_install_declined: boolean }>("get_settings");
       await invoke("save_settings", {
-        settings: { ...currentSettings, helper_declined: true },
+        settings: { ...currentSettings, helper_install_declined: true },
       });
     } catch (e) {
       console.error("Failed to save helper declined preference:", e);

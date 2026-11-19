@@ -2,12 +2,12 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface AppSettings {
-  helper_declined: boolean;
+  helper_install_declined: boolean;
   dns_fallback: boolean;
 }
 
 export function useSettings() {
-  const [settings, setSettings] = useState<AppSettings>({ helper_declined: false, dns_fallback: true });
+  const [settings, setSettings] = useState<AppSettings>({ helper_install_declined: false, dns_fallback: true });
   const [loading, setLoading] = useState(true);
 
   const fetchSettings = useCallback(async () => {
