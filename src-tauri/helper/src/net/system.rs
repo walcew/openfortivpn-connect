@@ -64,22 +64,23 @@ impl Os for SystemOs {
         block_in_place(|| run(ROUTE, &route_args(&name, route)))
     }
 
-    fn add_gateway_route(&self, gateway: IpAddr) -> Result<(), String> {
+    fn add_gateway_route(&self, gateway: IpAddr) -> Result<IpAddr, String> {
         let gateway = ipv4(gateway)?;
         block_in_place(|| {
-            let out = output(ROUTE, &["-n", "get", "default"].map(String::from))?;
-            // shortcut: recusa conectar quando a default não tem gateway IP (só de interface, ou
-            // saindo por outra VPN); evoluir se aparecer caso real.
-            let via = parse_default_gateway(&out).ok_or("no IPv4 default gateway to reach the VPN gateway")?;
-            run(ROUTE, &gateway_route_args("add", gateway, Some(via))).map_err(|e| {
-                // Resíduo de uma sessão anterior é limpo pela recuperação de crash, não aqui:
-                // apagar o /32 antes do add poderia tirar uma rota de outro software.
-                if e.contains("File exists") {
-                    format!("a host route to the VPN gateway {} already exists: {}", gateway, e)
-                } else {
-                    e
-                }
-            })
+            let via = default_gateway()?;
+            add_host_route(gateway, via).map(|()| IpAddr::V4(via))
+        })
+    }
+
+    fn move_gateway_route(&self, gateway: IpAddr) -> Result<IpAddr, String> {
+        let gateway = ipv4(gateway)?;
+        block_in_place(|| {
+            let via = default_gateway()?;
+            match run(ROUTE, &gateway_route_args("change", gateway, via)) {
+                Err(e) if e.contains("not in table") => add_host_route(gateway, via),
+                r => r,
+            }
+            .map(|()| IpAddr::V4(via))
         })
     }
 
@@ -103,11 +104,17 @@ impl Os for SystemOs {
         })
     }
 
-    fn remove_gateway_route(&self, gateway: IpAddr) {
-        if let Ok(gateway) = ipv4(gateway) {
-            if let Err(e) = block_in_place(|| run(ROUTE, &gateway_route_args("delete", gateway, None))) {
-                log::warn!("{}", e);
+    fn remove_gateway_route(&self, gateway: IpAddr, via: IpAddr) {
+        let (Ok(gateway), Ok(via)) = (ipv4(gateway), ipv4(via)) else { return };
+        let removed = block_in_place(|| {
+            let out = output(ROUTE, &["-n", "get", &gateway.to_string()].map(String::from))?;
+            if !is_host_route_via(&out, gateway, via) {
+                return Err(format!("host route to {} via {} is gone or changed owner, left in place", gateway, via));
             }
+            run(ROUTE, &gateway_route_args("delete", gateway, via))
+        });
+        if let Err(e) = removed {
+            log::warn!("{}", e);
         }
     }
 
@@ -235,6 +242,31 @@ fn unframe(frame: &[u8]) -> Option<&[u8]> {
     }
 }
 
+// shortcut: recusa quando a default não tem gateway IP (só de interface, ou saindo por outra VPN);
+// evoluir se aparecer caso real.
+fn default_gateway() -> Result<Ipv4Addr, String> {
+    let out = output(ROUTE, &["-n", "get", "default"].map(String::from))?;
+    parse_default_gateway(&out).ok_or_else(|| "no IPv4 default gateway to reach the VPN gateway".into())
+}
+
+fn add_host_route(gateway: Ipv4Addr, via: Ipv4Addr) -> Result<(), String> {
+    run(ROUTE, &gateway_route_args("add", gateway, via)).map_err(|e| {
+        // Resíduo de uma sessão anterior é limpo pela recuperação de crash, não aqui:
+        // apagar o /32 antes do add poderia tirar uma rota de outro software.
+        if e.contains("File exists") {
+            format!("a host route to the VPN gateway {} already exists: {}", gateway, e)
+        } else {
+            e
+        }
+    })
+}
+
+/// Se a saída de `route -n get <gateway>` é um /32 para ele saindo por `via`.
+fn is_host_route_via(out: &str, gateway: Ipv4Addr, via: Ipv4Addr) -> bool {
+    let field = |name: &str| out.lines().find_map(|l| l.trim().strip_prefix(name)).map(str::trim);
+    field("destination:") == Some(&gateway.to_string()) && parse_default_gateway(out) == Some(via)
+}
+
 fn ifconfig_args(name: &str, ip: Ipv4Addr, peer: Ipv4Addr, mtu: u16) -> Vec<String> {
     let mtu = mtu.to_string();
     [name, "inet", &ip.to_string(), &peer.to_string(), "mtu", &mtu, "up"].map(String::from).to_vec()
@@ -245,10 +277,9 @@ fn route_args(name: &str, route: Route) -> Vec<String> {
     ["-n", "add", "-net", &addr, "-netmask", &mask, "-interface", name].map(String::from).to_vec()
 }
 
-fn gateway_route_args(action: &str, gateway: Ipv4Addr, via: Option<Ipv4Addr>) -> Vec<String> {
-    let mut args: Vec<String> = ["-n", action, "-host", &gateway.to_string()].map(String::from).to_vec();
-    args.extend(via.map(|v| v.to_string()));
-    args
+/// Sempre com o next-hop: no `delete`, ele restringe a remoção ao /32 que sai por ele.
+fn gateway_route_args(action: &str, gateway: Ipv4Addr, via: Ipv4Addr) -> Vec<String> {
+    ["-n", action, "-host", &gateway.to_string(), &via.to_string()].map(String::from).to_vec()
 }
 
 /// Gateway IPv4 da saída de `route -n get default`; None se a default não tiver gateway IP.
@@ -373,9 +404,25 @@ mod tests {
     #[test]
     fn gateway_route_is_a_host_route_via_default_gateway() {
         let gw = Ipv4Addr::new(203, 0, 113, 5);
-        let add = gateway_route_args("add", gw, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        let add = gateway_route_args("add", gw, Ipv4Addr::new(192, 168, 1, 1));
         assert_eq!(add, strings(&["-n", "add", "-host", "203.0.113.5", "192.168.1.1"]));
-        assert_eq!(gateway_route_args("delete", gw, None), strings(&["-n", "delete", "-host", "203.0.113.5"]));
+        let via = Ipv4Addr::new(10, 0, 0, 1);
+        assert_eq!(gateway_route_args("change", gw, via), strings(&["-n", "change", "-host", "203.0.113.5", "10.0.0.1"]));
+        assert_eq!(gateway_route_args("delete", gw, via), strings(&["-n", "delete", "-host", "203.0.113.5", "10.0.0.1"]));
+    }
+
+    #[test]
+    fn recognizes_our_host_route_by_destination_and_next_hop() {
+        let (gw, via) = (Ipv4Addr::new(203, 0, 113, 5), Ipv4Addr::new(192, 168, 1, 1));
+        let host = "   route to: 203.0.113.5\ndestination: 203.0.113.5\n    gateway: 192.168.1.1\n  interface: en0\n      flags: <UP,GATEWAY,HOST,DONE,STATIC>\n";
+        assert!(is_host_route_via(host, gw, via));
+        // Outro next-hop: o /32 é de outro software ou já foi trocado.
+        assert!(!is_host_route_via(host, gw, Ipv4Addr::new(10, 0, 0, 1)));
+        // Sem /32, o `get` devolve a rota que cobre o IP (a metade do túnel ou a default).
+        let half = "   route to: 203.0.113.5\ndestination: 0.0.0.0\n       mask: 128.0.0.0\n  interface: utun4\n";
+        assert!(!is_host_route_via(half, gw, via));
+        let default = "   route to: 203.0.113.5\ndestination: default\n    gateway: 192.168.1.1\n";
+        assert!(!is_host_route_via(default, gw, via));
     }
 
     #[test]

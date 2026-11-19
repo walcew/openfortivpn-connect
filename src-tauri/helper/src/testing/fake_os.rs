@@ -2,19 +2,24 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::net::{Os, Packets, Route};
+
+/// Next-hop que o fake diz ter usado no /32: o do default no connect e o do default novo na troca de rede.
+pub const FIRST_VIA: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+pub const NEW_VIA: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OsCall {
     Up { ip: Ipv4Addr, peer: Ipv4Addr, mtu: u16 },
     AddRoute(Route),
     AddGatewayRoute(IpAddr),
+    MoveGatewayRoute(IpAddr),
     SetDns { servers: Vec<Ipv4Addr>, suffixes: Vec<String> },
     RemoveDns,
-    RemoveGatewayRoute(IpAddr),
+    RemoveGatewayRoute(IpAddr, IpAddr),
     Down,
 }
 
@@ -33,21 +38,24 @@ pub struct FakeOs {
     add_route: Failure,
     add_gateway_route: Failure,
     set_dns: Failure,
+    /// O próximo `move_gateway_route` falha (default ainda ausente na troca de Wi-Fi).
+    fail_next_move: AtomicBool,
     state_file: PathBuf,
 }
 
-static NEXT: AtomicU32 = AtomicU32::new(0);
+static STATE_FILE_SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl Default for FakeOs {
     /// Arquivo de estado próprio no diretório temporário, para os testes não se cruzarem.
     fn default() -> Self {
-        let name = format!("ovg-state-{}-{}.json", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let name = format!("ovg-state-{}-{}.json", std::process::id(), STATE_FILE_SEQ.fetch_add(1, Ordering::Relaxed));
         Self {
             calls: Mutex::default(),
             packets: Mutex::default(),
             add_route: Failure::None,
             add_gateway_route: Failure::None,
             set_dns: Failure::None,
+            fail_next_move: AtomicBool::new(false),
             state_file: std::env::temp_dir().join(name),
         }
     }
@@ -56,7 +64,14 @@ impl Default for FakeOs {
 impl FakeOs {
     /// Fake com o arquivo de estado neste caminho (ex.: com resíduo de um crash).
     pub fn with_state_file(state_file: PathBuf) -> Self {
-        Self { state_file, ..Default::default() }
+        let mut os = Self::default();
+        os.state_file = state_file;
+        os
+    }
+
+    /// Faz o próximo `move_gateway_route` falhar.
+    pub fn fail_next_move(&self) {
+        self.fail_next_move.store(true, Ordering::SeqCst);
     }
 
     /// Conteúdo do arquivo de estado, ou None se não existe.
@@ -66,17 +81,23 @@ impl FakeOs {
 
     /// Fake cujo `add_route` falha (erro ou pânico) depois de registrar a chamada.
     pub fn failing_add_route(failure: Failure) -> Self {
-        Self { add_route: failure, ..Default::default() }
+        let mut os = Self::default();
+        os.add_route = failure;
+        os
     }
 
     /// Fake cujo `add_gateway_route` falha com erro depois de registrar a chamada.
     pub fn failing_add_gateway_route() -> Self {
-        Self { add_gateway_route: Failure::Error, ..Default::default() }
+        let mut os = Self::default();
+        os.add_gateway_route = Failure::Error;
+        os
     }
 
     /// Fake cujo `set_dns` falha com erro depois de registrar a chamada.
     pub fn failing_set_dns() -> Self {
-        Self { set_dns: Failure::Error, ..Default::default() }
+        let mut os = Self::default();
+        os.set_dns = Failure::Error;
+        os
     }
 
     pub fn calls(&self) -> Vec<OsCall> {
@@ -95,7 +116,13 @@ impl FakeOs {
         for call in self.calls() {
             match call {
                 OsCall::RemoveDns => live.retain(|c| !matches!(c, OsCall::SetDns { .. })),
-                OsCall::RemoveGatewayRoute(g) => live.retain(|c| *c != OsCall::AddGatewayRoute(g)),
+                OsCall::RemoveGatewayRoute(g, _) => live.retain(|c| *c != OsCall::AddGatewayRoute(g)),
+                // Mover não cria nem remove um /32 que já existe.
+                OsCall::MoveGatewayRoute(g) => {
+                    if !live.contains(&OsCall::AddGatewayRoute(g)) {
+                        live.push(OsCall::AddGatewayRoute(g));
+                    }
+                }
                 OsCall::Down => live.retain(|c| !matches!(c, OsCall::Up { .. } | OsCall::AddRoute(_))),
                 added => live.push(added),
             }
@@ -122,10 +149,10 @@ impl Os for FakeOs {
             Failure::Panic => panic!("fake add_route panic"),
         }
     }
-    fn add_gateway_route(&self, gateway: IpAddr) -> Result<(), String> {
+    fn add_gateway_route(&self, gateway: IpAddr) -> Result<IpAddr, String> {
         self.record(OsCall::AddGatewayRoute(gateway));
         match self.add_gateway_route {
-            Failure::None => Ok(()),
+            Failure::None => Ok(FIRST_VIA),
             Failure::Error => Err("fake add_gateway_route failure".into()),
             Failure::Panic => panic!("fake add_gateway_route panic"),
         }
@@ -140,8 +167,15 @@ impl Os for FakeOs {
     fn remove_dns(&self) {
         self.record(OsCall::RemoveDns);
     }
-    fn remove_gateway_route(&self, gateway: IpAddr) {
-        self.record(OsCall::RemoveGatewayRoute(gateway));
+    fn move_gateway_route(&self, gateway: IpAddr) -> Result<IpAddr, String> {
+        if self.fail_next_move.swap(false, Ordering::SeqCst) {
+            return Err("fake move_gateway_route failure".into());
+        }
+        self.record(OsCall::MoveGatewayRoute(gateway));
+        Ok(NEW_VIA)
+    }
+    fn remove_gateway_route(&self, gateway: IpAddr, via: IpAddr) {
+        self.record(OsCall::RemoveGatewayRoute(gateway, via));
     }
     fn state_file(&self) -> PathBuf {
         self.state_file.clone()
@@ -150,5 +184,12 @@ impl Os for FakeOs {
         self.record(OsCall::Down);
         // Como fechar o fd do utun: o canal da interface acaba.
         self.packets.lock().unwrap().take();
+    }
+}
+
+impl Drop for FakeOs {
+    /// O arquivo de estado de um teste que falhou no meio não fica no diretório temporário.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.state_file);
     }
 }

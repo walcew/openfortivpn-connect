@@ -132,24 +132,28 @@ pub struct Gateway {
 }
 
 /// A task do túnel; abortá-la (ou soltá-la) fecha a conexão TLS.
-pub struct Tunnel(JoinHandle<String>, Arc<Notify>);
+pub struct Tunnel {
+    task: JoinHandle<String>,
+    /// Pede ao PPP um Echo-Request fora do intervalo.
+    probe: Arc<Notify>,
+}
 
 impl Tunnel {
     /// Espera o túnel cair e devolve o motivo.
     pub async fn closed(&mut self) -> String {
-        (&mut self.0).await.unwrap_or_else(|e| format!("Tunnel task failed: {}", e))
+        (&mut self.task).await.unwrap_or_else(|e| format!("Tunnel task failed: {}", e))
     }
 
     /// Manda um LCP Echo-Request agora, sem esperar o próximo intervalo; sem resposta, o túnel
     /// cai como em qualquer echo perdido.
     pub fn probe(&self) {
-        self.1.notify_one();
+        self.probe.notify_one();
     }
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -353,7 +357,7 @@ impl Gateway {
         let (up_tx, up_rx) = oneshot::channel();
         let probe = Arc::new(Notify::new());
         let ppp = ppp::run(stream, mtu, self.echo_interval, probe.clone(), up_tx, to_iface, from_iface);
-        let mut tunnel = Tunnel(tokio::spawn(ppp), probe);
+        let mut tunnel = Tunnel { task: tokio::spawn(ppp), probe };
         let up = match tokio::time::timeout(STEP_TIMEOUT, up_rx).await {
             Ok(Ok(up)) => up,
             Ok(Err(_)) => return Err(tunnel.closed().await),
