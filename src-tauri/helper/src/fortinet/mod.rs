@@ -1,5 +1,5 @@
 //! Engine Fortinet SSL VPN: login HTTP, `fortisslvpn_xml`, túnel TLS e PPP.
-//! O protocolo está descrito em `docs/protocolo-fortinet.md`.
+//! O protocolo está descrito em `docs/fortinet-protocol.md`.
 
 mod http;
 mod ppp;
@@ -23,13 +23,21 @@ use crate::validation::is_valid_hostname;
 const DEFAULT_MTU: u16 = 1354;
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Métodos de autenticação que o Engine já fala.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Auth {
+    Password,
+}
+
 /// O Profile como chega no `connect`. Só o que o Engine usa; o resto é ignorado.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
     pub id: String,
     pub host: String,
     pub port: u16,
-    pub auth: String,
+    #[allow(dead_code)] // só existe Password; o match entra com o segundo método
+    pub auth: Auth,
     pub username: String,
     #[serde(default)]
     pub trusted_certs: Vec<String>,
@@ -61,9 +69,6 @@ impl Drop for Tunnel {
 
 impl Gateway {
     pub fn new(profile: &Profile) -> Result<Self, String> {
-        if profile.auth != "password" {
-            return Err(format!("Unsupported auth method: {}", profile.auth));
-        }
         if !is_valid_hostname(&profile.host) {
             return Err(format!("Invalid host: {}", profile.host));
         }
@@ -90,8 +95,9 @@ impl Gateway {
         if self.port == 443 { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
     }
 
-    async fn request(&self, method: &str, path: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
-        let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path, self.host_header());
+    /// `host` vai no cabeçalho `Host`: o do gateway, ou `sslvpn` nos passos do túnel.
+    async fn request(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
+        let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path, host);
         if let Some(c) = cookie {
             req.push_str(&format!("Cookie: SVPNCOOKIE={}\r\n", c));
         }
@@ -117,11 +123,11 @@ impl Gateway {
     /// `POST /remote/logincheck` e devolve o `SVPNCOOKIE`.
     pub async fn login(&self, username: &str, password: &str) -> Result<String, String> {
         let form = format!(
-            "username={}&credential={}&realm=&ajax=1&just_logged_in=1",
+            "username={}&credential={}&realm=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1",
             http::form_encode(username),
             http::form_encode(password)
         );
-        let resp = self.request("POST", "/remote/logincheck", None, Some(&form)).await?;
+        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form)).await?;
         match resp.cookie("SVPNCOOKIE") {
             Some(c) if !c.is_empty() => Ok(c),
             _ => Err("Login failed: invalid username or password".into()),
@@ -130,7 +136,7 @@ impl Gateway {
 
     /// Lê a config do túnel, abre o `sslvpn-tunnel` e negocia o PPP até o IPCP subir.
     pub async fn open_tunnel(&self, cookie: &str) -> Result<(TunnelConfig, Packets, Tunnel), String> {
-        let resp = self.request("GET", "/remote/fortisslvpn_xml", Some(cookie), None).await?;
+        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(cookie), None).await?;
         if resp.status != 200 {
             return Err(format!("Gateway refused the tunnel configuration (HTTP {})", resp.status));
         }
@@ -169,6 +175,6 @@ impl Gateway {
     }
 
     pub async fn logout(&self, cookie: &str) -> Result<(), String> {
-        self.request("GET", "/remote/logout", Some(cookie), None).await.map(|_| ())
+        self.request("GET", "/remote/logout", &self.host_header(), Some(cookie), None).await.map(|_| ())
     }
 }

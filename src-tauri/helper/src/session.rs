@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, Notify};
 
 use crate::fortinet::{Gateway, Profile};
-use crate::net::{self, Os};
+use crate::net::{self, Os, TunnelConfig};
 
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -44,6 +44,8 @@ struct Inner {
     state: State,
     /// Presente enquanto uma sessão roda, do `connect` até o fim do teardown.
     cancel: Option<Arc<Notify>>,
+    /// Config entregue à camada de rede e ainda não desfeita.
+    applied: Option<TunnelConfig>,
 }
 
 /// Dono do estado da VPN e da fonte de eventos do protocolo v2. Cada `connect` roda
@@ -58,7 +60,7 @@ impl Session {
     pub fn new(os: Arc<dyn Os>) -> Self {
         Self {
             os,
-            inner: Mutex::new(Inner { state: State::Disconnected { reason: None }, cancel: None }),
+            inner: Mutex::new(Inner { state: State::Disconnected { reason: None }, cancel: None, applied: None }),
             events: broadcast::channel(256).0,
         }
     }
@@ -103,7 +105,17 @@ impl Session {
         }
         let session = self.clone();
         tokio::spawn(async move {
-            let reason = session.drive(&profile, &gateway, &password, &cancel).await;
+            // A sessão roda numa task supervisionada: um pânico não deixa rede aplicada
+            // nem a sessão presa em connecting/connected.
+            let s = session.clone();
+            let run = tokio::spawn(async move { s.drive(&profile, &gateway, &password, &cancel).await });
+            let reason = match run.await {
+                Ok(reason) => reason,
+                Err(e) => {
+                    session.teardown();
+                    Some(format!("Session task failed: {}", e))
+                }
+            };
             if let Some(r) = &reason {
                 session.log(format!("disconnected: {}", r));
             }
@@ -115,10 +127,19 @@ impl Session {
     }
 
     pub fn disconnect(&self) {
-        match &self.inner.lock().unwrap().cancel {
+        let cancel = self.inner.lock().unwrap().cancel.clone();
+        match cancel {
             // notify_one guarda a permissão se a task ainda não estiver esperando.
             Some(cancel) => cancel.notify_one(),
-            None => self.emit(Event::Log { line: "disconnect: no active session".into() }),
+            None => self.log("disconnect: no active session"),
+        }
+    }
+
+    /// Desfaz o que estiver aplicado na camada de rede, se houver.
+    fn teardown(&self) {
+        let applied = self.inner.lock().unwrap().applied.take();
+        if let Some(config) = applied {
+            net::teardown(&*self.os, &config);
         }
     }
 
@@ -147,8 +168,9 @@ impl Session {
             }
         };
 
+        self.inner.lock().unwrap().applied = Some(config.clone());
         if let Err(e) = net::apply(&*self.os, &config, packets) {
-            net::teardown(&*self.os, &config);
+            self.teardown();
             drop(tunnel);
             self.logout(gw, &cookie).await;
             return Some(e);
@@ -171,7 +193,7 @@ impl Session {
             _ = cancel.notified() => None,
         };
         drop(tunnel);
-        net::teardown(&*self.os, &config);
+        self.teardown();
         if reason.is_none() {
             self.logout(gw, &cookie).await;
         }
@@ -200,8 +222,8 @@ mod tests {
 
     use crate::net::Route;
     use crate::testing::fake_gateway::*;
-    use crate::testing::fake_os::{FakeOs, OsCall};
-    use crate::testing::{allow_all, connect, start_with_os, Client};
+    use crate::testing::fake_os::{Failure, FakeOs, OsCall};
+    use crate::testing::{connect, start_with_os, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
         json!({"v": 2, "cmd": "connect", "profile": gw.profile(), "password": password, "otp": null})
@@ -238,7 +260,7 @@ mod tests {
 
     async fn connected(options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value) {
         let gw = FakeGateway::start(options).await;
-        let (path, _session, os) = start_with_os(allow_all()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
         let mut c = client(&path).await;
         let state = connect_with(&mut c, &gw, PASSWORD).await;
         assert_eq!(state["state"], "connected", "{}", state);
@@ -290,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_password_disconnects_with_a_reason_and_applies_nothing() {
         let gw = FakeGateway::start(GatewayOptions::default()).await;
-        let (path, _session, os) = start_with_os(allow_all()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
         let mut c = client(&path).await;
         let state = connect_with(&mut c, &gw, "wrong").await;
         assert_eq!(state["state"], "disconnected");
@@ -301,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn untrusted_certificate_is_refused_with_its_digest() {
         let gw = FakeGateway::start(GatewayOptions::default()).await;
-        let (path, _session, os) = start_with_os(allow_all()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
         let mut c = client(&path).await;
         let mut cmd = connect_cmd(&gw, PASSWORD);
         cmd["profile"]["trusted_certs"] = json!(["00"]);
@@ -360,7 +382,7 @@ mod tests {
         let (gw, mut c, os, _state) = connected(GatewayOptions { mute_logout: true, ..Default::default() }).await;
         let started = Instant::now();
         let state = disconnect(&mut c).await;
-        assert!(started.elapsed() < Duration::from_millis(2800), "took {:?}", started.elapsed());
+        assert!(started.elapsed() < Duration::from_millis(2500), "took {:?}", started.elapsed());
         assert!(state.get("reason").is_none());
         assert_eq!(gw.logouts(), 1);
         assert!(os.applied().is_empty());
@@ -387,7 +409,7 @@ mod tests {
             }
         });
         let gw = FakeGateway::start(GatewayOptions::default()).await;
-        let (path, _session, os) = start_with_os(allow_all()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
         let mut c = client(&path).await;
         let mut cmd = connect_cmd(&gw, PASSWORD);
         cmd["profile"]["port"] = json!(port);
@@ -403,5 +425,46 @@ mod tests {
 
         // E a sessão fica livre para um novo connect.
         assert_eq!(connect_with(&mut c, &gw, PASSWORD).await["state"], "connected");
+    }
+
+    /// Connect contra um fake de SO que falha no `add_route`: devolve o estado final.
+    async fn connect_with_failing_os(failure: Failure) -> (FakeGateway, std::sync::Arc<FakeOs>, Value) {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_os(FakeOs::failing_add_route(failure)).await;
+        let mut c = client(&path).await;
+        let state = connect_with(&mut c, &gw, PASSWORD).await;
+        (gw, os, state)
+    }
+
+    #[tokio::test]
+    async fn failed_apply_tears_down_logs_out_and_reports_the_reason() {
+        let (gw, os, state) = connect_with_failing_os(Failure::Error).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("fake add_route failure"), "{}", state);
+        assert!(os.calls().iter().any(|c| matches!(c, OsCall::AddRoute(_))), "apply did not reach the failure");
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(gw.logouts(), 1);
+    }
+
+    #[tokio::test]
+    async fn panic_in_the_session_tears_down_and_frees_the_session() {
+        let (_gw, os, state) = connect_with_failing_os(Failure::Panic).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("Session task failed"), "{}", state);
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+    }
+
+    #[tokio::test]
+    async fn connect_with_an_unsupported_auth_method_is_refused() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let mut cmd = connect_cmd(&gw, PASSWORD);
+        cmd["profile"]["auth"] = json!("saml");
+        c.send(cmd).await;
+        let r = c.recv_skipping_logs().await;
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("saml"), "{}", r);
+        assert!(os.calls().is_empty());
     }
 }
