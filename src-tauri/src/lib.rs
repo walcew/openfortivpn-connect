@@ -1,6 +1,5 @@
 mod commands;
 mod dns_manager;
-mod engine_v2;
 mod keychain;
 mod models;
 mod profile_store;
@@ -41,7 +40,7 @@ pub fn run() {
             tray::setup_tray(app)?;
 
             // Conexão longa de eventos do Helper: sincroniza o estado ao abrir o app.
-            engine_v2::start(app.handle().clone());
+            helper_client::start(app.handle().clone());
 
             #[cfg(target_os = "macos")]
             {

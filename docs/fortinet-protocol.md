@@ -100,7 +100,7 @@ Depois vem o PPP sem HDLC (sem flags, escape nem FCS). O Engine envia o campo de
 - **IP** (`0x0021`): depois do IPCP, pacotes IPv4 passam nos dois sentidos entre o túnel e o canal da camada de rede.
 - Outros protocolos (IPv6CP, CCP) recebem Protocol-Reject depois que o LCP abre. Não há IPv6CP.
 
-DNS do XML tem prioridade; os do IPCP só valem se o XML não trouxer nenhum (**inf**). Isso diverge do v1: lá, sem DNS no XML, o `dns_fallback` (DNS do sistema mais Google) entra mesmo que o IPCP traga DNS; no v2 o fallback só entra se nem o XML nem o IPCP trouxerem (o DNS do IPCP é o do próprio gateway).
+DNS do XML tem prioridade; os do IPCP só valem se o XML não trouxer nenhum (**inf**). Isso diverge da 0.3.0: lá, sem DNS no XML, o `dns_fallback` (DNS do sistema mais Google) entra mesmo que o IPCP traga DNS; agora o fallback só entra se nem o XML nem o IPCP trouxerem (o DNS do IPCP é o do próprio gateway).
 
 ### Túnel morto e expiração
 

@@ -158,8 +158,8 @@ fn remove_state(path: &Path) {
 }
 
 /// Aplica a config, marcando em `applied` cada passo que deu certo. Em erro (ou pânico),
-/// o chamador faz `teardown` para desfazer o que entrou. A falha do DNS não é fatal, como no
-/// v1: o túnel sobe sem DNS e `Ok(Some(aviso))` diz por quê.
+/// o chamador faz `teardown` para desfazer o que entrou. A falha do DNS não é fatal: o túnel
+/// sobe sem DNS e `Ok(Some(aviso))` diz por quê.
 pub fn apply(os: &dyn Os, config: &TunnelConfig, packets: Packets, applied: &Mutex<Applied>) -> Result<Option<String>, String> {
     // O /32 entra antes das rotas do túnel para o gateway nunca ser roteado por dentro dele.
     let via = os.add_gateway_route(config.gateway)?;

@@ -1,5 +1,4 @@
 mod fortinet;
-mod handlers;
 mod net;
 mod protocol;
 mod server;
@@ -15,7 +14,7 @@ use std::path::Path;
 async fn main() {
     env_logger::init();
     log::info!(
-        "openvpngui-helper v{} starting",
+        "vpnconnect-helper v{} starting",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -37,7 +36,7 @@ async fn main() {
         }
     }
 
-    log::info!("openvpngui-helper stopped");
+    log::info!("vpnconnect-helper stopped");
 }
 
 async fn shutdown_signal() {

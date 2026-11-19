@@ -22,8 +22,10 @@ const SCUTIL: &str = "/usr/sbin/scutil";
 const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
 /// No diretório de suporte de root, com o nome do Helper instalado pelo app.
-const STATE_FILE: &str = "/Library/Application Support/com.openvpngui.helper/session-state.json";
-const DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
+const STATE_FILE: &str = "/Library/Application Support/com.vpnconnect.helper/session-state.json";
+const DNS_KEY: &str = "State:/Network/Service/VpnConnect/DNS";
+/// Chave da 0.3.0, que ficava para trás se o Helper antigo morria com a VPN ativa.
+const LEGACY_DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
 const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 /// Cabeçalho do utun: a família do protocolo em ordem de rede.
 const AF_INET_HEADER: [u8; 4] = (libc::AF_INET as u32).to_be_bytes();
@@ -343,7 +345,11 @@ pub fn write_dns_config(servers: &[String], suffixes: &[String]) -> Result<(), S
 /// Remove a chave de DNS; quem chama decide o que fazer com o status do scutil.
 pub fn remove_dns_config() -> Result<ExitStatus, String> {
     log::info!("Tearing down DNS configuration");
-    scutil(&format!("remove {}\nquit\n", DNS_KEY))
+    scutil(&scutil_remove_input())
+}
+
+fn scutil_remove_input() -> String {
+    format!("remove {DNS_KEY}\nremove {LEGACY_DNS_KEY}\nquit\n")
 }
 
 fn scutil_dns_input(servers: &[String], suffixes: &[String]) -> String {
@@ -438,7 +444,14 @@ mod tests {
         let input = scutil_dns_input(&strings(&["10.0.0.53"]), &strings(&["corp.example.com"]));
         assert!(input.contains("d.add ServerAddresses * 10.0.0.53\n"));
         assert!(input.contains("d.add SupplementalMatchDomains * corp.example.com\n"));
-        assert!(input.contains("set State:/Network/Service/OpenFortiVPN/DNS\n"));
+        assert!(input.contains("set State:/Network/Service/VpnConnect/DNS\n"));
+    }
+
+    #[test]
+    fn removing_dns_also_clears_the_key_left_by_the_old_helper() {
+        let input = scutil_remove_input();
+        assert!(input.contains("remove State:/Network/Service/VpnConnect/DNS\n"));
+        assert!(input.contains("remove State:/Network/Service/OpenFortiVPN/DNS\n"));
     }
 
     #[test]

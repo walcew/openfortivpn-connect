@@ -31,9 +31,9 @@ const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/var/log/openvpngui-helper.log</string>
+    <string>/var/log/vpnconnect-helper.log</string>
     <key>StandardOutPath</key>
-    <string>/var/log/openvpngui-helper.log</string>
+    <string>/var/log/vpnconnect-helper.log</string>
 </dict>
 </plist>
 "#;
@@ -52,7 +52,7 @@ pub fn check_status() -> HelperStatus {
     let installed = Path::new(HELPER_INSTALL_PATH).exists()
         && Path::new(PLIST_INSTALL_PATH).exists();
 
-    let (running, version) = match helper_client::ping() {
+    let (running, version) = match helper_client::version(helper_client::socket_path()) {
         Ok(v) => (true, Some(v)),
         Err(_) => (false, None),
     };
@@ -172,13 +172,13 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Verify the helper is responding
-    match helper_client::ping() {
+    match helper_client::version(helper_client::socket_path()) {
         Ok(version) => {
             log::info!("Helper daemon installed and running (v{})", version);
             Ok(())
         }
         Err(e) => Err(format!(
-            "Helper installed but not responding: {}. Check /var/log/openvpngui-helper.log",
+            "Helper installed but not responding: {}. Check /var/log/vpnconnect-helper.log",
             e
         )),
     }

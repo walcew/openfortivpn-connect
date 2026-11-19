@@ -9,12 +9,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::handlers;
 use crate::net::{self, SystemOs};
-use crate::protocol::{Frame, FrameKind, Request, RequestV2, Response, ResponseV2, VERSION_V2};
+use crate::protocol::{Frame, FrameKind, RequestV2, ResponseV2, VERSION_V2};
 use crate::session::{Event, Session};
 
-pub const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
+pub const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
 
 /// Decide se o uid do peer (obtido via getpeereid) pode usar o socket.
 pub type Authorizer = Arc<dyn Fn(u32) -> bool + Send + Sync>;
@@ -80,7 +79,7 @@ type Writer = tokio::net::unix::OwnedWriteHalf;
 
 async fn refuse(writer: &mut Writer, uid: u32) -> Result<(), Box<dyn std::error::Error>> {
     log::warn!("Refused uid {}", uid);
-    write_line(writer, &Response::error("Unauthorized".to_string())).await
+    write_line(writer, &ResponseV2::error("Unauthorized".to_string())).await
 }
 
 async fn handle_connection(
@@ -97,36 +96,16 @@ async fn handle_connection(
 
     let mut lines = BufReader::new(reader).lines();
 
-    // No v1 só a primeira linha é lida: uma requisição por conexão.
+    // A primeira linha já é uma requisição. Ela pode trazer a senha, por isso nunca vai ao log.
     let Some(first) = lines.next_line().await? else {
         return Ok(());
     };
-    let first = first.trim().to_string();
-    if first.is_empty() {
+    if first.trim().is_empty() {
         return Ok(());
     }
-    let parsed = serde_json::from_str::<Value>(&first);
-    let is_v2 = parsed.as_ref().map_or(false, |v| v.get("v").is_some());
+    let parsed = serde_json::from_str::<Value>(first.trim());
 
-    if !is_v2 {
-        // Só o v1 vai ao log: no v2 a linha pode trazer a senha.
-        log::debug!("Received: {}", first);
-        let request = parsed
-            .map_err(|e| e.to_string())
-            .and_then(|v| serde_json::from_value::<Request>(v).map_err(|e| e.to_string()));
-        let response = match request {
-            Ok(request) => {
-                // Os handlers fazem I/O bloqueante, então rodam fora do runtime.
-                tokio::task::spawn_blocking(move || handlers::handle(request))
-                    .await
-                    .unwrap_or_else(|e| Response::error(format!("Handler panicked: {}", e)))
-            }
-            Err(e) => Response::error(format!("Invalid request: {}", e)),
-        };
-        return write_line(&mut writer, &response).await;
-    }
-
-    // v2: assina antes de responder para não perder eventos, e começa pelo estado atual.
+    // Assina antes de responder para não perder eventos, e começa pelo estado atual.
     // A conexão é longa, então a autorização é reavaliada a cada requisição e a cada
     // evento: o usuário do console pode mudar (troca rápida de usuário) depois do accept.
     let mut events = session.subscribe();
@@ -170,6 +149,7 @@ fn handle_v2(session: &Arc<Session>, parsed: serde_json::Result<Value>) -> Respo
         .and_then(RequestV2::from_value);
     match request {
         Ok(RequestV2::Status) => ResponseV2::ok(Some(session.state())),
+        Ok(RequestV2::Version) => ResponseV2::version(env!("CARGO_PKG_VERSION")),
         Ok(RequestV2::Disconnect) => {
             session.disconnect();
             ResponseV2::ok(None)
@@ -215,24 +195,26 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
-    async fn v1_ping_keeps_working() {
+    async fn version_reports_the_helper_version() {
         let (path, _s) = start(allow_all()).await;
         let mut c = connect(&path).await;
-        c.send(json!({"cmd": "ping"})).await;
-        let r = c.recv().await.unwrap();
-        assert_eq!(r["ok"], true);
-        assert_eq!(r["version"], env!("CARGO_PKG_VERSION"));
-        assert!(c.recv().await.is_none(), "v1 closes after one response");
+        c.send(json!({"v": 2, "cmd": "version"})).await;
+        c.recv().await.unwrap(); // evento inicial de estado
+        assert_eq!(
+            c.recv().await.unwrap(),
+            json!({"v": 2, "type": "response", "ok": true, "version": env!("CARGO_PKG_VERSION")})
+        );
     }
 
     #[tokio::test]
-    async fn v1_invalid_request_is_an_error() {
+    async fn request_without_protocol_version_is_an_error() {
         let (path, _s) = start(allow_all()).await;
         let mut c = connect(&path).await;
-        c.send(json!({"cmd": "nope"})).await;
+        c.send(json!({"cmd": "status"})).await;
+        c.recv().await.unwrap(); // evento inicial de estado
         let r = c.recv().await.unwrap();
         assert_eq!(r["ok"], false);
-        assert!(r["error"].as_str().unwrap().starts_with("Invalid request"));
+        assert!(r["error"].as_str().unwrap().contains("version"));
     }
 
     #[tokio::test]
@@ -307,17 +289,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_peer_is_refused_in_both_versions() {
+    async fn unauthorized_peer_is_refused() {
         let (path, _s) = start(Arc::new(|_| false)).await;
-        for msg in [json!({"cmd": "ping"}), json!({"v": 2, "cmd": "status"})] {
-            let mut c = connect(&path).await;
-            c.send(msg).await;
-            assert_eq!(
-                c.recv().await.unwrap(),
-                json!({"ok": false, "error": "Unauthorized"})
-            );
-            assert!(c.recv().await.is_none());
-        }
+        let mut c = connect(&path).await;
+        c.send(json!({"v": 2, "cmd": "status"})).await;
+        assert_eq!(
+            c.recv().await.unwrap(),
+            json!({"ok": false, "error": "Unauthorized"})
+        );
+        assert!(c.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -331,7 +311,7 @@ mod tests {
         }))
         .await;
         let mut c = connect(&path).await;
-        c.send(json!({"cmd": "ping"})).await;
+        c.send(json!({"v": 2, "cmd": "status"})).await;
         c.recv().await.unwrap();
         // O arquivo do socket é deste processo, que também é o peer.
         let my_uid = std::fs::metadata(&path).unwrap().uid();
@@ -392,8 +372,9 @@ mod tests {
         for (console, accepted) in [(my_uid + 1, false), (my_uid, true)] {
             let (path, _s) = start(policy_authorizer(move || Some(console))).await;
             let mut c = connect(&path).await;
-            c.send(json!({"cmd": "ping"})).await;
-            assert_eq!(c.recv().await.unwrap()["ok"], accepted);
+            c.send(json!({"v": 2, "cmd": "status"})).await;
+            // Aceito: o primeiro quadro é o evento de estado, sem `ok`.
+            assert_eq!(c.recv().await.unwrap()["ok"] != false, accepted);
         }
     }
 
