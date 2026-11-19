@@ -2,13 +2,11 @@ use tauri::{AppHandle, Emitter};
 
 use crate::keychain;
 use crate::models::*;
-use crate::process_manager::ProcessManager;
 use crate::profile_store::ProfileStore;
 
 pub struct VpnManager {
     state: ConnectionState,
     profile_store: ProfileStore,
-    process_manager: ProcessManager,
     selected_profile_id: Option<String>,
 }
 
@@ -17,7 +15,6 @@ impl VpnManager {
         Ok(Self {
             state: ConnectionState::Disconnected,
             profile_store: ProfileStore::new()?,
-            process_manager: ProcessManager::new(),
             selected_profile_id: None,
         })
     }
@@ -80,27 +77,14 @@ impl VpnManager {
         crate::tray::update_tray_icon(app_handle, &self.state);
     }
 
+    /// Conecta pelo Engine do Helper. O progresso e o resultado chegam depois por eventos de estado.
     pub fn connect(
         &mut self,
         profile_id: &str,
-        app_handle: AppHandle,
-        debug_mode: bool,
+        app_handle: &AppHandle,
         dns_fallback: bool,
-        otp: Option<String>,
+        otp: Option<&str>,
     ) -> Result<(), String> {
-        #[cfg(feature = "engine-v2")]
-        {
-            let _ = debug_mode;
-            self.connect_v2(profile_id, &app_handle, dns_fallback, otp.as_deref())
-        }
-        #[cfg(not(feature = "engine-v2"))]
-        self.connect_v1(profile_id, app_handle, debug_mode, dns_fallback, otp)
-    }
-
-    /// Conecta pelo Engine do Helper (protocolo v2). O progresso e o resultado
-    /// chegam depois por eventos de estado.
-    #[cfg(feature = "engine-v2")]
-    fn connect_v2(&mut self, profile_id: &str, app_handle: &AppHandle, dns_fallback: bool, otp: Option<&str>) -> Result<(), String> {
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
             _ => return Err("Already connecting or connected".to_string()),
@@ -111,7 +95,7 @@ impl VpnManager {
             .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
         check_otp_provided(&profile, otp)?;
         let otp = profile.otp_to_send(otp);
-        // Como no v1: o DNS do sistema é lido antes de a VPN mexer na rede.
+        // O DNS do sistema é lido antes de a VPN mexer na rede.
         let fallback_dns = if dns_fallback { crate::dns_manager::get_current_dns_servers() } else { Vec::new() };
 
         let creds = match profile.auth_type {
@@ -136,104 +120,6 @@ impl VpnManager {
             self.set_state(ConnectionState::Error { message: e.clone() }, app_handle);
         }
         result
-    }
-
-    #[cfg_attr(feature = "engine-v2", allow(dead_code))]
-    fn connect_v1(
-        &mut self,
-        profile_id: &str,
-        app_handle: AppHandle,
-        debug_mode: bool,
-        dns_fallback: bool,
-        otp: Option<String>,
-    ) -> Result<(), String> {
-        // Validate state
-        match &self.state {
-            ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
-            _ => return Err("Already connecting or connected".to_string()),
-        }
-
-        // Look up profile
-        let profile = self
-            .profile_store
-            .get_by_id(profile_id)?
-            .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
-
-        // Sem OTP o openfortivpn ficaria preso esperando o código: barra antes
-        // de qualquer mudança de estado ou spawn.
-        check_otp_provided(&profile, otp.as_deref())?;
-
-        // Um domínio inválido faria o helper recusar todo o DNS da VPN, então
-        // falha aqui, antes de conectar, com uma mensagem visível.
-        let dns_match_domains = match Self::normalize_dns_domains(&profile.dns_match_domains) {
-            Ok(domains) => domains,
-            Err(e) => {
-                self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
-                return Err(e);
-            }
-        };
-
-        // Resolve credentials up front: without -u/-p the openfortivpn blocks
-        // waiting for input on stdin and the UI would sit on Connecting forever.
-        let password_creds = if profile.auth_type == AuthType::Password {
-            match Self::resolve_password_creds(&profile) {
-                Ok(creds) => Some(creds),
-                Err(e) => {
-                    self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-
-        // Set connecting state
-        self.set_state(
-            ConnectionState::Connecting {
-                profile_id: profile_id.to_string(),
-            },
-            &app_handle,
-        );
-
-        // O openfortivpn não tem opção de ignorar o certificado: quando o perfil
-        // pede isso, buscamos o digest sha256 direto do gateway e o passamos como
-        // --trusted-cert. Assim a conexão funciona já na primeira tentativa e
-        // continua funcionando quando o certificado é renovado.
-        let gateway_digest = if profile.ignore_cert_errors {
-            match crate::cert_fetcher::fetch_gateway_digest(&profile.host, profile.port) {
-                Ok(digest) => {
-                    log::info!("Auto-trusting gateway certificate {}", digest);
-                    Some(digest)
-                }
-                Err(e) => {
-                    log::warn!("Could not fetch gateway certificate digest: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let args = build_openfortivpn_args(&profile, password_creds, gateway_digest.as_deref(), otp.as_deref());
-
-        // Spawn the process
-        match self
-            .process_manager
-            .spawn_vpn(
-                args,
-                profile_id.to_string(),
-                app_handle.clone(),
-                debug_mode,
-                dns_fallback,
-                dns_match_domains,
-            )
-        {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.set_state(ConnectionState::Error { message: e.clone() }, &app_handle);
-                Err(e)
-            }
-        }
     }
 
     /// Clean up the split-DNS domains typed by the user: trims, lowercases and
@@ -261,8 +147,7 @@ impl VpnManager {
     }
 
     /// Look up the username and the keychain password of a password-auth profile.
-    /// Both are required: openfortivpn prompts on stdin when either is missing,
-    /// and the process would just hang with nothing shown to the user.
+    /// Both are required: without them the login cannot start.
     fn resolve_password_creds(profile: &VpnProfile) -> Result<(String, String), String> {
         let username = profile
             .username
@@ -295,17 +180,8 @@ impl VpnManager {
         self.set_state(ConnectionState::Disconnecting, app_handle);
     }
 
-    /// Perform the heavy disconnect work (kill process, restore routes, DNS).
-    pub fn finish_disconnect(&mut self, app_handle: &AppHandle) {
-        #[cfg(feature = "engine-v2")]
-        self.finish_disconnect_v2(app_handle);
-        #[cfg(not(feature = "engine-v2"))]
-        self.finish_disconnect_v1(app_handle);
-    }
-
     /// Pede o `disconnect` ao Engine, que também encerra um login pendente; o estado final chega por evento.
-    #[cfg(feature = "engine-v2")]
-    fn finish_disconnect_v2(&mut self, app_handle: &AppHandle) {
+    pub fn finish_disconnect(&mut self, app_handle: &AppHandle) {
         let path = crate::engine_v2::socket_path();
         if let Err(e) = crate::engine_v2::disconnect(path) {
             self.set_state(ConnectionState::Error { message: e }, app_handle);
@@ -315,18 +191,6 @@ impl VpnManager {
         // preso; um `status` fecha esse caso. Se ainda não caiu, o evento fecha.
         if let Ok(ConnectionState::Disconnected) = crate::engine_v2::status(path) {
             self.set_state(ConnectionState::Disconnected, app_handle);
-        }
-    }
-
-    #[cfg_attr(feature = "engine-v2", allow(dead_code))]
-    fn finish_disconnect_v1(&mut self, app_handle: &AppHandle) {
-        match self.process_manager.kill_vpn() {
-            Ok(()) => {
-                self.set_state(ConnectionState::Disconnected, app_handle);
-            }
-            Err(e) => {
-                self.set_state(ConnectionState::Error { message: e.clone() }, app_handle);
-            }
         }
     }
 
@@ -371,57 +235,6 @@ fn check_otp_provided(profile: &VpnProfile, otp: Option<&str>) -> Result<(), Str
         return Err("OTP is required for this profile".into());
     }
     Ok(())
-}
-
-/// Monta os argumentos do openfortivpn. `password_creds` é `Some` na auth por
-/// senha e `None` na SAML; `gateway_digest` é o digest já buscado quando o
-/// Profile ignora erros de certificado.
-fn build_openfortivpn_args(
-    profile: &VpnProfile,
-    password_creds: Option<(String, String)>,
-    gateway_digest: Option<&str>,
-    otp: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![format!("{}:{}", profile.host, profile.port)];
-
-    if let Some((username, password)) = password_creds {
-        args.push("-u".to_string());
-        args.push(username);
-        args.push("-p".to_string());
-        args.push(password);
-        if let Some(otp) = profile.otp_to_send(otp) {
-            // shortcut: o OTP fica visível no ps enquanto o openfortivpn roda, trocar por arquivo -c se credenciais em argv virarem problema
-            args.push(format!("--otp={}", otp));
-        }
-    } else {
-        args.push("--saml-login".to_string());
-    }
-
-    let mut trusted_certs = profile.trusted_certs.clone();
-    if let Some(digest) = gateway_digest {
-        if !trusted_certs.iter().any(|c| c == digest) {
-            trusted_certs.push(digest.to_string());
-        }
-    }
-
-    for cert in &trusted_certs {
-        args.push(format!("--trusted-cert={}", cert));
-    }
-
-    if let Some(ref realm) = profile.realm {
-        args.push(format!("--realm={}", realm));
-    }
-
-    // Disable openfortivpn's DNS handling — we manage DNS via scutil on macOS
-    // because macOS ignores /etc/resolv.conf
-    args.push("--set-dns=0".to_string());
-    args.push("--pppd-use-peerdns=0".to_string());
-
-    // Enable verbose logging so we can capture DNS server info from debug output
-    args.push("-v".to_string());
-
-    args.extend(profile.extra_args.clone());
-    args
 }
 
 #[cfg(test)]
@@ -473,16 +286,6 @@ mod tests {
         assert!(err.contains("No password stored"), "unexpected error: {}", err);
     }
 
-    fn args_of(
-        profile: &VpnProfile,
-        creds: Option<(&str, &str)>,
-        digest: Option<&str>,
-        otp: Option<&str>,
-    ) -> Vec<String> {
-        let creds = creds.map(|(u, p)| (u.to_string(), p.to_string()));
-        build_openfortivpn_args(profile, creds, digest, otp)
-    }
-
     #[test]
     fn test_check_otp_provided() {
         let mut profile = password_profile(Some("john"));
@@ -495,137 +298,5 @@ mod tests {
         // Sem otp_required, a ausência de OTP é aceita.
         profile.otp_required = false;
         assert!(check_otp_provided(&profile, None).is_ok());
-    }
-
-    fn base_profile() -> VpnProfile {
-        VpnProfile {
-            host: "vpn.corp.test".to_string(),
-            port: 8443,
-            auth_type: AuthType::Saml,
-            ..VpnProfile::default()
-        }
-    }
-
-    #[test]
-    fn test_args_password_auth() {
-        let args = args_of(&base_profile(), Some(("john", "s3cret")), None, None);
-        assert_eq!(
-            args,
-            ["vpn.corp.test:8443", "-u", "john", "-p", "s3cret", "--set-dns=0", "--pppd-use-peerdns=0", "-v"]
-        );
-    }
-
-    #[test]
-    fn test_args_saml_auth() {
-        let args = args_of(&base_profile(), None, None, None);
-        assert_eq!(
-            args,
-            ["vpn.corp.test:8443", "--saml-login", "--set-dns=0", "--pppd-use-peerdns=0", "-v"]
-        );
-        assert!(!args.iter().any(|a| a == "-u" || a == "-p"));
-    }
-
-    #[test]
-    fn test_args_realm() {
-        let mut profile = base_profile();
-        profile.realm = Some("corp".to_string());
-        assert!(args_of(&profile, None, None, None).contains(&"--realm=corp".to_string()));
-        profile.realm = None;
-        assert!(!args_of(&profile, None, None, None).iter().any(|a| a.starts_with("--realm")));
-    }
-
-    #[test]
-    fn test_args_trusted_certs() {
-        let mut profile = base_profile();
-        profile.trusted_certs = vec!["aaa".to_string(), "bbb".to_string()];
-        let args = args_of(&profile, None, None, None);
-        assert!(args.contains(&"--trusted-cert=aaa".to_string()));
-        assert!(args.contains(&"--trusted-cert=bbb".to_string()));
-    }
-
-    #[test]
-    fn test_args_dns_flags_and_verbose_always_present() {
-        for args in [args_of(&base_profile(), None, None, None), args_of(&base_profile(), Some(("u", "p")), None, None)] {
-            for flag in ["--set-dns=0", "--pppd-use-peerdns=0", "-v"] {
-                assert!(args.contains(&flag.to_string()), "missing {}", flag);
-            }
-        }
-    }
-
-    #[test]
-    fn test_args_extra_args_come_last() {
-        let mut profile = base_profile();
-        profile.extra_args = vec!["--foo".to_string(), "--bar=1".to_string()];
-        let args = args_of(&profile, None, None, None);
-        assert_eq!(&args[args.len() - 2..], ["--foo", "--bar=1"]);
-    }
-
-    #[test]
-    fn test_args_ignore_cert_adds_gateway_digest() {
-        let mut profile = base_profile();
-        profile.ignore_cert_errors = true;
-        let args = args_of(&profile, None, Some("deadbeef"), None);
-        assert!(args.contains(&"--trusted-cert=deadbeef".to_string()));
-    }
-
-    #[test]
-    fn test_args_ignore_cert_does_not_duplicate_known_digest() {
-        let mut profile = base_profile();
-        profile.ignore_cert_errors = true;
-        profile.trusted_certs = vec!["deadbeef".to_string()];
-        let args = args_of(&profile, None, Some("deadbeef"), None);
-        assert_eq!(args.iter().filter(|a| *a == "--trusted-cert=deadbeef").count(), 1);
-    }
-
-    #[test]
-    fn test_args_ignore_cert_without_digest_keeps_profile_certs() {
-        // Falha ao buscar o digest: segue só com os certs do perfil.
-        let mut profile = base_profile();
-        profile.ignore_cert_errors = true;
-        profile.trusted_certs = vec!["aaa".to_string()];
-        let args = args_of(&profile, None, None, None);
-        assert_eq!(args.iter().filter(|a| a.starts_with("--trusted-cert=")).count(), 1);
-    }
-
-    #[test]
-    fn test_args_otp_included_when_required() {
-        let mut profile = password_profile(Some("john"));
-        profile.otp_required = true;
-        let args = args_of(&profile, Some(("john", "s3cret")), None, Some("123456"));
-        assert!(args.contains(&"--otp=123456".to_string()));
-    }
-
-    #[test]
-    fn test_args_otp_trimmed() {
-        let mut profile = password_profile(Some("john"));
-        profile.otp_required = true;
-        let args = args_of(&profile, Some(("john", "s3cret")), None, Some(" 123456 "));
-        assert!(args.contains(&"--otp=123456".to_string()));
-    }
-
-    #[test]
-    fn test_args_otp_blank_is_omitted() {
-        let mut profile = password_profile(Some("john"));
-        profile.otp_required = true;
-        for otp in [None, Some(""), Some("   ")] {
-            let args = args_of(&profile, Some(("john", "s3cret")), None, otp);
-            assert!(!args.iter().any(|a| a.starts_with("--otp")), "otp {:?}", otp);
-        }
-    }
-
-    #[test]
-    fn test_args_otp_ignored_when_not_required() {
-        let profile = password_profile(Some("john"));
-        assert!(!profile.otp_required);
-        let args = args_of(&profile, Some(("john", "s3cret")), None, Some("123456"));
-        assert!(!args.iter().any(|a| a.starts_with("--otp")));
-    }
-
-    #[test]
-    fn test_args_otp_never_included_for_saml() {
-        let mut profile = base_profile();
-        profile.otp_required = true;
-        let args = args_of(&profile, None, None, Some("123456"));
-        assert!(!args.iter().any(|a| a.starts_with("--otp")));
     }
 }

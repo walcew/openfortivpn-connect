@@ -22,35 +22,12 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(handle_menu_event)
         .build(app)?;
 
-    // Listen for connection state changes to update VpnManager state and refresh tray.
-    // The log monitor emits these events but cannot update VpnManager.state directly
-    // (no access to the Mutex). This listener bridges that gap.
-    // Com `engine-v2` o canal de eventos do Helper já aplica o estado com lock
-    // bloqueante; sincronizar aqui também (try_lock com desistência) só reordenaria eventos.
+    // O canal de eventos do Helper já aplica o estado no VpnManager com lock bloqueante;
+    // aqui só se atualiza o menu (sincronizar também com try_lock reordenaria eventos).
     let handle = app.handle().clone();
-    app.listen("connection-status-changed", move |event| {
+    app.listen("connection-status-changed", move |_| {
         let h = handle.clone();
-        #[cfg(not(feature = "engine-v2"))]
-        let payload_str = event.payload().to_string();
-        #[cfg(feature = "engine-v2")]
-        let _ = event;
-        std::thread::spawn(move || {
-            // Parse the payload to sync VpnManager.state
-            #[cfg(not(feature = "engine-v2"))]
-            if let Ok(payload) = serde_json::from_str::<crate::models::ConnectionStatusPayload>(&payload_str) {
-                // Try to update VpnManager.state — retry a few times if locked
-                for _ in 0..10 {
-                    let mgr_state = h.state::<Mutex<VpnManager>>();
-                    if let Ok(mut mgr) = mgr_state.try_lock() {
-                        mgr.sync_state_from_payload(&payload);
-                        drop(mgr);
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            }
-            refresh_tray_menu(&h);
-        });
+        std::thread::spawn(move || refresh_tray_menu(&h));
     });
 
     Ok(())
@@ -240,7 +217,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                         .unwrap_or_default();
                     let mgr_state = app.state::<Mutex<VpnManager>>();
                     let mut mgr = mgr_state.lock().unwrap();
-                    let _ = mgr.connect(&profile_id, app.clone(), settings.debug_mode, settings.dns_fallback, None);
+                    let _ = mgr.connect(&profile_id, &app, settings.dns_fallback, None);
                     drop(mgr);
                 }
                 // Refresh after lock is released

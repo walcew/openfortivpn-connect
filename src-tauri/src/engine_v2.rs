@@ -1,4 +1,4 @@
-//! Cliente do protocolo v2 do Helper, usado só com a feature `engine-v2`.
+//! Cliente do protocolo v2 do Helper.
 //!
 //! Comandos vão em conexões v2 curtas (uma resposta por comando, erro síncrono);
 //! os eventos de estado e de log chegam por uma conexão longa que reabre sozinha
@@ -229,7 +229,7 @@ fn run_events(path: &Path, mut on: impl FnMut(Incoming)) {
     }
 }
 
-/// No caminho v2 os eventos são a única fonte da verdade do estado. O lock é
+/// Os eventos são a única fonte da verdade do estado. O lock é
 /// bloqueante (e não `try_lock`) para que um evento chegando durante um
 /// connect/disconnect em andamento espere o comando soltar o manager em vez de se perder.
 fn apply_state(manager: &Mutex<VpnManager>, state: &ConnectionState) {
@@ -254,8 +254,7 @@ fn transition(connecting: &mut Option<String>, state: &ConnectionState, cert_dig
     }
     let profile_id = connecting.take()?;
     match (state, cert_digest) {
-        // Mesmos eventos do caminho do openfortivpn: o front abre a URL no navegador padrão e
-        // mostra o diálogo "Trust & Reconnect".
+        // O front abre a URL no navegador padrão e mostra o diálogo "Trust & Reconnect".
         (ConnectionState::WaitingSaml { url, .. }, _) => Some(("saml-url", json!({"url": url}))),
         (ConnectionState::Error { .. }, Some(digest)) => Some(("cert-warning", json!({"digest": digest, "profile_id": profile_id}))),
         _ => None,
