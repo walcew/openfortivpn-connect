@@ -68,6 +68,8 @@ pub struct GatewayOptions {
     pub push: Option<Push>,
     /// O pedido de token chega sem `reqid`.
     pub incomplete_challenge: bool,
+    /// Acrescenta uma rota `0.0.0.0/0.0.0.0` ao split tunnel.
+    pub default_route_in_split: bool,
 }
 
 struct Shared {
@@ -281,7 +283,10 @@ fn xml(options: &GatewayOptions) -> String {
     let split = if options.full_tunnel {
         String::new()
     } else {
-        let addrs: String = SPLIT_ROUTES.iter().map(|(ip, mask)| format!("<addr ip='{}' mask='{}'/>", ip, mask)).collect();
+        let mut addrs: String = SPLIT_ROUTES.iter().map(|(ip, mask)| format!("<addr ip='{}' mask='{}'/>", ip, mask)).collect();
+        if options.default_route_in_split {
+            addrs.push_str("<addr ip='0.0.0.0' mask='0.0.0.0'/>");
+        }
         format!("<split-tunnel-info>{}</split-tunnel-info>", addrs)
     };
     format!(

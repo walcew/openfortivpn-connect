@@ -2,6 +2,7 @@
 //! canal de pacotes IP e os entrega ao sistema (interface, rotas, /32 do gateway, DNS).
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 
@@ -45,6 +46,7 @@ pub struct Packets {
 /// As remoções não falham: o teardown sempre tenta tudo.
 pub trait Os: Send + Sync {
     /// Cria a interface do túnel e assume o canal de pacotes. Rotas dela somem com ela.
+    /// Em erro, não deixa interface para trás.
     fn up(&self, ip: Ipv4Addr, peer: Ipv4Addr, mtu: u16, packets: Packets) -> Result<(), String>;
     /// Rota pela interface do túnel.
     fn add_route(&self, route: Route) -> Result<(), String>;
@@ -62,23 +64,54 @@ const FULL_TUNNEL: [Route; 2] = [
     Route { addr: Ipv4Addr::new(128, 0, 0, 0), mask: Ipv4Addr::new(128, 0, 0, 0) },
 ];
 
-/// Aplica a config. Em erro, o chamador faz `teardown` para desfazer o que entrou.
-pub fn apply(os: &dyn Os, config: &TunnelConfig, packets: Packets) -> Result<(), String> {
+/// O que já entrou no SO, para o teardown desfazer só isso.
+#[derive(Debug, Default)]
+pub struct Applied {
+    gateway_route: Option<IpAddr>,
+    interface: bool,
+    dns: bool,
+}
+
+/// Aplica a config, marcando em `applied` cada passo que deu certo. Em erro (ou pânico),
+/// o chamador faz `teardown` para desfazer o que entrou.
+pub fn apply(os: &dyn Os, config: &TunnelConfig, packets: Packets, applied: &Mutex<Applied>) -> Result<(), String> {
     // O /32 entra antes das rotas do túnel para o gateway nunca ser roteado por dentro dele.
     os.add_gateway_route(config.gateway)?;
+    applied.lock().unwrap().gateway_route = Some(config.gateway);
     os.up(config.ip, config.peer, config.mtu, packets)?;
-    let routes = if config.full_tunnel { &FULL_TUNNEL[..] } else { &config.routes[..] };
-    for route in routes {
-        os.add_route(*route)?;
+    applied.lock().unwrap().interface = true;
+    for route in tunnel_routes(config) {
+        os.add_route(route)?;
     }
     if !config.dns_servers.is_empty() {
         os.set_dns(&config.dns_servers, &config.dns_suffixes)?;
+        applied.lock().unwrap().dns = true;
     }
     Ok(())
 }
 
-pub fn teardown(os: &dyn Os, config: &TunnelConfig) {
-    os.remove_dns();
-    os.down();
-    os.remove_gateway_route(config.gateway);
+/// Rotas pelo túnel. Uma default (máscara 0) vinda do gateway vira as duas metades,
+/// como no full tunnel: a rota default do sistema nunca é tocada.
+fn tunnel_routes(config: &TunnelConfig) -> Vec<Route> {
+    if config.full_tunnel {
+        return FULL_TUNNEL.to_vec();
+    }
+    config
+        .routes
+        .iter()
+        .flat_map(|r| if r.mask.is_unspecified() { FULL_TUNNEL.to_vec() } else { vec![*r] })
+        .collect()
+}
+
+pub fn teardown(os: &dyn Os, applied: &Mutex<Applied>) {
+    let applied = std::mem::take(&mut *applied.lock().unwrap());
+    if applied.dns {
+        os.remove_dns();
+    }
+    if applied.interface {
+        os.down();
+    }
+    if let Some(gateway) = applied.gateway_route {
+        os.remove_gateway_route(gateway);
+    }
 }
