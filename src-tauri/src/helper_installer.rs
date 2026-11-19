@@ -108,9 +108,18 @@ fn admin_script(cmd: &str) -> String {
 /// Comandos de shell que removem o Helper da 0.3.0. Tolerantes: numa instalação nova nada disso
 /// existe, e o passo não pode derrubar o `set -e` do chamador.
 fn legacy_cleanup_cmd() -> String {
+    // Com uma sessão da 0.3.0 ativa, o openfortivpn e o pppd ficam órfãos: mesmos comandos do
+    // `kill-vpn` antigo (SIGTERM e depois SIGKILL no pppd, que ignora SIGTERM quando o peer sumiu).
+    // Só se o Helper antigo existe, para não matar o pppd de outra VPN numa instalação nova.
     // O unload derruba o Helper antigo e os filhos dele; o `remove` cobre o label carregado sem plist.
     let mut cmd = format!(
-        "launchctl unload -w {plist} 2>/dev/null || true; \
+        "if [ -e {plist} ]; then \
+           pkill -x openfortivpn || true; sleep 1; \
+           killall pppd 2>/dev/null || true; sleep 1; \
+           killall -KILL pppd 2>/dev/null || true; \
+           for i in ppp0 ppp1 ppp2; do /sbin/ifconfig $i down 2>/dev/null || true; done; \
+         fi; \
+         launchctl unload -w {plist} 2>/dev/null || true; \
          launchctl remove {label} 2>/dev/null || true; \
          echo {remove_dns} | /usr/sbin/scutil || true; ",
         plist = shell_quote(LEGACY_PLIST_PATH),
@@ -292,12 +301,16 @@ mod tests {
     fn install_is_one_admin_script_that_removes_the_old_helper_before_the_new_one_loads() {
         let cmd = install_cmd("/Applications/App.app/Contents/Resources/openvpngui-helper");
         let at = |needle: &str| cmd.find(needle).unwrap_or_else(|| panic!("missing {needle} in {cmd}"));
+        let kill_openfortivpn = at("pkill -x openfortivpn");
+        let kill_pppd = at("killall -KILL pppd");
+        let down_ppp = at("/sbin/ifconfig $i down");
         let old_unload = at("launchctl unload -w '/Library/LaunchDaemons/com.openvpngui.helper.plist'");
         let old_remove = at("launchctl remove com.openvpngui.helper");
         let old_dns = at("remove State:/Network/Service/OpenFortiVPN/DNS");
         let old_files = at("rm -f /Library/PrivilegedHelperTools/com.openvpngui.helper /Library/PrivilegedHelperTools/openfortivpn /var/run/openvpngui-helper.sock");
         let new_copy = at("cp '/Applications/App.app/Contents/Resources/openvpngui-helper' /Library/PrivilegedHelperTools/com.vpnconnect.helper");
         let new_load = at("launchctl load -w /Library/LaunchDaemons/com.vpnconnect.helper.plist");
+        assert!(kill_openfortivpn < kill_pppd && kill_pppd < down_ppp && down_ppp < old_unload);
         assert!(old_unload < old_remove && old_remove < old_dns && old_dns < old_files);
         assert!(old_files < new_copy && new_copy < new_load);
         assert!(cmd.starts_with("set -e; "));
