@@ -50,7 +50,8 @@ jobs:
           cache: 'npm'
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # shortcut: Rust fixado em 1.99 porque o layout de build do Cargo 1.100 quebra o tauri-build 2.5.6 ("Is a directory"); voltar para stable quando o tauri-build suportar o novo layout
+        uses: dtolnay/rust-toolchain@1.99
         with:
           targets: ${{ matrix.target }}
 
