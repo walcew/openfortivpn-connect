@@ -1,6 +1,6 @@
 # OpenFortiVpn Connect
 
-Cliente macOS para VPNs FortiGate SSL-VPN, que usa o openfortivpn como motor de túnel.
+Cliente macOS para VPNs FortiGate SSL-VPN, com Engine próprio rodando no Helper.
 
 ## Language
 
@@ -9,15 +9,11 @@ A configuração salva de um gateway VPN: host, porta, método de autenticação
 _Avoid_: Connection, account, server
 
 **Helper**:
-O daemon privilegiado que roda como root e é o único autorizado a iniciar e encerrar o openfortivpn e a alterar rede e DNS.
+O daemon privilegiado que roda como root. É o dono da sessão: hospeda o Engine, cria o túnel, aplica rotas e DNS e desfaz tudo quando a sessão termina. A GUI e a futura CLI são clientes do socket dele.
 _Avoid_: Daemon, service, agent
 
-**Bundled openfortivpn**:
-O binário do openfortivpn que acompanha o app e é instalado junto com o Helper. É o único que o Helper executa.
-_Avoid_: CLI, system openfortivpn, Homebrew openfortivpn
-
 **Engine**:
-A implementação de um protocolo de VPN dentro do Helper. Hoje só existe o Fortinet SSL VPN, ainda em desenvolvimento.
+A implementação de um protocolo de VPN dentro do Helper: faz o login e o túnel e entrega a configuração à camada de rede. Hoje só existe o Fortinet SSL VPN.
 _Avoid_: Motor externo, backend, driver
 
 **Auto-trust**:

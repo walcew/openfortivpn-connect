@@ -1,5 +1,7 @@
 # openfortivpn bundlado; Homebrew deixa de ser suportado
 
+**Status:** substituído pelo [ADR 0002](0002-own-engine-replaces-openfortivpn.md) na 0.4.0, quando o openfortivpn saiu do bundle. Mantido como registro histórico.
+
 O Helper roda como root e executava `/opt/homebrew/bin/openfortivpn`. Esse binário e as dylibs do OpenSSL que ele carrega ficam em diretórios graváveis pelo usuário, o que permitia a qualquer processo do usuário obter root na conexão seguinte. Decidimos compilar o openfortivpn no CI com OpenSSL estático, instalá-lo como root em `/Library/PrivilegedHelperTools` junto com o Helper e fazer o Helper executar só esse binário, sem fallback para o Homebrew.
 
 ## Considered Options
