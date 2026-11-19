@@ -10,7 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::net::{self, SystemOs};
-use crate::protocol::{Frame, FrameKind, RequestV2, ResponseV2, VERSION_V2};
+use crate::protocol::{Frame, FrameKind, Request, Response, PROTOCOL_VERSION};
 use crate::session::{Event, Session};
 
 pub const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
@@ -79,7 +79,7 @@ type Writer = tokio::net::unix::OwnedWriteHalf;
 
 async fn refuse(writer: &mut Writer, uid: u32) -> Result<(), Box<dyn std::error::Error>> {
     log::warn!("Refused uid {}", uid);
-    write_line(writer, &ResponseV2::error("Unauthorized".to_string())).await
+    write_line(writer, &Response::error("Unauthorized".to_string())).await
 }
 
 async fn handle_connection(
@@ -138,31 +138,31 @@ async fn handle_connection(
         if !authorizer(uid) {
             return refuse(&mut writer, uid).await;
         }
-        let response = handle_v2(&session, parsed);
+        let response = handle_request(&session, parsed);
         write_frame(&mut writer, FrameKind::Response, &response).await?;
     }
 }
 
-fn handle_v2(session: &Arc<Session>, parsed: serde_json::Result<Value>) -> ResponseV2 {
+fn handle_request(session: &Arc<Session>, parsed: serde_json::Result<Value>) -> Response {
     let request = parsed
         .map_err(|e| format!("Invalid request: {}", e))
-        .and_then(RequestV2::from_value);
+        .and_then(Request::from_value);
     match request {
-        Ok(RequestV2::Status) => ResponseV2::ok(Some(session.state())),
-        Ok(RequestV2::Version) => ResponseV2::version(env!("CARGO_PKG_VERSION")),
-        Ok(RequestV2::Disconnect) => {
+        Ok(Request::Status) => Response::ok(Some(session.state())),
+        Ok(Request::Version) => Response::version(env!("CARGO_PKG_VERSION")),
+        Ok(Request::Disconnect) => {
             session.disconnect();
-            ResponseV2::ok(None)
+            Response::ok(None)
         }
-        Ok(RequestV2::Cancel) => {
+        Ok(Request::Cancel) => {
             session.cancel();
-            ResponseV2::ok(None)
+            Response::ok(None)
         }
-        Ok(RequestV2::Connect { profile, password, otp }) => match session.connect(profile, password, otp) {
-            Ok(()) => ResponseV2::ok(None),
-            Err(e) => ResponseV2::error(e),
+        Ok(Request::Connect { profile, password, otp }) => match session.connect(*profile, password, otp) {
+            Ok(()) => Response::ok(None),
+            Err(e) => Response::error(e),
         },
-        Err(msg) => ResponseV2::error(msg),
+        Err(msg) => Response::error(msg),
     }
 }
 
@@ -183,7 +183,7 @@ async fn write_frame<T: Serialize>(
     kind: FrameKind,
     body: &T,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    write_line(writer, &Frame { v: VERSION_V2, kind, body }).await
+    write_line(writer, &Frame { v: PROTOCOL_VERSION, kind, body }).await
 }
 
 #[cfg(test)]
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_status_reports_disconnected_after_initial_state_event() {
+    async fn status_reports_disconnected_after_initial_state_event() {
         let (path, _s) = start(allow_all()).await;
         let mut c = connect(&path).await;
         c.send(json!({"v": 2, "cmd": "status"})).await;
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_connection_stays_open_and_receives_events() {
+    async fn connection_stays_open_and_receives_events() {
         let (path, session) = start(allow_all()).await;
         let mut c = connect(&path).await;
         c.send(json!({"v": 2, "cmd": "status"})).await;
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_disconnect_without_session_is_a_noop() {
+    async fn disconnect_without_session_is_a_noop() {
         let (path, _s) = start(allow_all()).await;
         let mut c = connect(&path).await;
         c.send(json!({"v": 2, "cmd": "disconnect"})).await;
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_rejects_bad_requests_without_closing() {
+    async fn rejects_bad_requests_without_closing() {
         let (path, _s) = start(allow_all()).await;
         let mut c = connect(&path).await;
         c.send(json!({"v": 2, "cmd": "status"})).await;
@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_request_is_refused_when_authorization_is_revoked_mid_connection() {
+    async fn request_is_refused_when_authorization_is_revoked_mid_connection() {
         use std::sync::atomic::AtomicBool;
         let allowed = Arc::new(AtomicBool::new(true));
         let a = allowed.clone();
@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_events_stop_when_authorization_is_revoked_mid_connection() {
+    async fn events_stop_when_authorization_is_revoked_mid_connection() {
         use std::sync::atomic::AtomicBool;
         let allowed = Arc::new(AtomicBool::new(true));
         let a = allowed.clone();

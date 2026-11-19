@@ -19,6 +19,7 @@ const LEGACY_FILES: [&str; 5] = [
     "/var/log/openvpngui-helper.log",
     "/tmp/openvpngui-*.log",
 ];
+// Par de `LEGACY_DNS_KEY` em helper/src/net/system.rs, que também apaga a chave.
 const LEGACY_DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
 
 const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -57,7 +58,7 @@ pub struct HelperStatus {
     pub needs_update: bool,
 }
 
-/// Check the current status of the helper daemon.
+/// Estado atual do Helper.
 pub fn check_status() -> HelperStatus {
     let installed = Path::new(HELPER_INSTALL_PATH).exists()
         && Path::new(PLIST_INSTALL_PATH).exists();
@@ -82,16 +83,15 @@ fn needs_update(installed_version: Option<&str>, expected_version: &str) -> bool
     installed_version.is_some_and(|v| v != expected_version)
 }
 
-/// Escape a string for inclusion in an AppleScript double-quoted string.
-/// AppleScript only recognizes `\\` and `\"` as escape sequences.
-/// Shell metacharacters like `$`, `` ` ``, `&` are left as-is because
-/// `do shell script` passes the string to `/bin/sh` which interprets them.
+/// Escapa uma string para ir dentro de aspas duplas do AppleScript, que só reconhece
+/// `\\` e `\"` como escape. Metacaracteres do shell (`$`, `` ` ``, `&`) ficam como estão,
+/// porque o `do shell script` entrega a string ao `/bin/sh`, que os interpreta.
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Wrap a user-supplied value in single quotes for shell safety.
-/// Inside single quotes, the shell interprets nothing — only `'` needs handling.
+/// Põe um valor entre aspas simples para o shell. Dentro delas o shell não interpreta nada,
+/// então só o `'` precisa de tratamento.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -154,8 +154,7 @@ fn install_cmd(bundled_helper: &str) -> String {
     )
 }
 
-/// Install the helper daemon using osascript (one-time admin password).
-/// The helper binary is read from the app bundle's resources.
+/// Instala o Helper com osascript (uma senha de admin) a partir dos resources do bundle do app.
 pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     let resource_dir = app_handle
         .path()
@@ -187,10 +186,10 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
         return Err(format!("Installation failed: {}", stderr));
     }
 
-    // Wait briefly for the daemon to start
+    // Espera o daemon subir
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    // Verify the helper is responding
+    // Confere se o Helper responde
     match helper_client::version(helper_client::socket_path()) {
         Ok(version) => {
             log::info!("Helper daemon installed and running (v{})", version);
@@ -203,7 +202,7 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     }
 }
 
-/// Uninstall the helper daemon (e qualquer resto da 0.3.0).
+/// Desinstala o Helper e qualquer resto da 0.3.0.
 pub fn uninstall() -> Result<(), String> {
     let script = admin_script(&format!(
         "set -e; \
@@ -215,7 +214,7 @@ pub fn uninstall() -> Result<(), String> {
         legacy = legacy_cleanup_cmd(),
         helper = HELPER_INSTALL_PATH,
         plist = PLIST_INSTALL_PATH,
-        socket = helper_client::SOCKET_PATH,
+        socket = helper_client::socket_path().display(),
     ));
 
     let output = Command::new("osascript")
@@ -328,7 +327,8 @@ mod tests {
 
     #[test]
     fn no_new_artifact_carries_the_old_names() {
-        for new in [HELPER_INSTALL_PATH, PLIST_INSTALL_PATH, helper_client::SOCKET_PATH, PLIST_CONTENT] {
+        let socket = helper_client::socket_path().to_string_lossy().into_owned();
+        for new in [HELPER_INSTALL_PATH, PLIST_INSTALL_PATH, PLIST_CONTENT, &socket] {
             assert!(!new.contains("openvpngui") && !new.to_lowercase().contains("openfortivpn"), "{new}");
         }
     }

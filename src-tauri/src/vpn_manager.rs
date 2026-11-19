@@ -31,8 +31,7 @@ impl VpnManager {
         self.selected_profile_id = Some(id.to_string());
     }
 
-    /// Update internal state from an event payload (used by the tray listener
-    /// to sync state changes emitted by the log monitor).
+    /// Atualiza o estado interno a partir de um payload de estado, vindo dos eventos do Helper.
     pub fn sync_state_from_payload(&mut self, payload: &ConnectionStatusPayload) {
         let new_state = match payload.state.as_str() {
             "Disconnected" => ConnectionState::Disconnected,
@@ -126,10 +125,9 @@ impl VpnManager {
         result
     }
 
-    /// Clean up the split-DNS domains typed by the user: trims, lowercases and
-    /// strips a leading `*.` or `.` (the scutil match domain is the bare suffix),
-    /// then drops empty entries and duplicates. Rejects anything the helper's
-    /// hostname validation would refuse.
+    /// Limpa os domínios de split DNS digitados: apara, põe em minúsculas e tira o `*.` ou `.`
+    /// inicial (o domínio do scutil é o sufixo puro), depois descarta vazios e duplicados.
+    /// Rejeita o que a validação de hostname do Helper recusaria.
     fn normalize_dns_domains(domains: &[String]) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = Vec::new();
         for d in domains {
@@ -150,8 +148,8 @@ impl VpnManager {
         Ok(out)
     }
 
-    /// Look up the username and the keychain password of a password-auth profile.
-    /// Both are required: without them the login cannot start.
+    /// Busca o usuário e a senha (no Keychain) de um Profile com senha. Os dois são
+    /// obrigatórios: sem eles o login não começa.
     fn resolve_password_creds(profile: &VpnProfile) -> Result<(String, String), String> {
         let username = profile
             .username
@@ -179,7 +177,7 @@ impl VpnManager {
         Ok((username.to_string(), password))
     }
 
-    /// Begin disconnecting: sets state to Disconnecting and returns immediately.
+    /// Começa a desconexão: põe o estado em Disconnecting e volta na hora.
     pub fn begin_disconnect(&mut self, app_handle: &AppHandle) {
         self.set_state(ConnectionState::Disconnecting, app_handle);
     }
@@ -198,7 +196,7 @@ impl VpnManager {
         }
     }
 
-    /// Full synchronous disconnect (used by tray menu).
+    /// Desconexão completa e síncrona (usada pelo menu da tray).
     pub fn disconnect(&mut self, app_handle: AppHandle) -> Result<(), String> {
         self.begin_disconnect(&app_handle);
         self.finish_disconnect(&app_handle);

@@ -8,14 +8,14 @@ use crate::session::State;
 // JSON por linha, em conexão longa. Toda requisição leva `"v": 2`. Do servidor saem dois
 // tipos de quadro, ambos com `v` e `type`: `response` (uma por requisição) e `event`
 // (assíncrono, vindo da sessão).
-// Para crescer: novos comandos entram em `RequestV2` e novos eventos em
+// Para crescer: novos comandos entram em `Request` e novos eventos em
 // `session::Event`, sem mudar o envelope.
 
-pub const VERSION_V2: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
-pub enum RequestV2 {
+pub enum Request {
     Status,
     /// Versão do Helper instalado, para o app decidir se reinstala.
     Version,
@@ -24,7 +24,7 @@ pub enum RequestV2 {
     Cancel,
     /// Senha e OTP só no corpo, nunca em argv nem em log.
     Connect {
-        profile: Profile,
+        profile: Box<Profile>,
         /// Ausente no SAML.
         #[serde(default)]
         password: String,
@@ -34,11 +34,11 @@ pub enum RequestV2 {
     },
 }
 
-impl RequestV2 {
+impl Request {
     /// Valida a versão e o comando de uma linha já lida como JSON.
     pub fn from_value(value: serde_json::Value) -> Result<Self, String> {
         match value.get("v").and_then(|v| v.as_u64()) {
-            Some(v) if v == u64::from(VERSION_V2) => {}
+            Some(v) if v == u64::from(PROTOCOL_VERSION) => {}
             other => return Err(format!("Unsupported protocol version: {:?}", other)),
         }
         serde_json::from_value(value).map_err(|e| format!("Invalid request: {}", e))
@@ -46,7 +46,7 @@ impl RequestV2 {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ResponseV2 {
+pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -56,7 +56,7 @@ pub struct ResponseV2 {
     pub version: Option<String>,
 }
 
-impl ResponseV2 {
+impl Response {
     pub fn ok(state: Option<State>) -> Self {
         Self { ok: true, error: None, state, version: None }
     }
@@ -77,7 +77,7 @@ pub enum FrameKind {
     Event,
 }
 
-/// Envelope de tudo que o servidor escreve numa conexão v2.
+/// Envelope de tudo que o servidor escreve numa conexão.
 #[derive(Debug, Serialize)]
 pub struct Frame<T: Serialize> {
     pub v: u32,

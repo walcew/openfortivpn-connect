@@ -1,6 +1,6 @@
-//! Cliente do protocolo v2 do Helper.
+//! Cliente do protocolo do Helper.
 //!
-//! Comandos vão em conexões v2 curtas (uma resposta por comando, erro síncrono);
+//! Comandos vão em conexões curtas (uma resposta por comando, erro síncrono);
 //! os eventos de estado e de log chegam por uma conexão longa que reabre sozinha
 //! se o Helper reiniciar.
 
@@ -18,7 +18,7 @@ use crate::models::*;
 use crate::vpn_manager::VpnManager;
 
 /// Socket do Helper; par de `SOCKET_PATH` em helper/src/server.rs.
-pub(crate) const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
+const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
@@ -114,7 +114,7 @@ fn send(mut stream: &UnixStream, cmd: &Value) -> Result<(), String> {
     writeln!(stream, "{}", cmd).map_err(|e| format!("Failed to send request: {}", e))
 }
 
-/// Envia um comando numa conexão v2 curta e devolve a resposta; eventos
+/// Envia um comando numa conexão curta e devolve a resposta; eventos
 /// intercalados são descartados.
 fn request(path: &Path, cmd: &Value) -> Result<Value, String> {
     let stream = open(path)?;
@@ -162,7 +162,7 @@ fn str_list(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Converte o estado do contrato v2 (evento ou resposta de `status`) no
+/// Converte o estado do contrato (evento ou resposta de `status`) no
 /// `ConnectionState` que a janela e a tray já consomem.
 fn parse_state(v: &Value) -> Option<ConnectionState> {
     let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
@@ -228,7 +228,7 @@ fn run_events(path: &Path, mut on: impl FnMut(Incoming)) {
         delay = match listen_once(path, &mut on) {
             Ok(()) => RECONNECT_MIN,
             Err(e) => {
-                log::debug!("Helper v2 event channel unavailable: {}", e);
+                log::debug!("Helper event channel unavailable: {}", e);
                 (delay * 2).min(RECONNECT_MAX)
             }
         };
@@ -386,7 +386,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
 
-    fn socket_path() -> PathBuf {
+    fn temp_socket_path() -> PathBuf {
         std::env::temp_dir().join(format!("ovg-{}.sock", &uuid::Uuid::new_v4().simple().to_string()[..8]))
     }
 
@@ -397,7 +397,7 @@ mod tests {
         greeting: Vec<Value>,
         reply: impl Fn(&Value) -> Vec<Value> + Send + 'static,
     ) -> (PathBuf, mpsc::Receiver<Value>) {
-        let path = socket_path();
+        let path = temp_socket_path();
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn version_fails_when_the_helper_is_not_running() {
-        assert!(version(&socket_path()).is_err());
+        assert!(version(&temp_socket_path()).is_err());
     }
 
     #[test]
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn event_channel_reopens_when_the_helper_comes_back() {
         // Helper ausente no início; sobe depois e o canal conecta sozinho.
-        let path = socket_path();
+        let path = temp_socket_path();
         let (tx, events) = mpsc::channel();
         let p = path.clone();
         std::thread::spawn(move || run_events(&p, |i| { let _ = tx.send(i); }));

@@ -24,7 +24,8 @@ const KILLALL: &str = "/usr/bin/killall";
 /// No diretório de suporte de root, com o nome do Helper instalado pelo app.
 const STATE_FILE: &str = "/Library/Application Support/com.vpnconnect.helper/session-state.json";
 const DNS_KEY: &str = "State:/Network/Service/VpnConnect/DNS";
-/// Chave da 0.3.0, que ficava para trás se o Helper antigo morria com a VPN ativa.
+/// Chave da 0.3.0, que ficava para trás se o Helper antigo morria com a VPN ativa. Par de
+/// `LEGACY_DNS_KEY` em src-tauri/src/helper_installer.rs, que a apaga no upgrade.
 const LEGACY_DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
 const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 /// Cabeçalho do utun: a família do protocolo em ordem de rede.
