@@ -2,9 +2,11 @@
 
 use std::hash::{BuildHasher, Hasher};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
 
 const LCP: u16 = 0xc021;
 const IPCP: u16 = 0x8021;
@@ -27,6 +29,9 @@ const IPCP_ADDRESS: u8 = 3;
 const IPCP_DNS1: u8 = 129;
 const IPCP_DNS2: u8 = 131;
 
+/// Echo-Requests seguidos sem nenhum LCP do gateway que contam como túnel morto.
+const ECHO_MISSES: u8 = 3;
+
 /// Cabeçalho Fortinet: tamanho total, magic e tamanho do PPP, big-endian.
 const FRAME_MAGIC: u16 = 0x5050;
 const HEADER_LEN: usize = 6;
@@ -48,10 +53,12 @@ enum Action {
 }
 
 /// Conduz o túnel até ele cair e devolve o motivo. `up` dispara quando o IPCP abre;
-/// a partir daí os pacotes IP fluem entre o stream e o canal da interface.
+/// a partir daí os pacotes IP fluem entre o stream e o canal da interface, e um LCP
+/// Echo-Request sai a cada `echo_interval`; `ECHO_MISSES` seguidos sem LCP de volta derrubam o túnel.
 pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     mtu: u16,
+    echo_interval: Duration,
     up: oneshot::Sender<Up>,
     to_iface: mpsc::Sender<Vec<u8>>,
     mut from_iface: mpsc::Receiver<Vec<u8>>,
@@ -62,14 +69,17 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 65536];
+    // O primeiro tick sai assim que o IPCP abre; Delay evita rajada de ticks atrasados.
+    let mut echo = tokio::time::interval(echo_interval);
+    echo.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        // Só `read` e `recv` dentro do select: os dois podem ser cancelados sem perder dados.
+        // Só `read`, `recv` e `tick` dentro do select: os dois podem ser cancelados sem perder dados.
         tokio::select! {
             r = stream.read(&mut chunk) => {
                 match r {
-                    Ok(0) => return "Tunnel closed by the gateway".into(),
+                    Ok(0) => return "Tunnel dropped: connection closed by the gateway".into(),
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(e) => return format!("Tunnel read failed: {}", e),
+                    Err(e) => return format!("Tunnel dropped: read failed: {}", e),
                 }
                 loop {
                     let payload = match take_frame(&mut buf) {
@@ -91,6 +101,16 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Some(packet) = from_iface.recv(), if ppp.up.is_none() => {
                 if let Err(e) = stream.write_all(&frame(IP, &packet)).await {
+                    return format!("Tunnel write failed: {}", e);
+                }
+            }
+            _ = echo.tick(), if ppp.up.is_none() => {
+                if ppp.missed == ECHO_MISSES {
+                    return "Tunnel dropped: no response from the gateway".into();
+                }
+                ppp.missed += 1;
+                ppp.echo_id = ppp.echo_id.wrapping_add(1);
+                if let Err(e) = stream.write_all(&packet(LCP, ECHO_REQ, ppp.echo_id, &ppp.magic)).await {
                     return format!("Tunnel write failed: {}", e);
                 }
             }
@@ -168,6 +188,9 @@ struct Ppp {
     peer: Option<Ipv4Addr>,
     /// Some até o IPCP abrir.
     up: Option<oneshot::Sender<Up>>,
+    /// Echo-Requests sem nenhum LCP do gateway desde o último; qualquer LCP prova que ele responde.
+    missed: u8,
+    echo_id: u8,
 }
 
 impl Ppp {
@@ -175,7 +198,7 @@ impl Ppp {
         let magic = (std::collections::hash_map::RandomState::new().build_hasher().finish() as u32 | 1).to_be_bytes();
         let lcp = Cp::new(LCP, vec![(LCP_MRU, mtu.to_be_bytes().to_vec()), (LCP_MAGIC, magic.to_vec())]);
         let ipcp = Cp::new(IPCP, vec![(IPCP_ADDRESS, vec![0; 4]), (IPCP_DNS1, vec![0; 4]), (IPCP_DNS2, vec![0; 4])]);
-        Self { magic, lcp, ipcp, ipcp_started: false, peer: None, up: Some(up) }
+        Self { magic, lcp, ipcp, ipcp_started: false, peer: None, up: Some(up), missed: 0, echo_id: 0 }
     }
 
     fn handle(&mut self, payload: &[u8]) -> Vec<Action> {
@@ -189,6 +212,7 @@ impl Ppp {
         match proto {
             IP if self.up.is_none() => out.push(Action::Deliver(body.to_vec())),
             LCP => {
+                self.missed = 0;
                 if let Some((code, id, data)) = parse_cp(body) {
                     self.lcp_packet(code, id, data, &mut out);
                 }

@@ -1,7 +1,7 @@
 //! Gateway Fortinet falso em loopback, com TLS de certificado gerado no teste.
 //! Implementa `/remote/info`, `logincheck` por senha (com segundo passo de OTP ou push), o fim do SAML
 //! (`saml/auth_id` e o `logincheck` vazio), `fortisslvpn_xml`, `sslvpn-tunnel` com o lado servidor do PPP
-//! (LCP, IPCP e echo) e `logout`. Modos novos (túnel morto) entram como campos em `GatewayOptions`.
+//! (LCP, IPCP e echo) e `logout`. Modos novos entram como campos em `GatewayOptions`.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_rustls::rustls::crypto::ring;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -81,6 +81,10 @@ pub struct GatewayOptions {
     pub saml_cookie_on_logincheck: bool,
     /// `remoteauthtimeout` do `/remote/info`, em segundos; None manda 120, o do gateway testado.
     pub remoteauthtimeout: Option<u64>,
+    /// Ignora os Echo-Request do cliente, como um gateway que sumiu sem fechar o TLS.
+    pub mute_echo: bool,
+    /// `auth-timeout` do XML, em segundos; None manda `AUTH_TIMEOUT`.
+    pub auth_timeout: Option<u64>,
 }
 
 struct Shared {
@@ -88,6 +92,8 @@ struct Shared {
     sso_port: u16,
     logouts: AtomicUsize,
     echo_replies: AtomicUsize,
+    echo_requests: AtomicUsize,
+    close_tunnel: Notify,
     from_client: mpsc::UnboundedSender<Vec<u8>>,
     to_client: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
@@ -146,6 +152,8 @@ impl FakeGateway {
             sso_port,
             logouts: AtomicUsize::new(0),
             echo_replies: AtomicUsize::new(0),
+            echo_requests: AtomicUsize::new(0),
+            close_tunnel: Notify::new(),
             from_client: from_tx,
             to_client: Mutex::new(Some(to_rx)),
         });
@@ -192,6 +200,16 @@ impl FakeGateway {
 
     pub fn echo_replies(&self) -> usize {
         self.shared.echo_replies.load(Ordering::SeqCst)
+    }
+
+    /// Echo-Requests recebidos do cliente, respondidos ou não.
+    pub fn echo_requests(&self) -> usize {
+        self.shared.echo_requests.load(Ordering::SeqCst)
+    }
+
+    /// Fecha o TLS do túnel aberto (close_notify e FIN), como um gateway que encerra a conexão.
+    pub fn close_tunnel(&self) {
+        self.shared.close_tunnel.notify_one();
     }
 
     /// Manda um pacote IP ao cliente pelo túnel.
@@ -345,7 +363,7 @@ fn xml(options: &GatewayOptions) -> String {
          <client-config save-password='off' keep-alive='off' auto-connect='off'/>\
          <ipv4>{}<dns-suffix str='{}'/><assigned-addr ipv4='10.212.134.200'/>{}</ipv4>\
          <idle-timeout val='3600'/><auth-timeout val='{}'/></sslvpn-tunnel>",
-        dns, DNS_SUFFIXES.join(";"), split, AUTH_TIMEOUT
+        dns, DNS_SUFFIXES.join(";"), split, options.auth_timeout.unwrap_or(AUTH_TIMEOUT)
     )
 }
 
@@ -483,6 +501,10 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
                 let _ = wr.write_all(&ppp_frame(IP, 0, 0, &p)).await;
                 continue;
             }
+            _ = shared.close_tunnel.notified() => {
+                let _ = wr.shutdown().await;
+                break;
+            }
         };
         assert_eq!(ppp[..2], ADDRESS_CONTROL, "client frames carry address and control");
         let proto = u16::from_be_bytes([ppp[2], ppp[3]]);
@@ -498,6 +520,12 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
             (LCP, CONFIGURE_ACK) => {
                 lcp_open = true;
                 reply.push(ppp_frame(IPCP, CONFIGURE_REQUEST, 1, &option(IPCP_IP_ADDRESS, &PEER_IP.octets())));
+            }
+            (LCP, ECHO_REQUEST) => {
+                shared.echo_requests.fetch_add(1, Ordering::SeqCst);
+                if !shared.options.mute_echo {
+                    reply.push(ppp_frame(LCP, ECHO_REPLY, id, &GATEWAY_MAGIC));
+                }
             }
             (LCP, ECHO_REPLY) => {
                 shared.echo_replies.fetch_add(1, Ordering::SeqCst);
