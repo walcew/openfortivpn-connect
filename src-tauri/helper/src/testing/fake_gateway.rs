@@ -93,6 +93,8 @@ struct Shared {
     logouts: AtomicUsize,
     echo_replies: AtomicUsize,
     echo_requests: AtomicUsize,
+    /// `realm` de cada `logincheck` por senha, na ordem em que chegaram.
+    realms: Mutex<Vec<String>>,
     close_tunnel: Notify,
     stop_reading: Notify,
     terminate: Notify,
@@ -155,6 +157,7 @@ impl FakeGateway {
             logouts: AtomicUsize::new(0),
             echo_replies: AtomicUsize::new(0),
             echo_requests: AtomicUsize::new(0),
+            realms: Mutex::new(Vec::new()),
             close_tunnel: Notify::new(),
             stop_reading: Notify::new(),
             terminate: Notify::new(),
@@ -209,6 +212,11 @@ impl FakeGateway {
     /// Echo-Requests recebidos do cliente, respondidos ou não.
     pub fn echo_requests(&self) -> usize {
         self.shared.echo_requests.load(Ordering::SeqCst)
+    }
+
+    /// Realms recebidos no primeiro passo do login por senha.
+    pub fn realms(&self) -> Vec<String> {
+        self.shared.realms.lock().unwrap().clone()
     }
 
     /// Fecha o TLS do túnel aberto (close_notify e FIN), como um gateway que encerra a conexão.
@@ -307,9 +315,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
             };
             if token_mode && echoed && approved { granted } else { denied }
         } else {
+            shared.realms.lock().unwrap().push(field("realm").unwrap_or("<missing>").to_string());
             let ok = field("username") == Some(USERNAME)
                 && field("credential") == Some(PASSWORD)
-                && field("realm") == Some("")
                 && field("just_logged_in") == Some("1")
                 && field("redir") == Some("/remote/index")
                 && field("ajax") == Some("1");
