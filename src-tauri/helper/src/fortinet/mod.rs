@@ -3,6 +3,7 @@
 
 mod http;
 mod ppp;
+mod saml;
 mod xml;
 
 pub use http::CertTrust;
@@ -33,12 +34,20 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Valores do pedido de token que o segundo passo do login devolve ao gateway.
 const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
+/// Nosso prazo do login SAML, o mesmo do fluxo interno do FortiClient; vale o menor entre ele e o `remoteauthtimeout`.
+const SAML_TIMEOUT: Duration = Duration::from_secs(300);
+// shortcut: sem `sso_port` no `/remote/info` usa 8020, a porta do gateway testado; trocar por erro se aparecer gateway com outra porta e sem o campo.
+const DEFAULT_SSO_PORT: u16 = 8020;
+/// Passo comum do FortiClient depois do SAML: `logincheck` sem credencial.
+const SAML_LOGINCHECK: &str = "username=&credential=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1";
 
 /// Métodos de autenticação que o Engine já fala.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Auth {
     Password,
+    /// Navegador externo; sem username nem senha.
+    Saml,
 }
 
 /// O Profile como chega no `connect`. Só o que o Engine usa; o resto é ignorado.
@@ -47,8 +56,9 @@ pub struct Profile {
     pub id: String,
     pub host: String,
     pub port: u16,
-    #[allow(dead_code)] // só existe Password; o match entra com o segundo método
     pub auth: Auth,
+    /// Vazio no SAML.
+    #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub trusted_certs: Vec<String>,
@@ -76,6 +86,12 @@ pub struct Challenge {
 pub enum Login {
     Cookie(String),
     Challenge(Challenge),
+}
+
+/// Número de um atributo `nome='valor'` (ou com aspas duplas) no corpo do `/remote/info`.
+fn info_number(body: &str, name: &str) -> Option<u64> {
+    let rest = body.split(&format!("{}=", name)).nth(1)?.trim_start_matches(['\'', '"']);
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok().filter(|n| *n > 0)
 }
 
 /// Pares `chave=valor` do corpo do `logincheck`, separados por vírgula.
@@ -175,7 +191,7 @@ impl Gateway {
         if self.port == 443 { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
     }
 
-    /// `host` vai no cabeçalho `Host`: o do gateway, ou `sslvpn` nos passos do túnel.
+    /// `cookie` é o valor inteiro do cabeçalho `Cookie`. `host` vai no cabeçalho `Host`: o do gateway, ou `sslvpn` nos passos do túnel.
     async fn request(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
         tokio::time::timeout(STEP_TIMEOUT, self.exchange(method, path, host, cookie, form))
             .await
@@ -186,7 +202,7 @@ impl Gateway {
     async fn exchange(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
         let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path, host);
         if let Some(c) = cookie {
-            req.push_str(&format!("Cookie: SVPNCOOKIE={}\r\n", c));
+            req.push_str(&format!("Cookie: {}\r\n", c));
         }
         if let Some(body) = form {
             req.push_str(&format!(
@@ -254,9 +270,38 @@ impl Gateway {
         }
     }
 
+    /// Login SAML pelo navegador externo. `waiting` recebe a URL que a GUI abre no navegador,
+    /// depois que o listener local já está de pé.
+    pub async fn saml_login(&self, waiting: impl FnOnce(String)) -> Result<String, String> {
+        let host = self.host_header();
+        let info = self.request("GET", "/remote/info", &host, None, None).await?;
+        let info = String::from_utf8_lossy(&info.body);
+        let port = info_number(&info, "sso_port").and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_SSO_PORT);
+        let timeout = info_number(&info, "remoteauthtimeout").map_or(SAML_TIMEOUT, |s| SAML_TIMEOUT.min(Duration::from_secs(s)));
+
+        let listener = saml::listen(port).await?;
+        waiting(format!("https://{}/remote/saml/start?redirect=1", host));
+        let id = tokio::time::timeout(timeout, saml::wait_for_id(listener))
+            .await
+            .map_err(|_| format!("SAML login timed out after {} s", timeout.as_secs()))??;
+
+        let resp = self.request("GET", &format!("/remote/saml/auth_id?id={}", id), &host, None, None).await?;
+        if let Some(c) = resp.cookie("SVPNCOOKIE").filter(|c| !c.is_empty()) {
+            return Ok(c);
+        }
+        // Sem o cookie no `auth_id`, o passo comum do FortiClient, levando os cookies que o `auth_id` deixou (**inf**).
+        let cookies = resp.cookies();
+        let resp = self
+            .request("POST", "/remote/logincheck", &host, Some(&cookies).filter(|c| !c.is_empty()).map(String::as_str), Some(SAML_LOGINCHECK))
+            .await?;
+        resp.cookie("SVPNCOOKIE")
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| "SAML login failed: the gateway returned no session cookie".into())
+    }
+
     /// Lê a config do túnel, abre o `sslvpn-tunnel` e negocia o PPP até o IPCP subir.
     pub async fn open_tunnel(&self, cookie: &str) -> Result<(TunnelConfig, Packets, Tunnel), String> {
-        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(cookie), None).await?;
+        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(&format!("SVPNCOOKIE={}", cookie)), None).await?;
         if resp.status != 200 {
             return Err(format!("Gateway refused the tunnel configuration (HTTP {})", resp.status));
         }
@@ -295,6 +340,6 @@ impl Gateway {
     }
 
     pub async fn logout(&self, cookie: &str) -> Result<(), String> {
-        self.request("GET", "/remote/logout", &self.host_header(), Some(cookie), None).await.map(|_| ())
+        self.request("GET", "/remote/logout", &self.host_header(), Some(&format!("SVPNCOOKIE={}", cookie)), None).await.map(|_| ())
     }
 }

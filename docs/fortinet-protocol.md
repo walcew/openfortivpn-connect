@@ -1,6 +1,6 @@
 # Protocolo Fortinet SSL VPN no Engine
 
-O que o Engine Fortinet do Helper (`src-tauri/helper/src/fortinet/`) implementa hoje: login por senha com OTP e FortiToken push, configuração do túnel, túnel TLS com PPP e logout. Escrito do zero a partir do comportamento observado do FortiClient (doc de engenharia reversa do `vpn-client`, seções 4 e 5), das RFCs do PPP (1661 e 1332, DNS na 1877) e do comportamento público de clientes de terceiros. Nenhum código de openfortivpn ou openconnect foi copiado ou traduzido.
+O que o Engine Fortinet do Helper (`src-tauri/helper/src/fortinet/`) implementa hoje: login por senha com OTP e FortiToken push, login SAML pelo navegador externo, configuração do túnel, túnel TLS com PPP e logout. Escrito do zero a partir do comportamento observado do FortiClient (doc de engenharia reversa do `vpn-client`, seções 4 e 5), das RFCs do PPP (1661 e 1332, DNS na 1877) e do comportamento público de clientes de terceiros. Nenhum código de openfortivpn ou openconnect foi copiado ou traduzido.
 
 Marcas: **obs** = visto no FortiClient ou no gateway real; **rfc** = padrão PPP; **inf** = inferência, ainda sem prova contra o gateway real.
 
@@ -37,6 +37,22 @@ ret=2,tokeninfo=<tipo>,chal_msg=<texto>,reqid=..,polid=..,grp=..,portal=..,peer=
 - Cancelar durante `waiting-push` não faz logout: o Engine ainda não tem cookie. Se o usuário aprovar o push depois de cancelar, a sessão fica aberta no gateway até expirar.
 - Sucesso é o mesmo `Set-Cookie: SVPNCOOKIE` não vazio. Sem cookie, o código errado ou expirado e o push recusado ou expirado viram `disconnected` com `reason`. OTP enviado a um gateway que não pede token é ignorado.
 - O OTP só trafega no corpo do `connect` (socket) e no corpo do `POST` (TLS); nunca em argv nem em log.
+
+### SAML pelo navegador externo
+
+O fluxo externo do FortiClient (doc de engenharia reversa, seção 4), com o Profile `auth: "saml"`, sem username nem senha:
+
+1. `GET /remote/info` com o host do gateway. O Engine lê os atributos `sso_port='<n>'` e `remoteauthtimeout='<s>'` do corpo, com aspas simples ou duplas (**obs**: `remoteauthtimeout='120' sso_port='8020'`; o resto do formato do corpo não importa). O prazo do login é o menor entre 300 s (nosso) e o `remoteauthtimeout` (**obs**). Sem `sso_port`, usa 8020, a do gateway testado; sem `remoteauthtimeout`, os 300 s.
+2. Escuta em `127.0.0.1:<sso_port>`, nunca em `0.0.0.0`. Porta ocupada (o próprio FortiClient usa a 8020) vira `disconnected` com "Local SSO port <n> is already in use; close the app using it (e.g. FortiClient) and try again".
+3. Emite o estado `waiting-saml` com `url` = `https://<host>[:<porta>]/remote/saml/start?redirect=1` (porta omitida quando é 443). A GUI abre a URL no navegador padrão, porque o Helper roda como root (**obs**: a URL é a do FortiClient).
+4. O navegador chega ao listener com `GET /?id=<id>`. Conexões sem `?id=` (o navegador abre de 2 a 5 vazias antes da real, **obs**) ou que não mandam o cabeçalho em 10 s são ignoradas. O `id` é o texto entre `?id=` e o primeiro espaço ou `&`; só vale com 1 a 1024 caracteres entre letras, dígitos e `-_.~%` (**inf**: o formato real do `id` não foi visto). Válido, a resposta é `HTTP/1.1 200 OK` com uma página dizendo que a aba pode ser fechada; inválido, `400` e `disconnected` com "invalid SAML id". O listener fecha nos dois casos.
+5. `GET /remote/saml/auth_id?id=<id>`. Se a resposta trouxer `Set-Cookie: SVPNCOOKIE=<valor>` não vazio, o login acabou. **inf**: é onde o openfortivpn lê o cookie; onde o cookie aparece é a pergunta aberta nº 1 da spec, a confirmar contra o gateway real.
+6. Sem o cookie ali, o passo comum do FortiClient (**obs**): `POST /remote/logincheck` com `username=&credential=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1`, levando no `Cookie` os cookies com valor que o `auth_id` deixou (**inf**: o FortiClient usa o pote de cookies do WinINet, então que o gateway amarre a sessão por cookie do `auth_id` é inferência). Sem `SVPNCOOKIE` também aqui, `disconnected` com "the gateway returned no session cookie".
+7. Daí em diante o fluxo é o mesmo da senha (seções 2 a 4).
+
+- Passado o prazo sem o `id`, `disconnected` com "SAML login timed out after <s> s".
+- O comando `cancel` (ou `disconnect`) durante a espera fecha o listener e volta a `disconnected` sem `reason`. Não há logout: ainda não existe cookie.
+- O cookie fica no Helper: não vai em evento, log nem resposta. O `id` também não vai para o log.
 
 ## 2. Configuração do túnel
 
@@ -91,4 +107,4 @@ DNS do XML tem prioridade; os do IPCP só valem se o XML não trouxer nenhum (**
 
 ## O que ainda não está aqui
 
-`/remote/info`, SAML, LCP echo do cliente para detectar túnel morto, aviso e teardown na expiração, DTLS, `tun`/`websocket` e IPv6.
+SAML embutido (sem `redirect`), LCP echo do cliente para detectar túnel morto, aviso e teardown na expiração, DTLS, `tun`/`websocket` e IPv6.
