@@ -73,8 +73,9 @@ pub struct Applied {
 }
 
 /// Aplica a config, marcando em `applied` cada passo que deu certo. Em erro (ou pânico),
-/// o chamador faz `teardown` para desfazer o que entrou.
-pub fn apply(os: &dyn Os, config: &TunnelConfig, packets: Packets, applied: &Mutex<Applied>) -> Result<(), String> {
+/// o chamador faz `teardown` para desfazer o que entrou. A falha do DNS não é fatal, como no
+/// v1: o túnel sobe sem DNS e `Ok(Some(aviso))` diz por quê.
+pub fn apply(os: &dyn Os, config: &TunnelConfig, packets: Packets, applied: &Mutex<Applied>) -> Result<Option<String>, String> {
     // O /32 entra antes das rotas do túnel para o gateway nunca ser roteado por dentro dele.
     os.add_gateway_route(config.gateway)?;
     applied.lock().unwrap().gateway_route = Some(config.gateway);
@@ -84,10 +85,12 @@ pub fn apply(os: &dyn Os, config: &TunnelConfig, packets: Packets, applied: &Mut
         os.add_route(route)?;
     }
     if !config.dns_servers.is_empty() {
-        os.set_dns(&config.dns_servers, &config.dns_suffixes)?;
-        applied.lock().unwrap().dns = true;
+        match os.set_dns(&config.dns_servers, &config.dns_suffixes) {
+            Ok(()) => applied.lock().unwrap().dns = true,
+            Err(e) => return Ok(Some(format!("DNS setup failed, tunnel stays up without DNS: {}", e))),
+        }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Rotas pelo túnel. Uma default (máscara 0) vinda do gateway vira as duas metades,

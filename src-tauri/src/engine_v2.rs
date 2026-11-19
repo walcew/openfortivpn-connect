@@ -44,7 +44,7 @@ pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
 
 /// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. O OTP já vem
 /// normalizado por `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo
-/// push, o Helper pede o push.
+/// push, o Helper pede o push. O realm do Profile fica fora do contrato.
 /// `dns_fallback_servers` é o DNS do sistema lido antes de conectar (vazio com o fallback
 /// desligado); o Helper o usa, com os do Google, só se o gateway não mandar DNS.
 fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
@@ -59,7 +59,6 @@ fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Op
             "username": username,
             "trusted_certs": profile.trusted_certs,
             "ignore_cert_errors": profile.ignore_cert_errors,
-            // shortcut: o realm do Profile segue fora do contrato; entra quando o Engine o usar no login
             "dns_match_domains": profile.dns_match_domains,
             "dns_fallback_servers": dns_fallback_servers,
         },
