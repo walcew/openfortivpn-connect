@@ -41,38 +41,34 @@ pub fn socket_path() -> &'static Path {
     Path::new(SOCKET_PATH)
 }
 
-/// Recusa o que o Engine ainda não suporta, antes de qualquer tentativa.
-// shortcut: só senha (com OTP ou push), SAML evolui no ticket #15
-pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
-    if profile.auth_type == AuthType::Saml {
-        return Err("SAML authentication is not supported yet by the v2 engine".into());
-    }
-    Ok(())
-}
-
-/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. O OTP já vem
-/// normalizado por `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo
-/// push, o Helper pede o push. O realm do Profile fica fora do contrato.
+/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. `creds` (usuário e
+/// senha) é `Some` na auth por senha e `None` no SAML. O OTP já vem normalizado por
+/// `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo push, o Helper pede o push.
+/// O realm do Profile fica fora do contrato.
 /// `dns_fallback_servers` é o DNS do sistema lido antes de conectar (vazio com o fallback
 /// desligado); o Helper o usa, com os do Google, só se o gateway não mandar DNS.
-fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
-    json!({
+fn connect_request(profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
+    let mut req = json!({
         "v": 2,
         "cmd": "connect",
         "profile": {
             "id": profile.id,
             "host": profile.host,
             "port": profile.port,
-            "auth": "password",
-            "username": username,
+            "auth": "saml",
             "trusted_certs": profile.trusted_certs,
             "ignore_cert_errors": profile.ignore_cert_errors,
             "dns_match_domains": profile.dns_match_domains,
             "dns_fallback_servers": dns_fallback_servers,
         },
-        "password": password,
         "otp": otp,
-    })
+    });
+    if let Some((username, password)) = creds {
+        req["profile"]["auth"] = json!("password");
+        req["profile"]["username"] = json!(username);
+        req["password"] = json!(password);
+    }
+    req
 }
 
 fn open(path: &Path) -> Result<UnixStream, String> {
@@ -111,8 +107,13 @@ fn request(path: &Path, cmd: &Value) -> Result<Value, String> {
     Err("Helper closed the connection without a response".into())
 }
 
-pub fn connect(path: &Path, profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>, dns_fallback_servers: &[String]) -> Result<(), String> {
-    request(path, &connect_request(profile, username, password, otp, dns_fallback_servers)).map(|_| ())
+pub fn connect(path: &Path, profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Option<&str>, dns_fallback_servers: &[String]) -> Result<(), String> {
+    request(path, &connect_request(profile, creds, otp, dns_fallback_servers)).map(|_| ())
+}
+
+/// Cancela um login pendente (SAML ou push); sem login pendente o Helper não faz nada.
+pub fn cancel(path: &Path) -> Result<(), String> {
+    request(path, &json!({"v": 2, "cmd": "cancel"})).map(|_| ())
 }
 
 pub fn disconnect(path: &Path) -> Result<(), String> {
@@ -141,6 +142,7 @@ fn parse_state(v: &Value) -> Option<ConnectionState> {
             None => ConnectionState::Disconnected,
         },
         "connecting" => ConnectionState::Connecting { profile_id: text("profile_id") },
+        "waiting-saml" => ConnectionState::WaitingSaml { profile_id: text("profile_id"), url: text("url") },
         "waiting-push" => ConnectionState::WaitingPush { profile_id: text("profile_id") },
         "connected" => ConnectionState::Connected {
             profile_id: text("profile_id"),
@@ -267,6 +269,16 @@ fn bandwidth_update(prev: &mut Option<Sample>, incoming: &Incoming, now: Instant
     })
 }
 
+/// URL do SAML a abrir no navegador: só na transição `connecting` -> `waiting-saml`, para
+/// que o estado inicial de uma reconexão do canal não reabra a aba. Lê o mesmo `connecting`
+/// do `cert_warning`, antes dele.
+fn saml_url(connecting: &Option<String>, state: &ConnectionState) -> Option<String> {
+    match state {
+        ConnectionState::WaitingSaml { url, .. } if connecting.is_some() => Some(url.clone()),
+        _ => None,
+    }
+}
+
 /// Liga o canal de eventos ao manager, aos eventos do Tauri e à tray.
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
@@ -278,6 +290,10 @@ pub fn start(app: AppHandle) {
             }
             match incoming {
                 Incoming::State { state, cert_digest } => {
+                    // Mesmo evento do caminho do openfortivpn: o front abre a URL no navegador padrão.
+                    if let Some(url) = saml_url(&connecting, &state) {
+                        let _ = app.emit("saml-url", json!({"url": url}));
+                    }
                     // Mesmo diálogo "Trust & Reconnect" do caminho do openfortivpn.
                     if let Some(payload) = cert_warning(&mut connecting, &state, cert_digest.as_deref()) {
                         let _ = app.emit("cert-warning", payload);
@@ -367,7 +383,7 @@ mod tests {
     #[test]
     fn connect_sends_the_contract_json_with_credentials_in_the_body() {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
-        connect(&path, &password_profile(), "alice", "s3cret", None, &["192.168.0.1".to_string()]).unwrap();
+        connect(&path, &password_profile(), Some(("alice", "s3cret")), None, &["192.168.0.1".to_string()]).unwrap();
         assert_eq!(
             rx.recv().unwrap(),
             json!({
@@ -465,7 +481,7 @@ mod tests {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
         let mut profile = password_profile();
         profile.otp_required = true;
-        connect(&path, &profile, "alice", "s3cret", Some("123456"), &[]).unwrap();
+        connect(&path, &profile, Some(("alice", "s3cret")), Some("123456"), &[]).unwrap();
         assert_eq!(rx.recv().unwrap()["otp"], "123456");
     }
 
@@ -578,12 +594,50 @@ mod tests {
     }
 
     #[test]
-    fn saml_is_not_supported_yet_but_otp_is() {
-        let mut p = password_profile();
-        assert!(check_supported(&p).is_ok());
-        p.otp_required = true;
-        assert!(check_supported(&p).is_ok());
-        p.auth_type = AuthType::Saml;
-        assert!(check_supported(&p).unwrap_err().contains("not supported yet"));
+    fn saml_connect_sends_no_username_or_password() {
+        let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
+        let profile = VpnProfile { auth_type: AuthType::Saml, username: None, ..password_profile() };
+        connect(&path, &profile, None, None, &[]).unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            json!({
+                "v": 2, "cmd": "connect",
+                "profile": {
+                    "id": "p1", "host": "vpn.example.com", "port": 443, "auth": "saml",
+                    "trusted_certs": ["abc"], "ignore_cert_errors": false,
+                    "dns_match_domains": ["corp.example.com"], "dns_fallback_servers": []
+                },
+                "otp": null
+            })
+        );
+    }
+
+    #[test]
+    fn cancel_sends_the_contract_json() {
+        let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
+        cancel(&path).unwrap();
+        assert_eq!(rx.recv().unwrap(), json!({"v": 2, "cmd": "cancel"}));
+    }
+
+    #[test]
+    fn waiting_saml_becomes_waiting_saml_with_the_url() {
+        let frame = event(json!({"event": "state", "state": "waiting-saml", "profile_id": "p1", "url": "https://vpn/remote/saml/start?redirect=1"}));
+        assert!(matches!(
+            parse_frame(&frame),
+            Some(Incoming::State { state: ConnectionState::WaitingSaml { profile_id, url }, .. })
+                if profile_id == "p1" && url == "https://vpn/remote/saml/start?redirect=1"
+        ));
+    }
+
+    #[test]
+    fn saml_url_opens_only_on_the_transition_from_connecting() {
+        let waiting = ConnectionState::WaitingSaml { profile_id: "p1".into(), url: "https://vpn/x".into() };
+        let mut pending = None;
+        // Estado inicial de uma reconexão do canal, sem connecting antes: não reabre.
+        assert!(saml_url(&pending, &waiting).is_none());
+        cert_warning(&mut pending, &connecting("p1"), None);
+        assert_eq!(saml_url(&pending, &waiting).as_deref(), Some("https://vpn/x"));
+        cert_warning(&mut pending, &waiting, None);
+        assert!(saml_url(&pending, &waiting).is_none());
     }
 }
