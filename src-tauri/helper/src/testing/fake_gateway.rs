@@ -70,6 +70,8 @@ pub struct GatewayOptions {
     pub incomplete_challenge: bool,
     /// Acrescenta uma rota `0.0.0.0/0.0.0.0` ao split tunnel.
     pub default_route_in_split: bool,
+    /// Nenhum servidor DNS, nem no XML nem no IPCP.
+    pub no_dns: bool,
 }
 
 struct Shared {
@@ -289,15 +291,16 @@ fn xml(options: &GatewayOptions) -> String {
         }
         format!("<split-tunnel-info>{}</split-tunnel-info>", addrs)
     };
+    let dns = if options.no_dns { String::new() } else { format!("<dns ip='{}'/><dns ip='{}'/>", XML_DNS[0], XML_DNS[1]) };
     format!(
         "<?xml version='1.0' encoding='utf-8'?>\n<sslvpn-tunnel ver='2' dtls='1' patch='1'>\
          <dtls-config heartbeat-interval='10' heartbeat-fail-count='10' heartbeat-idle-timeout='10' client-hello-timeout='10'/>\
          <tunnel-method value='ppp'/><tunnel-method value='tun'/>\
          <auth-ses check-src-ip='1' tun-connect-without-reauth='0' tun-user-ses-timeout='30'/>\
          <client-config save-password='off' keep-alive='off' auto-connect='off'/>\
-         <ipv4><dns ip='{}'/><dns ip='{}'/><dns-suffix str='{}'/><assigned-addr ipv4='10.212.134.200'/>{}</ipv4>\
+         <ipv4>{}<dns-suffix str='{}'/><assigned-addr ipv4='10.212.134.200'/>{}</ipv4>\
          <idle-timeout val='3600'/><auth-timeout val='{}'/></sslvpn-tunnel>",
-        XML_DNS[0], XML_DNS[1], DNS_SUFFIXES.join(";"), split, AUTH_TIMEOUT
+        dns, DNS_SUFFIXES.join(";"), split, AUTH_TIMEOUT
     )
 }
 
@@ -419,10 +422,11 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
     });
     let mut to_client = shared.to_client.lock().unwrap().take().expect("one tunnel at a time");
 
+    let ipcp_dns = if shared.options.no_dns { Ipv4Addr::UNSPECIFIED } else { IPCP_DNS };
     let assigned: Vec<(u8, Vec<u8>)> = vec![
         (IPCP_IP_ADDRESS, ASSIGNED_IP.octets().to_vec()),
-        (IPCP_PRIMARY_DNS, IPCP_DNS.octets().to_vec()),
-        (IPCP_SECONDARY_DNS, IPCP_DNS.octets().to_vec()),
+        (IPCP_PRIMARY_DNS, ipcp_dns.octets().to_vec()),
+        (IPCP_SECONDARY_DNS, ipcp_dns.octets().to_vec()),
     ];
     let (mut lcp_open, mut ipcp_ours, mut ipcp_theirs, mut echo_sent) = (false, false, false, false);
     let _ = wr.write_all(&ppp_frame(LCP, CONFIGURE_REQUEST, 1, &option(LCP_MAGIC_NUMBER, &GATEWAY_MAGIC))).await;

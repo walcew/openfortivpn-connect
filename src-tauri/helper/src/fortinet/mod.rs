@@ -10,6 +10,7 @@ pub use http::CertTrust;
 /// Emite uma linha como evento de log da sessão.
 pub type LogFn = Arc<dyn Fn(String) + Send + Sync>;
 
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,6 +59,10 @@ pub struct Profile {
     /// dos sufixos do gateway. Vazio mantém os sufixos do gateway.
     #[serde(default)]
     pub dns_match_domains: Vec<String>,
+    /// DNS do sistema lido pela GUI antes de conectar (vazio com o fallback desligado ou
+    /// sem DNS no sistema). Só valem, com os do Google, se o gateway não mandar servidor.
+    #[serde(default)]
+    pub dns_fallback_servers: Vec<Ipv4Addr>,
 }
 
 /// O gateway pediu o segundo fator (OTP ou push) no primeiro passo do login.

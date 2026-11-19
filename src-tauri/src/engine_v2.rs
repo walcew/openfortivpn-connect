@@ -45,7 +45,9 @@ pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
 /// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. O OTP já vem
 /// normalizado por `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo
 /// push, o Helper pede o push.
-fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>) -> Value {
+/// `dns_fallback_servers` é o DNS do sistema lido antes de conectar (vazio com o fallback
+/// desligado); o Helper o usa, com os do Google, só se o gateway não mandar DNS.
+fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
     json!({
         "v": 2,
         "cmd": "connect",
@@ -59,6 +61,7 @@ fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Op
             "ignore_cert_errors": profile.ignore_cert_errors,
             // shortcut: o realm do Profile segue fora do contrato; entra quando o Engine o usar no login
             "dns_match_domains": profile.dns_match_domains,
+            "dns_fallback_servers": dns_fallback_servers,
         },
         "password": password,
         "otp": otp,
@@ -101,8 +104,8 @@ fn request(path: &Path, cmd: &Value) -> Result<Value, String> {
     Err("Helper closed the connection without a response".into())
 }
 
-pub fn connect(path: &Path, profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>) -> Result<(), String> {
-    request(path, &connect_request(profile, username, password, otp)).map(|_| ())
+pub fn connect(path: &Path, profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>, dns_fallback_servers: &[String]) -> Result<(), String> {
+    request(path, &connect_request(profile, username, password, otp, dns_fallback_servers)).map(|_| ())
 }
 
 pub fn disconnect(path: &Path) -> Result<(), String> {
@@ -310,7 +313,7 @@ mod tests {
     #[test]
     fn connect_sends_the_contract_json_with_credentials_in_the_body() {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
-        connect(&path, &password_profile(), "alice", "s3cret", None).unwrap();
+        connect(&path, &password_profile(), "alice", "s3cret", None, &["192.168.0.1".to_string()]).unwrap();
         assert_eq!(
             rx.recv().unwrap(),
             json!({
@@ -318,7 +321,7 @@ mod tests {
                 "profile": {
                     "id": "p1", "host": "vpn.example.com", "port": 443, "auth": "password",
                     "username": "alice", "trusted_certs": ["abc"], "ignore_cert_errors": false,
-                    "dns_match_domains": ["corp.example.com"]
+                    "dns_match_domains": ["corp.example.com"], "dns_fallback_servers": ["192.168.0.1"]
                 },
                 "password": "s3cret", "otp": null
             })
@@ -373,7 +376,7 @@ mod tests {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
         let mut profile = password_profile();
         profile.otp_required = true;
-        connect(&path, &profile, "alice", "s3cret", Some("123456")).unwrap();
+        connect(&path, &profile, "alice", "s3cret", Some("123456"), &[]).unwrap();
         assert_eq!(rx.recv().unwrap()["otp"], "123456");
     }
 

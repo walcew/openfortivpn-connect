@@ -90,8 +90,8 @@ impl VpnManager {
     ) -> Result<(), String> {
         #[cfg(feature = "engine-v2")]
         {
-            let _ = (debug_mode, dns_fallback);
-            self.connect_v2(profile_id, &app_handle, otp.as_deref())
+            let _ = debug_mode;
+            self.connect_v2(profile_id, &app_handle, dns_fallback, otp.as_deref())
         }
         #[cfg(not(feature = "engine-v2"))]
         self.connect_v1(profile_id, app_handle, debug_mode, dns_fallback, otp)
@@ -100,7 +100,7 @@ impl VpnManager {
     /// Conecta pelo Engine do Helper (protocolo v2). O progresso e o resultado
     /// chegam depois por eventos de estado.
     #[cfg(feature = "engine-v2")]
-    fn connect_v2(&mut self, profile_id: &str, app_handle: &AppHandle, otp: Option<&str>) -> Result<(), String> {
+    fn connect_v2(&mut self, profile_id: &str, app_handle: &AppHandle, dns_fallback: bool, otp: Option<&str>) -> Result<(), String> {
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
             _ => return Err("Already connecting or connected".to_string()),
@@ -112,6 +112,8 @@ impl VpnManager {
         crate::engine_v2::check_supported(&profile)?;
         check_otp_provided(&profile, otp)?;
         let otp = profile.otp_to_send(otp);
+        // Como no v1: o DNS do sistema é lido antes de a VPN mexer na rede.
+        let fallback_dns = if dns_fallback { crate::dns_manager::get_current_dns_servers() } else { Vec::new() };
 
         let result = Self::resolve_password_creds(&profile).and_then(|(username, password)| {
             self.set_state(
@@ -124,6 +126,7 @@ impl VpnManager {
                 &username,
                 &password,
                 otp,
+                &fallback_dns,
             )
         });
         if let Err(e) = &result {

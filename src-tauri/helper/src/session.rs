@@ -10,6 +10,7 @@ use crate::fortinet::{CertTrust, Gateway, LogFn, Login, Profile};
 use crate::net::{self, Os};
 
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
+const GOOGLE_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +206,15 @@ impl Session {
             }
         };
 
+        // Regra do v1: o fallback (DNS do sistema + Google) só entra sem DNS do gateway, para
+        // resolvedores públicos não pegarem nomes internos do split DNS.
+        if config.dns_servers.is_empty() && !profile.dns_fallback_servers.is_empty() {
+            for s in profile.dns_fallback_servers.iter().chain(&GOOGLE_DNS) {
+                if !config.dns_servers.contains(s) {
+                    config.dns_servers.push(*s);
+                }
+            }
+        }
         if !profile.dns_match_domains.is_empty() {
             config.dns_suffixes = profile.dns_match_domains.clone();
         }
@@ -585,6 +595,44 @@ mod tests {
         disconnect(&mut c).await;
         assert!(os.calls().contains(&OsCall::RemoveDns));
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+    }
+
+    async fn connect_without_gateway_dns(fallback: Value) -> std::sync::Arc<FakeOs> {
+        let gw = FakeGateway::start(GatewayOptions { no_dns: true, ..Default::default() }).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let mut cmd = connect_cmd(&gw, PASSWORD);
+        cmd["profile"]["dns_fallback_servers"] = fallback;
+        c.send(cmd).await;
+        loop {
+            if c.recv_skipping_logs().await["state"] == "connected" {
+                return os;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_dns_is_used_only_when_the_gateway_sends_none() {
+        let os = connect_without_gateway_dns(json!(["192.168.0.1", "8.8.8.8"])).await;
+        let servers = ["192.168.0.1", "8.8.8.8", "8.8.4.4"].map(|s| s.parse().unwrap()).to_vec();
+        assert!(os.calls().contains(&OsCall::SetDns { servers, suffixes: DNS_SUFFIXES.map(String::from).to_vec() }));
+    }
+
+    #[tokio::test]
+    async fn no_fallback_servers_means_no_dns_applied() {
+        let os = connect_without_gateway_dns(json!([])).await;
+        assert!(!os.calls().iter().any(|c| matches!(c, OsCall::SetDns { .. })), "{:?}", os.calls());
+    }
+
+    #[tokio::test]
+    async fn fallback_dns_does_not_mix_with_the_gateway_dns() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let mut cmd = connect_cmd(&gw, PASSWORD);
+        cmd["profile"]["dns_fallback_servers"] = json!(["192.168.0.1"]);
+        assert_eq!(connect_logging(&mut c, cmd).await.0["state"], "connected");
+        assert!(os.calls().contains(&OsCall::SetDns { servers: XML_DNS.to_vec(), suffixes: DNS_SUFFIXES.map(String::from).to_vec() }));
     }
 
     #[tokio::test]
