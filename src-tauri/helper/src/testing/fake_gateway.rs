@@ -143,15 +143,19 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
 
     let response = if request_line.starts_with("POST /remote/logincheck ") {
         let form = parse_form(&body);
-        let ok = form.iter().any(|(k, v)| k == "username" && v == USERNAME)
-            && form.iter().any(|(k, v)| k == "credential" && v == PASSWORD)
-            && form.iter().any(|(k, v)| k == "realm" && v.is_empty());
+        let field = |name: &str| form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+        let ok = field("username") == Some(USERNAME)
+            && field("credential") == Some(PASSWORD)
+            && field("realm") == Some("")
+            && field("just_logged_in") == Some("1")
+            && field("redir") == Some("/remote/index")
+            && field("ajax") == Some("1");
         if ok {
             http(&format!("Set-Cookie: SVPNCOOKIE={}; path=/; secure; httponly\r\n", COOKIE), "ret=1,redir=/remote/fortisslvpn_xml")
         } else {
             http("Set-Cookie: SVPNCOOKIE=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n", "ret=0,redir=/remote/login?&err=sslvpn_login_permission_denied")
         }
-    } else if request_line.starts_with("GET /remote/fortisslvpn_xml ") && has_cookie {
+    } else if request_line.starts_with("GET /remote/fortisslvpn_xml ") && has_cookie && header("host").as_deref() == Some("sslvpn") {
         http("", &xml(&shared.options))
     } else if request_line.starts_with("GET /remote/sslvpn-tunnel ") && has_cookie && header("host").as_deref() == Some("sslvpn") {
         return ppp_server(stream, shared).await;

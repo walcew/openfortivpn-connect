@@ -51,21 +51,26 @@ impl Client {
 
 /// Sobe o servidor num socket temporário (nunca em /var/run) com o fake de SO.
 pub async fn start(authorizer: Authorizer) -> (PathBuf, Arc<Session>) {
-    let (path, session, _os) = start_with_os(authorizer).await;
-    (path, session)
+    start_server(authorizer, Arc::new(FakeOs::default())).await
 }
 
-pub async fn start_with_os(authorizer: Authorizer) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
+/// Servidor sem checagem de uid com o fake de SO dado, que volta para inspeção.
+pub async fn start_with_os(os: FakeOs) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
+    let os = Arc::new(os);
+    let (path, session) = start_server(allow_all(), os.clone()).await;
+    (path, session, os)
+}
+
+async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<Session>) {
     let path = std::env::temp_dir().join(format!(
         "ovg-{}-{}.sock",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let listener = bind(&path).unwrap();
-    let os = Arc::new(FakeOs::default());
-    let session = Arc::new(Session::new(os.clone()));
+    let session = Arc::new(Session::new(os));
     tokio::spawn(serve(listener, session.clone(), authorizer));
-    (path, session, os)
+    (path, session)
 }
 
 pub async fn connect(path: &PathBuf) -> Client {

@@ -16,13 +16,28 @@ pub enum OsCall {
     Down,
 }
 
+/// Como o `add_route` do fake se comporta.
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum Failure {
+    #[default]
+    None,
+    Error,
+    Panic,
+}
+
 #[derive(Default)]
 pub struct FakeOs {
     calls: Mutex<Vec<OsCall>>,
     packets: Mutex<Option<Packets>>,
+    add_route: Failure,
 }
 
 impl FakeOs {
+    /// Fake cujo `add_route` falha (erro ou pânico) depois de registrar a chamada.
+    pub fn failing_add_route(failure: Failure) -> Self {
+        Self { add_route: failure, ..Default::default() }
+    }
+
     pub fn calls(&self) -> Vec<OsCall> {
         self.calls.lock().unwrap().clone()
     }
@@ -60,7 +75,11 @@ impl Os for FakeOs {
     }
     fn add_route(&self, route: Route) -> Result<(), String> {
         self.record(OsCall::AddRoute(route));
-        Ok(())
+        match self.add_route {
+            Failure::None => Ok(()),
+            Failure::Error => Err("fake add_route failure".into()),
+            Failure::Panic => panic!("fake add_route panic"),
+        }
     }
     fn add_gateway_route(&self, gateway: IpAddr) -> Result<(), String> {
         self.record(OsCall::AddGatewayRoute(gateway));
