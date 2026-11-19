@@ -1,15 +1,17 @@
 //! Listener local do SAML pelo navegador externo: recebe o `id` que o gateway manda o
 //! navegador entregar em `127.0.0.1:<sso_port>`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 /// Prazo de cada conexão para mandar o cabeçalho; a pré-conexão vazia do navegador cai nele.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST: usize = 8192;
+const MAX_CONNECTIONS: usize = 16;
 /// O formato do `id` é **inf**: aceita o que cabe numa query sem escape, com folga no tamanho.
 const MAX_ID: usize = 1024;
 
@@ -29,36 +31,45 @@ pub async fn listen(port: u16) -> Result<TcpListener, String> {
     })
 }
 
-/// Espera a conexão com `?id=`, responde ao navegador e devolve o `id` validado.
-/// Conexões sem `?id=` (o navegador abre algumas vazias antes da real) são ignoradas.
-/// O listener fecha quando a função volta.
+/// Espera um `GET /?id=<id>` com `id` bem formado, responde 200 ao navegador e devolve o `id`.
+/// Conexões vazias (o navegador abre algumas antes da real) são fechadas sem resposta; qualquer
+/// outro pedido recebe 400 e o listener segue escutando, para que uma página qualquer apontando
+/// para a porta não derrube o login. O listener fecha quando a função volta.
 pub async fn wait_for_id(listener: TcpListener) -> Result<String, String> {
     let (tx, mut rx) = mpsc::channel::<(TcpStream, String)>(4);
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             Ok((stream, _)) = listener.accept() => {
+                // Acima do limite a conexão nova é fechada: um processo local não esgota os fds do Helper.
+                let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(Some((stream, line))) = tokio::time::timeout(REQUEST_TIMEOUT, read_head(stream)).await {
-                        if line.contains("?id=") {
-                            let _ = tx.send((stream, line)).await;
-                        }
+                    let _slot = slot;
+                    let Ok(Some((mut stream, line))) = tokio::time::timeout(REQUEST_TIMEOUT, read_head(stream)).await else { return };
+                    match extract_id(&line) {
+                        Some(id) => { let _ = tx.send((stream, id)).await; }
+                        None => respond(&mut stream, "400 Bad Request", INVALID_PAGE).await,
                     }
                 });
             }
-            Some((mut stream, line)) = rx.recv() => {
-                let id = extract_id(&line);
-                let (status, page) = if id.is_some() { ("200 OK", DONE_PAGE) } else { ("400 Bad Request", INVALID_PAGE) };
-                let resp = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    status, page.len(), page
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
-                let _ = stream.shutdown().await;
-                return id.ok_or_else(|| "SAML login failed: invalid SAML id received from the browser".into());
+            Some((mut stream, id)) = rx.recv() => {
+                respond(&mut stream, "200 OK", DONE_PAGE).await;
+                return Ok(id);
             }
         }
     }
+}
+
+async fn respond(stream: &mut TcpStream, status: &str, page: &str) {
+    let resp = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        page.len(),
+        page
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 /// Lê o cabeçalho inteiro (fechar com dados não lidos faria o navegador ver um reset) e
@@ -77,9 +88,10 @@ async fn read_head(mut stream: TcpStream) -> Option<(TcpStream, String)> {
     Some((stream, line))
 }
 
-/// Texto entre `?id=` e o primeiro espaço (ou `&`), só com caracteres de URL sem escape especial.
+/// O `id` de uma linha `GET /?id=<id> HTTP/1.x`: até o primeiro `&`, só com caracteres de URL sem escape especial.
 fn extract_id(request_line: &str) -> Option<String> {
-    let id = request_line.split_once("?id=")?.1.split([' ', '&']).next()?;
+    let target = request_line.strip_prefix("GET ")?.split(' ').next()?;
+    let id = target.strip_prefix("/?id=")?.split('&').next()?;
     let valid = !id.is_empty()
         && id.len() <= MAX_ID
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.~%".contains(&b));

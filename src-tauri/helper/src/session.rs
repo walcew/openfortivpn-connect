@@ -100,6 +100,9 @@ struct Inner {
     state: State,
     /// Presente enquanto uma sessão roda, do `connect` até o fim do teardown.
     cancel: Option<Arc<Notify>>,
+    /// `disconnect` ou `cancel` já pedido nesta sessão; marcado sob o lock junto com o aviso,
+    /// para o `drive` não anunciar `connected` depois de um cancelamento que chegou antes.
+    stopping: bool,
 }
 
 /// Dono do estado da VPN e da fonte de eventos do protocolo v2. Cada `connect` roda
@@ -130,7 +133,7 @@ impl Session {
         Self {
             os,
             trust: Arc::new(trust),
-            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None }),
+            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None, stopping: false }),
             applied: Mutex::default(),
             events: broadcast::channel(256).0,
             push_timeout: None,
@@ -195,6 +198,7 @@ impl Session {
                 return Err("A session is already active".into());
             }
             inner.cancel = Some(cancel.clone());
+            inner.stopping = false;
             let connecting = State::Connecting { profile_id: profile.id.clone() };
             Self::set_state(&mut inner, &self.events, connecting);
         }
@@ -225,27 +229,30 @@ impl Session {
     }
 
     pub fn disconnect(&self) {
-        let cancel = self.inner.lock().unwrap().cancel.clone();
-        match cancel {
-            // notify_one guarda a permissão se a task ainda não estiver esperando.
-            Some(cancel) => cancel.notify_one(),
-            None => self.log("disconnect: no active session"),
+        if !Self::stop(&mut self.inner.lock().unwrap()) {
+            self.log("disconnect: no active session");
         }
     }
 
     /// Cancela um login pendente (SAML, push ou ainda conectando). Conectada ou sem sessão, nada muda.
     pub fn cancel(&self) {
-        let pending = {
-            let inner = self.inner.lock().unwrap();
-            match inner.state {
-                State::Connecting { .. } | State::WaitingSaml { .. } | State::WaitingPush { .. } => inner.cancel.clone(),
-                _ => None,
-            }
+        let stopped = {
+            let mut inner = self.inner.lock().unwrap();
+            matches!(inner.state, State::Connecting { .. } | State::WaitingSaml { .. } | State::WaitingPush { .. })
+                && Self::stop(&mut inner)
         };
-        match pending {
-            Some(cancel) => cancel.notify_one(),
-            None => self.log("cancel: no pending login"),
+        if !stopped {
+            self.log("cancel: no pending login");
         }
+    }
+
+    /// Avisa a sessão ativa para parar, sob o lock que o chamador segura. false sem sessão.
+    fn stop(inner: &mut Inner) -> bool {
+        let Some(cancel) = inner.cancel.clone() else { return false };
+        inner.stopping = true;
+        // notify_one guarda a permissão se a task ainda não estiver esperando.
+        cancel.notify_one();
+        true
     }
 
     /// Desfaz o que estiver aplicado na camada de rede, se houver.
@@ -310,17 +317,26 @@ impl Session {
                 return Some(e);
             }
         }
-        {
+        let stopped = {
             let mut inner = self.inner.lock().unwrap();
-            let connected = State::Connected {
-                profile_id: profile.id.clone(),
-                ip: config.ip,
-                since: rfc3339(Utc::now()),
-                dns_servers: config.dns_servers.clone(),
-                dns_suffixes: config.dns_suffixes.clone(),
-                expires_at: config.expires_at.map(rfc3339),
-            };
-            Self::set_state(&mut inner, &self.events, connected);
+            if !inner.stopping {
+                let connected = State::Connected {
+                    profile_id: profile.id.clone(),
+                    ip: config.ip,
+                    since: rfc3339(Utc::now()),
+                    dns_servers: config.dns_servers.clone(),
+                    dns_suffixes: config.dns_suffixes.clone(),
+                    expires_at: config.expires_at.map(rfc3339),
+                };
+                Self::set_state(&mut inner, &self.events, connected);
+            }
+            inner.stopping
+        };
+        if stopped {
+            drop(tunnel);
+            self.teardown();
+            self.logout(gw, &cookie).await;
+            return None;
         }
         let events = self.events.clone();
         let mut ticker = tokio::time::interval(self.bandwidth_interval);
@@ -1064,19 +1080,24 @@ mod tests {
     /// Navegador falso: abre conexões vazias e um pedido sem `id` antes da real, como o
     /// navegador de verdade, e depois `GET /?id=<id>`. Devolve a resposta da real.
     async fn browser(port: u16, id: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
         let addr = ("127.0.0.1", port);
         let _idle = TcpStream::connect(addr).await.unwrap();
         drop(TcpStream::connect(addr).await.unwrap());
-        let mut favicon = TcpStream::connect(addr).await.unwrap();
-        favicon.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
-        let mut real = TcpStream::connect(addr).await.unwrap();
-        let req = format!("GET /?id={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: text/html\r\n\r\n", id, port);
-        real.write_all(req.as_bytes()).await.unwrap();
-        let mut resp = String::new();
-        tokio::time::timeout(Duration::from_secs(5), real.read_to_string(&mut resp)).await.unwrap().unwrap();
-        resp
+        let favicon = local_request(port, "GET /favicon.ico").await;
+        assert!(favicon.starts_with("HTTP/1.1 400"), "{}", favicon);
+        local_request(port, &format!("GET /?id={}", id)).await
+    }
+
+    /// Manda `<método> <alvo> HTTP/1.1` ao listener SAML e devolve a resposta (vazia se ele fechar sem responder).
+    async fn local_request(port: u16, line: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!("{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: text/html\r\n\r\n", line, port);
+        let _ = s.write_all(req.as_bytes()).await;
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp)).await.unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
     }
 
     #[tokio::test]
@@ -1121,14 +1142,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_saml_id_disconnects_with_a_reason_and_applies_nothing() {
+    async fn requests_other_than_a_valid_id_get_400_and_the_login_goes_on() {
+        let (gw, mut c, _os, waiting) = saml_connect(GatewayOptions::default()).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        // Como um `<img src="http://127.0.0.1:<porta>/?id=...">` de uma página qualquer.
+        for line in [
+            "GET /?id=abc;rm%20-rf".to_string(),
+            format!("GET /?id={}", "a".repeat(2000)),
+            format!("POST /?id={}", SAML_ID),
+            format!("GET /other?id={}", SAML_ID),
+            "GET /".to_string(),
+        ] {
+            let resp = local_request(gw.sso_port, &line).await;
+            assert!(resp.starts_with("HTTP/1.1 400"), "{}: {}", line, resp);
+        }
+        assert!(browser(gw.sso_port, SAML_ID).await.starts_with("HTTP/1.1 200 OK"));
+        assert_connected_state(&next_state(&mut c).await);
+    }
+
+    #[tokio::test]
+    async fn connections_above_the_limit_are_closed_without_an_answer() {
+        let (gw, mut c, _os, waiting) = saml_connect(GatewayOptions::default()).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        let mut idle = Vec::new();
+        for _ in 0..16 {
+            idle.push(tokio::net::TcpStream::connect(("127.0.0.1", gw.sso_port)).await.unwrap());
+        }
+        assert_eq!(local_request(gw.sso_port, &format!("GET /?id={}", SAML_ID)).await, "");
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(browser(gw.sso_port, SAML_ID).await.starts_with("HTTP/1.1 200 OK"));
+        assert_connected_state(&next_state(&mut c).await);
+    }
+
+    #[tokio::test]
+    async fn well_formed_id_refused_by_the_gateway_disconnects_with_a_reason() {
         let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
         assert_eq!(waiting["state"], "waiting-saml");
-        let resp = browser(gw.sso_port, "abc;rm%20-rf").await;
-        assert!(!resp.starts_with("HTTP/1.1 200"), "{}", resp);
+        assert!(browser(gw.sso_port, "unknown-id").await.starts_with("HTTP/1.1 200 OK"));
         let state = next_state(&mut c).await;
         assert_eq!(state["state"], "disconnected");
-        assert!(state["reason"].as_str().unwrap().contains("invalid SAML id"), "{}", state);
+        assert!(state["reason"].as_str().unwrap().contains("no session cookie"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_while_waiting_for_saml_returns_to_disconnected_and_closes_the_listener() {
+        let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        let state = disconnect(&mut c).await;
+        assert!(state.get("reason").is_none(), "{}", state);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", gw.sso_port)).await.is_err());
         assert!(os.calls().is_empty());
     }
 
