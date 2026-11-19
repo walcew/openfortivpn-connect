@@ -26,8 +26,14 @@ enum Incoming {
     /// `cert_digest` só vem no `disconnected` por certificado não confiável.
     State { state: ConnectionState, cert_digest: Option<String> },
     Log(String),
-    /// Totais acumulados da sessão, contados pelo Engine.
-    Bandwidth { rx_bytes: u64, tx_bytes: u64 },
+    Bandwidth(Totals),
+}
+
+/// Totais acumulados da sessão, contados pelo Engine.
+#[derive(Clone, Copy)]
+struct Totals {
+    rx_bytes: u64,
+    tx_bytes: u64,
 }
 
 /// Caminho do socket do Helper.
@@ -158,10 +164,9 @@ fn parse_frame(frame: &Value) -> Option<Incoming> {
             parse_state(frame).map(|state| Incoming::State { state, cert_digest })
         }
         ("event", Some("log")) => frame["line"].as_str().map(|l| Incoming::Log(l.to_string())),
-        ("event", Some("bandwidth")) => Some(Incoming::Bandwidth {
-            rx_bytes: frame["rx_bytes"].as_u64()?,
-            tx_bytes: frame["tx_bytes"].as_u64()?,
-        }),
+        ("event", Some("bandwidth")) => {
+            Some(Incoming::Bandwidth(Totals { rx_bytes: frame["rx_bytes"].as_u64()?, tx_bytes: frame["tx_bytes"].as_u64()? }))
+        }
         _ => None,
     }
 }
@@ -225,22 +230,41 @@ fn cert_warning(connecting: &mut Option<String>, state: &ConnectionState, cert_d
     }
 }
 
-/// Última amostra de banda: totais e o instante em que chegaram.
-type Sample = (u64, u64, Instant);
+/// Última amostra de banda: os totais e o instante em que chegaram.
+struct Sample {
+    totals: Totals,
+    at: Instant,
+}
 
 /// Converte os totais do Helper no payload que o frontend já consome; a velocidade
 /// (bytes/s) vem da diferença para a amostra anterior, e a primeira amostra tem velocidade 0.
-fn bandwidth_payload(prev: &mut Option<Sample>, rx_bytes: u64, tx_bytes: u64, now: Instant) -> BandwidthPayload {
+/// Qualquer estado zera a amostra: os contadores recomeçam a cada sessão, e o Helper manda
+/// o estado ao abrir (ou reabrir) o canal, antes de qualquer banda.
+fn bandwidth_update(prev: &mut Option<Sample>, incoming: &Incoming, now: Instant) -> Option<BandwidthPayload> {
+    let totals = match incoming {
+        Incoming::State { .. } => {
+            *prev = None;
+            return None;
+        }
+        Incoming::Bandwidth(totals) => *totals,
+        Incoming::Log(_) => return None,
+    };
     let speed = |total: u64, before: u64, secs: f64| if secs > 0.0 { total.saturating_sub(before) as f64 / secs } else { 0.0 };
-    let (rx_speed, tx_speed) = match *prev {
-        Some((rx, tx, at)) => {
-            let secs = now.duration_since(at).as_secs_f64();
-            (speed(rx_bytes, rx, secs), speed(tx_bytes, tx, secs))
+    let (rx_speed, tx_speed) = match prev {
+        Some(Sample { totals: before, at }) => {
+            let secs = now.duration_since(*at).as_secs_f64();
+            (speed(totals.rx_bytes, before.rx_bytes, secs), speed(totals.tx_bytes, before.tx_bytes, secs))
         }
         None => (0.0, 0.0),
     };
-    *prev = Some((rx_bytes, tx_bytes, now));
-    BandwidthPayload { rx_bytes, tx_bytes, rx_speed, tx_speed, timestamp: Utc::now().to_rfc3339() }
+    *prev = Some(Sample { totals, at: now });
+    Some(BandwidthPayload {
+        rx_bytes: totals.rx_bytes,
+        tx_bytes: totals.tx_bytes,
+        rx_speed,
+        tx_speed,
+        timestamp: Utc::now().to_rfc3339(),
+    })
 }
 
 /// Liga o canal de eventos ao manager, aos eventos do Tauri e à tray.
@@ -248,31 +272,30 @@ pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         let mut connecting = None;
         let mut sample = None;
-        run_events(socket_path(), |incoming| match incoming {
-            Incoming::State { state, cert_digest } => {
-                // Os contadores do Helper recomeçam a cada sessão.
-                if !matches!(state, ConnectionState::Connected { .. }) {
-                    sample = None;
-                }
-                // Mesmo diálogo "Trust & Reconnect" do caminho do openfortivpn.
-                if let Some(payload) = cert_warning(&mut connecting, &state, cert_digest.as_deref()) {
-                    let _ = app.emit("cert-warning", payload);
-                }
-                crate::tray::update_tray_icon(&app, &state);
-                let _ = app.emit("connection-status-changed", ConnectionStatusPayload::from(&state));
-                apply_state(&app.state::<Mutex<VpnManager>>(), &state);
-                // Depois do sync, para o menu refletir o estado novo.
-                crate::tray::refresh_tray_menu(&app);
+        run_events(socket_path(), |incoming| {
+            if let Some(payload) = bandwidth_update(&mut sample, &incoming, Instant::now()) {
+                let _ = app.emit("bandwidth-update", payload);
             }
-            Incoming::Bandwidth { rx_bytes, tx_bytes } => {
-                let _ = app.emit("bandwidth-update", bandwidth_payload(&mut sample, rx_bytes, tx_bytes, Instant::now()));
-            }
-            Incoming::Log(message) => {
-                let _ = app.emit(
-                    "log-line",
-                    // shortcut: o Helper não manda nível, tudo vai como info; evolui se o evento de log ganhar nível
-                    LogLinePayload { timestamp: Utc::now().to_rfc3339(), level: "info".into(), message },
-                );
+            match incoming {
+                Incoming::State { state, cert_digest } => {
+                    // Mesmo diálogo "Trust & Reconnect" do caminho do openfortivpn.
+                    if let Some(payload) = cert_warning(&mut connecting, &state, cert_digest.as_deref()) {
+                        let _ = app.emit("cert-warning", payload);
+                    }
+                    crate::tray::update_tray_icon(&app, &state);
+                    let _ = app.emit("connection-status-changed", ConnectionStatusPayload::from(&state));
+                    apply_state(&app.state::<Mutex<VpnManager>>(), &state);
+                    // Depois do sync, para o menu refletir o estado novo.
+                    crate::tray::refresh_tray_menu(&app);
+                }
+                Incoming::Bandwidth(_) => {}
+                Incoming::Log(message) => {
+                    let _ = app.emit(
+                        "log-line",
+                        // shortcut: o Helper não manda nível, tudo vai como info; evolui se o evento de log ganhar nível
+                        LogLinePayload { timestamp: Utc::now().to_rfc3339(), level: "info".into(), message },
+                    );
+                }
             }
         });
     });
@@ -402,24 +425,39 @@ mod tests {
         assert!(matches!(parse_frame(&frame("not a digest")), Some(Incoming::State { cert_digest: None, .. })));
     }
 
+    fn bandwidth_frame(rx: u64, tx: u64) -> Incoming {
+        let frame = json!({"v": 2, "type": "event", "event": "bandwidth", "rx_bytes": rx, "tx_bytes": tx});
+        parse_frame(&frame).expect("not a bandwidth event")
+    }
+
+    fn state_frame(state: &str) -> Incoming {
+        parse_frame(&event(json!({"event": "state", "state": state}))).unwrap()
+    }
+
     #[test]
     fn bandwidth_event_becomes_a_payload_with_the_speed_from_the_previous_sample() {
-        let frame = |rx: u64, tx: u64| json!({"v": 2, "type": "event", "event": "bandwidth", "rx_bytes": rx, "tx_bytes": tx});
-        let totals = |f: Value| match parse_frame(&f) {
-            Some(Incoming::Bandwidth { rx_bytes, tx_bytes }) => (rx_bytes, tx_bytes),
-            _ => panic!("not a bandwidth event"),
-        };
         let (mut prev, t0) = (None, Instant::now());
 
-        let (rx, tx) = totals(frame(1000, 500));
-        let first = bandwidth_payload(&mut prev, rx, tx, t0);
+        let first = bandwidth_update(&mut prev, &bandwidth_frame(1000, 500), t0).unwrap();
         assert_eq!((first.rx_bytes, first.tx_bytes, first.rx_speed, first.tx_speed), (1000, 500, 0.0, 0.0));
 
-        let (rx, tx) = totals(frame(3000, 500));
-        let second = bandwidth_payload(&mut prev, rx, tx, t0 + Duration::from_secs(2));
+        let second = bandwidth_update(&mut prev, &bandwidth_frame(3000, 500), t0 + Duration::from_secs(2)).unwrap();
         assert_eq!((second.rx_bytes, second.tx_bytes), (3000, 500));
         assert_eq!((second.rx_speed, second.tx_speed), (1000.0, 0.0));
         assert!(DateTime::parse_from_rfc3339(&second.timestamp).is_ok());
+    }
+
+    #[test]
+    fn a_state_event_resets_the_speed_baseline() {
+        // `connecting` de uma sessão nova e o estado enviado ao reabrir o canal seguem o mesmo caminho.
+        for state in ["connecting", "connected", "disconnected"] {
+            let (mut prev, t0) = (None, Instant::now());
+            bandwidth_update(&mut prev, &bandwidth_frame(9_000_000, 9_000_000), t0);
+
+            assert!(bandwidth_update(&mut prev, &state_frame(state), t0 + Duration::from_secs(1)).is_none());
+            let first = bandwidth_update(&mut prev, &bandwidth_frame(100, 100), t0 + Duration::from_secs(2)).unwrap();
+            assert_eq!((first.rx_speed, first.tx_speed), (0.0, 0.0), "after {}", state);
+        }
     }
 
     #[test]
