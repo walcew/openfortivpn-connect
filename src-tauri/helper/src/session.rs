@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, Notify};
 
 use crate::fortinet::{CertTrust, Gateway, LogFn, Login, Profile};
-use crate::net::{self, Os, TunnelConfig};
+use crate::net::{self, Os};
 
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -51,8 +51,6 @@ struct Inner {
     state: State,
     /// Presente enquanto uma sessão roda, do `connect` até o fim do teardown.
     cancel: Option<Arc<Notify>>,
-    /// Config entregue à camada de rede e ainda não desfeita.
-    applied: Option<TunnelConfig>,
 }
 
 /// Dono do estado da VPN e da fonte de eventos do protocolo v2. Cada `connect` roda
@@ -61,6 +59,8 @@ pub struct Session {
     os: Arc<dyn Os>,
     trust: Arc<CertTrust>,
     inner: Mutex<Inner>,
+    /// O que a camada de rede aplicou e ainda não foi desfeito.
+    applied: Mutex<net::Applied>,
     events: broadcast::Sender<Event>,
     push_timeout: Option<Duration>,
 }
@@ -80,7 +80,8 @@ impl Session {
         Self {
             os,
             trust: Arc::new(trust),
-            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None, applied: None }),
+            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None }),
+            applied: Mutex::default(),
             events: broadcast::channel(256).0,
             push_timeout: None,
         }
@@ -176,10 +177,7 @@ impl Session {
 
     /// Desfaz o que estiver aplicado na camada de rede, se houver.
     fn teardown(&self) {
-        let applied = self.inner.lock().unwrap().applied.take();
-        if let Some(config) = applied {
-            net::teardown(&*self.os, &config);
-        }
+        net::teardown(&*self.os, &self.applied);
     }
 
     /// Conduz a sessão até o fim e devolve o motivo (None = desconexão pedida pelo usuário).
@@ -207,8 +205,7 @@ impl Session {
             }
         };
 
-        self.inner.lock().unwrap().applied = Some(config.clone());
-        if let Err(e) = net::apply(&*self.os, &config, packets) {
+        if let Err(e) = net::apply(&*self.os, &config, packets, &self.applied) {
             self.teardown();
             drop(tunnel);
             self.logout(gw, &cookie).await;
@@ -371,6 +368,14 @@ mod tests {
         // Duas metades no túnel; nenhuma rota com máscara 0.0.0.0.
         let halves = [route("0.0.0.0", "128.0.0.0"), route("128.0.0.0", "128.0.0.0")];
         assert_eq!(os.calls(), applied_calls(&halves));
+    }
+
+    #[tokio::test]
+    async fn default_route_from_the_gateway_becomes_the_two_halves() {
+        let (_gw, _c, os, _state) = connected(GatewayOptions { default_route_in_split: true, ..Default::default() }).await;
+        let mut routes: Vec<Route> = SPLIT_ROUTES.iter().map(|(a, m)| route(a, m)).collect();
+        routes.extend([route("0.0.0.0", "128.0.0.0"), route("128.0.0.0", "128.0.0.0")]);
+        assert_eq!(os.calls(), applied_calls(&routes));
     }
 
     #[tokio::test]
@@ -721,6 +726,18 @@ mod tests {
         assert!(state["reason"].as_str().unwrap().contains("fake add_route failure"), "{}", state);
         assert!(os.calls().iter().any(|c| matches!(c, OsCall::AddRoute(_))), "apply did not reach the failure");
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(gw.logouts(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_gateway_route_is_not_removed_by_the_teardown() {
+        // O /32 que não entrou pode ser de outro dono: o teardown só desfaz o que deu certo.
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_os(FakeOs::failing_add_gateway_route()).await;
+        let mut c = client(&path).await;
+        let state = connect_with(&mut c, &gw, PASSWORD).await;
+        assert!(state["reason"].as_str().unwrap().contains("fake add_gateway_route failure"), "{}", state);
+        assert_eq!(os.calls(), [OsCall::AddGatewayRoute(IpAddr::V4(Ipv4Addr::LOCALHOST))]);
         assert_eq!(gw.logouts(), 1);
     }
 
