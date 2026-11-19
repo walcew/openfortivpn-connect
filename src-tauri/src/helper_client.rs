@@ -18,7 +18,7 @@ use crate::models::*;
 use crate::vpn_manager::VpnManager;
 
 /// Socket do Helper; par de `SOCKET_PATH` em helper/src/server.rs.
-const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
+pub(crate) const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
