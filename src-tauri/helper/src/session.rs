@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::JoinSet;
 
-use crate::fortinet::{CertTrust, Gateway, LogFn, Login, Profile};
+use crate::fortinet::{Auth, CertTrust, Gateway, LogFn, Login, Profile};
 use crate::net::{self, Os, Packets};
 
 const GOOGLE_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
@@ -31,6 +31,11 @@ pub enum State {
     },
     Connecting {
         profile_id: String,
+    },
+    /// Listener SAML de pé; a GUI abre `url` no navegador e o usuário faz o login lá.
+    WaitingSaml {
+        profile_id: String,
+        url: String,
     },
     /// Push do FortiToken enviado; o usuário aprova no celular.
     WaitingPush {
@@ -228,6 +233,21 @@ impl Session {
         }
     }
 
+    /// Cancela um login pendente (SAML, push ou ainda conectando). Conectada ou sem sessão, nada muda.
+    pub fn cancel(&self) {
+        let pending = {
+            let inner = self.inner.lock().unwrap();
+            match inner.state {
+                State::Connecting { .. } | State::WaitingSaml { .. } | State::WaitingPush { .. } => inner.cancel.clone(),
+                _ => None,
+            }
+        };
+        match pending {
+            Some(cancel) => cancel.notify_one(),
+            None => self.log("cancel: no pending login"),
+        }
+    }
+
     /// Desfaz o que estiver aplicado na camada de rede, se houver.
     fn teardown(&self) {
         net::teardown(&*self.os, &self.applied);
@@ -329,6 +349,15 @@ impl Session {
     /// Login em um ou dois passos. Com o gateway pedindo token: usa o OTP se houver,
     /// senão pede o push (e emite `waiting-push`) quando o gateway o oferece.
     async fn authenticate(&self, profile: &Profile, gw: &Gateway, password: &str, otp: Option<&str>) -> Result<String, String> {
+        if let Auth::Saml = profile.auth {
+            return gw
+                .saml_login(|url| {
+                    self.log("waiting for SAML login in the browser");
+                    let mut inner = self.inner.lock().unwrap();
+                    Self::set_state(&mut inner, &self.events, State::WaitingSaml { profile_id: profile.id.clone(), url });
+                })
+                .await;
+        }
         let challenge = match gw.login(&profile.username, password).await? {
             Login::Cookie(cookie) => return Ok(cookie),
             Login::Challenge(challenge) => challenge,
@@ -391,6 +420,10 @@ mod tests {
     async fn connect_with_otp(c: &mut Client, gw: &FakeGateway, password: &str, otp: Option<&str>) -> Value {
         let mut cmd = connect_cmd(gw, password);
         cmd["otp"] = json!(otp);
+        send_connect(c, cmd).await
+    }
+
+    async fn send_connect(c: &mut Client, cmd: Value) -> Value {
         c.send(cmd).await;
         let mut seen_response = false;
         let mut connecting = false;
@@ -1001,11 +1034,145 @@ mod tests {
         let (path, _session, os) = start_with_os(FakeOs::default()).await;
         let mut c = client(&path).await;
         let mut cmd = connect_cmd(&gw, PASSWORD);
-        cmd["profile"]["auth"] = json!("saml");
+        cmd["profile"]["auth"] = json!("certificate");
         c.send(cmd).await;
         let r = c.recv_skipping_logs().await;
         assert_eq!(r["ok"], false);
-        assert!(r["error"].as_str().unwrap().contains("saml"), "{}", r);
+        assert!(r["error"].as_str().unwrap().contains("certificate"), "{}", r);
+        assert!(os.calls().is_empty());
+    }
+
+    // ---- SAML ----
+
+    /// `connect` de um Profile SAML: sem username nem senha.
+    fn saml_cmd(gw: &FakeGateway) -> Value {
+        let mut profile = gw.profile();
+        profile["auth"] = json!("saml");
+        profile.as_object_mut().unwrap().remove("username");
+        json!({"v": 2, "cmd": "connect", "profile": profile})
+    }
+
+    /// Connect SAML: devolve o estado seguinte a `connecting`.
+    async fn saml_connect(options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value) {
+        let gw = FakeGateway::start(options).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let state = send_connect(&mut c, saml_cmd(&gw)).await;
+        (gw, c, os, state)
+    }
+
+    /// Navegador falso: abre conexões vazias e um pedido sem `id` antes da real, como o
+    /// navegador de verdade, e depois `GET /?id=<id>`. Devolve a resposta da real.
+    async fn browser(port: u16, id: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        let addr = ("127.0.0.1", port);
+        let _idle = TcpStream::connect(addr).await.unwrap();
+        drop(TcpStream::connect(addr).await.unwrap());
+        let mut favicon = TcpStream::connect(addr).await.unwrap();
+        favicon.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
+        let mut real = TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET /?id={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: text/html\r\n\r\n", id, port);
+        real.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        tokio::time::timeout(Duration::from_secs(5), real.read_to_string(&mut resp)).await.unwrap().unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn saml_login_through_the_browser_connects_without_leaking_the_cookie() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        c.send(saml_cmd(&gw)).await;
+        let mut frames = Vec::new();
+        loop {
+            let v = c.recv().await.unwrap();
+            frames.push(v.clone());
+            if v["state"] == "waiting-saml" {
+                let url = format!("https://127.0.0.1:{}/remote/saml/start?redirect=1", gw.port);
+                assert_eq!(v, json!({"v": 2, "type": "event", "event": "state", "state": "waiting-saml", "profile_id": PROFILE_ID, "url": url}));
+                let resp = browser(gw.sso_port, SAML_ID).await;
+                assert!(resp.starts_with("HTTP/1.1 200 OK"), "{}", resp);
+                assert!(resp.contains("close this tab"), "{}", resp);
+            }
+            if v["state"] == "connected" {
+                break;
+            }
+            assert_ne!(v["state"], "disconnected", "{}", v);
+        }
+        assert!(frames.iter().any(|f| f["state"] == "waiting-saml"));
+        assert_connected_state(frames.last().unwrap());
+        assert_eq!(os.calls(), applied_calls(&SPLIT_ROUTES.map(|(a, m)| route(a, m))));
+        // O listener fecha depois do `id`.
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", gw.sso_port)).await.is_err());
+        disconnect(&mut c).await;
+        for f in &frames {
+            assert!(!f.to_string().contains(COOKIE), "cookie leaked: {}", f);
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_cookie_that_only_comes_from_logincheck_also_connects() {
+        let (gw, mut c, _os, waiting) = saml_connect(GatewayOptions { saml_cookie_on_logincheck: true, ..Default::default() }).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        browser(gw.sso_port, SAML_ID).await;
+        assert_connected_state(&next_state(&mut c).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_saml_id_disconnects_with_a_reason_and_applies_nothing() {
+        let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        let resp = browser(gw.sso_port, "abc;rm%20-rf").await;
+        assert!(!resp.starts_with("HTTP/1.1 200"), "{}", resp);
+        let state = next_state(&mut c).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("invalid SAML id"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saml_login_times_out_after_the_gateway_remoteauthtimeout() {
+        let (_gw, mut c, os, waiting) = saml_connect(GatewayOptions { remoteauthtimeout: Some(1), ..Default::default() }).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        let state = next_state(&mut c).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("SAML login timed out after 1 s"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_for_saml_returns_to_disconnected_and_closes_the_listener() {
+        let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
+        assert_eq!(waiting["state"], "waiting-saml");
+        c.send(json!({"v": 2, "cmd": "cancel"})).await;
+        assert_eq!(c.recv_skipping_logs().await["ok"], true);
+        assert_eq!(next_state(&mut c).await, json!({"v": 2, "type": "event", "event": "state", "state": "disconnected"}));
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", gw.sso_port)).await.is_err());
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_without_a_pending_login_is_a_no_op() {
+        let (_gw, mut c, os, _state) = connected(GatewayOptions::default()).await;
+        c.send(json!({"v": 2, "cmd": "cancel"})).await;
+        assert_eq!(c.recv_skipping_logs().await["ok"], true);
+        c.send(json!({"v": 2, "cmd": "status"})).await;
+        assert_eq!(c.recv_skipping_logs().await["state"], "connected");
+        assert!(!os.applied().is_empty());
+    }
+
+    #[tokio::test]
+    async fn busy_sso_port_disconnects_with_a_clear_reason() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let _busy = std::net::TcpListener::bind(("127.0.0.1", gw.sso_port)).unwrap();
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let state = send_connect(&mut c, saml_cmd(&gw)).await;
+        assert_eq!(state["state"], "disconnected");
+        let reason = state["reason"].as_str().unwrap();
+        assert!(reason.contains(&format!("port {} is already in use", gw.sso_port)) && reason.contains("FortiClient"), "{}", reason);
         assert!(os.calls().is_empty());
     }
 }

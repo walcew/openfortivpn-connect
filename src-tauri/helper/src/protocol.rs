@@ -104,9 +104,13 @@ pub const VERSION_V2: u32 = 2;
 pub enum RequestV2 {
     Status,
     Disconnect,
+    /// Cancela um login pendente; sem login pendente é no-op.
+    Cancel,
     /// Senha e OTP só no corpo, nunca em argv nem em log.
     Connect {
         profile: Profile,
+        /// Ausente no SAML.
+        #[serde(default)]
         password: String,
         /// Código OTP; ausente e com o gateway oferecendo push, o Engine pede o push.
         #[serde(default)]

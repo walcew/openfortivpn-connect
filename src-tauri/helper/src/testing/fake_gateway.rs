@@ -1,6 +1,7 @@
 //! Gateway Fortinet falso em loopback, com TLS de certificado gerado no teste.
-//! Implementa `logincheck` por senha (com segundo passo de OTP ou push), `fortisslvpn_xml`, `sslvpn-tunnel` com o lado
-//! servidor do PPP (LCP, IPCP e echo) e `logout`. Modos novos (SAML, túnel morto) entram como campos em `GatewayOptions`.
+//! Implementa `/remote/info`, `logincheck` por senha (com segundo passo de OTP ou push), o fim do SAML
+//! (`saml/auth_id` e o `logincheck` vazio), `fortisslvpn_xml`, `sslvpn-tunnel` com o lado servidor do PPP
+//! (LCP, IPCP e echo) e `logout`. Modos novos (túnel morto) entram como campos em `GatewayOptions`.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,6 +39,10 @@ pub const OTP: &str = "123456";
 /// Quanto o modo push demora para responder, para provar que o cliente espera.
 pub const PUSH_DELAY: Duration = Duration::from_millis(300);
 /// Valores do desafio de token; `magic` leva `=` e `&` para provar o parse e o encoding.
+/// `id` que o navegador falso entrega no listener SAML e que o `saml/auth_id` aceita.
+pub const SAML_ID: &str = "Zx9-q_7Lm.42";
+/// Cookie de sessão que o `auth_id` entrega no modo `saml_cookie_on_logincheck`, no lugar do `SVPNCOOKIE`.
+const SAML_SESSION: &str = "FGTSAMLSESSION=pending-saml-session";
 const CHALLENGE: [(&str, &str); 6] =
     [("reqid", "4242"), ("polid", "pol-1"), ("grp", "vpn users"), ("portal", "full-access"), ("magic", "m4g=1&c"), ("peer", "10.0.0.1")];
 
@@ -72,10 +77,15 @@ pub struct GatewayOptions {
     pub default_route_in_split: bool,
     /// Nenhum servidor DNS, nem no XML nem no IPCP.
     pub no_dns: bool,
+    /// O `saml/auth_id` não traz o `SVPNCOOKIE`, só um cookie de sessão; o cookie vem no `logincheck` vazio.
+    pub saml_cookie_on_logincheck: bool,
+    /// `remoteauthtimeout` do `/remote/info`, em segundos; None manda 120, o do gateway testado.
+    pub remoteauthtimeout: Option<u64>,
 }
 
 struct Shared {
     options: GatewayOptions,
+    sso_port: u16,
     logouts: AtomicUsize,
     echo_replies: AtomicUsize,
     from_client: mpsc::UnboundedSender<Vec<u8>>,
@@ -84,6 +94,8 @@ struct Shared {
 
 pub struct FakeGateway {
     pub port: u16,
+    /// Porta livre que o `/remote/info` anuncia como `sso_port`.
+    pub sso_port: u16,
     /// sha256 hex do DER do certificado, como em `trusted_certs`.
     pub digest: String,
     ca: Option<CertificateDer<'static>>,
@@ -125,11 +137,14 @@ impl FakeGateway {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Livre agora; o teste de porta ocupada a prende antes do connect.
+        let sso_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
 
         let (from_tx, from_rx) = mpsc::unbounded_channel();
         let (to_tx, to_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             options,
+            sso_port,
             logouts: AtomicUsize::new(0),
             echo_replies: AtomicUsize::new(0),
             from_client: from_tx,
@@ -147,7 +162,7 @@ impl FakeGateway {
                 });
             }
         });
-        Self { port, digest, ca, shared, from_client: tokio::sync::Mutex::new(from_rx), to_client: to_tx }
+        Self { port, sso_port, digest, ca, shared, from_client: tokio::sync::Mutex::new(from_rx), to_client: to_tx }
     }
 
     /// O Profile do comando `connect` apontando para este gateway.
@@ -218,7 +233,16 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
         let granted = http(&format!("Set-Cookie: SVPNCOOKIE={}; path=/; secure; httponly\r\n", COOKIE), "ret=1,redir=/remote/fortisslvpn_xml");
         let denied = http("Set-Cookie: SVPNCOOKIE=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n", "ret=0,redir=/remote/login?&err=sslvpn_login_permission_denied");
         let token_mode = shared.options.require_otp || shared.options.push.is_some();
-        if field("reqid").is_some() {
+        if field("username") == Some("") {
+            // Passo comum depois do SAML: sem credencial, vale o cookie de sessão do `auth_id`.
+            let ok = shared.options.saml_cookie_on_logincheck
+                && header("cookie").as_deref() == Some(SAML_SESSION)
+                && field("credential") == Some("")
+                && field("just_logged_in") == Some("1")
+                && field("redir") == Some("/remote/index")
+                && field("ajax") == Some("1");
+            if ok { granted } else { denied }
+        } else if field("reqid").is_some() {
             // Segundo passo: o cliente devolve o desafio inteiro, mais o código ou o pedido de push.
             let echoed = field("username") == Some(USERNAME)
                 && CHALLENGE.iter().all(|(k, v)| field(k) == Some(*v))
@@ -258,6 +282,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
             } else {
                 granted
             }
+        }
+    } else if request_line.starts_with("GET /remote/info ") {
+        let timeout = shared.options.remoteauthtimeout.unwrap_or(120);
+        http("", &format!("<info remoteauthtimeout='{}' sso_port='{}' saml_redirect='1'/>", timeout, shared.sso_port))
+    } else if request_line.starts_with(&format!("GET /remote/saml/auth_id?id={} ", SAML_ID)) {
+        if shared.options.saml_cookie_on_logincheck {
+            http(&format!("Set-Cookie: {}; path=/; secure; httponly\r\n", SAML_SESSION), "")
+        } else {
+            http(&format!("Set-Cookie: SVPNCOOKIE={}; path=/; secure; httponly\r\n", COOKIE), "")
         }
     } else if request_line.starts_with("GET /remote/fortisslvpn_xml ") && has_cookie && header("host").as_deref() == Some("sslvpn") {
         http("", &xml(&shared.options))

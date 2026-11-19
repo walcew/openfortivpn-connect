@@ -138,6 +138,17 @@ impl Response {
             .next()
     }
 
+    /// `nome=valor` de cada `Set-Cookie` com valor, juntos como no cabeçalho `Cookie`.
+    pub fn cookies(&self) -> String {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k == "set-cookie")
+            .filter_map(|(_, v)| v.split(';').next().map(str::trim))
+            .filter(|c| c.split_once('=').is_some_and(|(_, v)| !v.is_empty()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
