@@ -10,9 +10,6 @@ pub struct VpnManager {
     profile_store: ProfileStore,
     process_manager: ProcessManager,
     selected_profile_id: Option<String>,
-    /// O disconnect em curso começou durante um login pendente (SAML ou push): vira `cancel`.
-    #[cfg_attr(not(feature = "engine-v2"), allow(dead_code))]
-    cancel_login: bool,
 }
 
 impl VpnManager {
@@ -22,7 +19,6 @@ impl VpnManager {
             profile_store: ProfileStore::new()?,
             process_manager: ProcessManager::new(),
             selected_profile_id: None,
-            cancel_login: false,
         })
     }
 
@@ -119,8 +115,9 @@ impl VpnManager {
         let fallback_dns = if dns_fallback { crate::dns_manager::get_current_dns_servers() } else { Vec::new() };
 
         let creds = match profile.auth_type {
-            AuthType::Password => Self::resolve_password_creds(&profile).map(Some),
-            AuthType::Saml => Ok(None),
+            AuthType::Password => Self::resolve_password_creds(&profile)
+                .map(|(username, password)| crate::engine_v2::Credentials::Password { username, password }),
+            AuthType::Saml => Ok(crate::engine_v2::Credentials::Saml),
         };
         let result = creds.and_then(|creds| {
             self.set_state(
@@ -130,7 +127,7 @@ impl VpnManager {
             crate::engine_v2::connect(
                 crate::engine_v2::socket_path(),
                 &profile,
-                creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                &creds,
                 otp,
                 &fallback_dns,
             )
@@ -295,10 +292,6 @@ impl VpnManager {
 
     /// Begin disconnecting: sets state to Disconnecting and returns immediately.
     pub fn begin_disconnect(&mut self, app_handle: &AppHandle) {
-        self.cancel_login = matches!(
-            self.state,
-            ConnectionState::WaitingSaml { .. } | ConnectionState::WaitingPush { .. }
-        );
         self.set_state(ConnectionState::Disconnecting, app_handle);
     }
 
@@ -310,16 +303,11 @@ impl VpnManager {
         self.finish_disconnect_v1(app_handle);
     }
 
-    /// Pede o `disconnect` (ou o `cancel`, com login pendente) ao Engine; o estado final chega por evento.
+    /// Pede o `disconnect` ao Engine, que também encerra um login pendente; o estado final chega por evento.
     #[cfg(feature = "engine-v2")]
     fn finish_disconnect_v2(&mut self, app_handle: &AppHandle) {
         let path = crate::engine_v2::socket_path();
-        let sent = if self.cancel_login {
-            crate::engine_v2::cancel(path)
-        } else {
-            crate::engine_v2::disconnect(path)
-        };
-        if let Err(e) = sent {
+        if let Err(e) = crate::engine_v2::disconnect(path) {
             self.set_state(ConnectionState::Error { message: e }, app_handle);
             return;
         }

@@ -124,7 +124,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     let status_text = match &state {
         ConnectionState::Disconnected => "Disconnected".to_string(),
         ConnectionState::Connecting { .. } => "Connecting...".to_string(),
-        ConnectionState::WaitingSaml { .. } => "Log in on your browser...".to_string(),
+        ConnectionState::WaitingSaml { .. } => "Waiting for login in your browser...".to_string(),
         ConnectionState::WaitingPush { .. } => "Approve on your phone...".to_string(),
         ConnectionState::Connected { ip, .. } => format!("Connected ({})", ip),
         ConnectionState::Disconnecting => "Disconnecting...".to_string(),

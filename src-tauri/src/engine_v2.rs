@@ -41,13 +41,19 @@ pub fn socket_path() -> &'static Path {
     Path::new(SOCKET_PATH)
 }
 
-/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. `creds` (usuário e
-/// senha) é `Some` na auth por senha e `None` no SAML. O OTP já vem normalizado por
+/// Como o `connect` se autentica no gateway.
+pub enum Credentials {
+    Password { username: String, password: String },
+    /// Pelo navegador externo, sem usuário nem senha.
+    Saml,
+}
+
+/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. O OTP já vem normalizado por
 /// `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo push, o Helper pede o push.
 /// O realm do Profile fica fora do contrato.
 /// `dns_fallback_servers` é o DNS do sistema lido antes de conectar (vazio com o fallback
 /// desligado); o Helper o usa, com os do Google, só se o gateway não mandar DNS.
-fn connect_request(profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
+fn connect_request(profile: &VpnProfile, creds: &Credentials, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
     let mut req = json!({
         "v": 2,
         "cmd": "connect",
@@ -55,7 +61,10 @@ fn connect_request(profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Optio
             "id": profile.id,
             "host": profile.host,
             "port": profile.port,
-            "auth": "saml",
+            "auth": match creds {
+                Credentials::Password { .. } => "password",
+                Credentials::Saml => "saml",
+            },
             "trusted_certs": profile.trusted_certs,
             "ignore_cert_errors": profile.ignore_cert_errors,
             "dns_match_domains": profile.dns_match_domains,
@@ -63,8 +72,7 @@ fn connect_request(profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Optio
         },
         "otp": otp,
     });
-    if let Some((username, password)) = creds {
-        req["profile"]["auth"] = json!("password");
+    if let Credentials::Password { username, password } = creds {
         req["profile"]["username"] = json!(username);
         req["password"] = json!(password);
     }
@@ -107,13 +115,8 @@ fn request(path: &Path, cmd: &Value) -> Result<Value, String> {
     Err("Helper closed the connection without a response".into())
 }
 
-pub fn connect(path: &Path, profile: &VpnProfile, creds: Option<(&str, &str)>, otp: Option<&str>, dns_fallback_servers: &[String]) -> Result<(), String> {
+pub fn connect(path: &Path, profile: &VpnProfile, creds: &Credentials, otp: Option<&str>, dns_fallback_servers: &[String]) -> Result<(), String> {
     request(path, &connect_request(profile, creds, otp, dns_fallback_servers)).map(|_| ())
-}
-
-/// Cancela um login pendente (SAML ou push); sem login pendente o Helper não faz nada.
-pub fn cancel(path: &Path) -> Result<(), String> {
-    request(path, &json!({"v": 2, "cmd": "cancel"})).map(|_| ())
 }
 
 pub fn disconnect(path: &Path) -> Result<(), String> {
@@ -217,17 +220,21 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Payload do `cert-warning` quando um estado acabou de falhar por certificado não confiável.
-/// `connecting` guarda o Profile da tentativa em curso: só a transição `connecting` -> erro
-/// abre o diálogo, não o erro antigo repetido no estado inicial de uma reconexão do canal.
-fn cert_warning(connecting: &mut Option<String>, state: &ConnectionState, cert_digest: Option<&str>) -> Option<Value> {
+/// Evento do Tauri que uma transição de estado pede além do próprio estado: `saml-url` na
+/// transição `connecting` -> `waiting-saml` e `cert-warning` na `connecting` -> erro por
+/// certificado não confiável. `connecting` guarda o Profile da tentativa em curso, então o
+/// estado inicial repetido de uma reconexão do canal não reabre a aba nem o diálogo.
+fn transition(connecting: &mut Option<String>, state: &ConnectionState, cert_digest: Option<&str>) -> Option<(&'static str, Value)> {
     if let ConnectionState::Connecting { profile_id } = state {
         *connecting = Some(profile_id.clone());
         return None;
     }
     let profile_id = connecting.take()?;
     match (state, cert_digest) {
-        (ConnectionState::Error { .. }, Some(digest)) => Some(json!({"digest": digest, "profile_id": profile_id})),
+        // Mesmos eventos do caminho do openfortivpn: o front abre a URL no navegador padrão e
+        // mostra o diálogo "Trust & Reconnect".
+        (ConnectionState::WaitingSaml { url, .. }, _) => Some(("saml-url", json!({"url": url}))),
+        (ConnectionState::Error { .. }, Some(digest)) => Some(("cert-warning", json!({"digest": digest, "profile_id": profile_id}))),
         _ => None,
     }
 }
@@ -269,16 +276,6 @@ fn bandwidth_update(prev: &mut Option<Sample>, incoming: &Incoming, now: Instant
     })
 }
 
-/// URL do SAML a abrir no navegador: só na transição `connecting` -> `waiting-saml`, para
-/// que o estado inicial de uma reconexão do canal não reabra a aba. Lê o mesmo `connecting`
-/// do `cert_warning`, antes dele.
-fn saml_url(connecting: &Option<String>, state: &ConnectionState) -> Option<String> {
-    match state {
-        ConnectionState::WaitingSaml { url, .. } if connecting.is_some() => Some(url.clone()),
-        _ => None,
-    }
-}
-
 /// Liga o canal de eventos ao manager, aos eventos do Tauri e à tray.
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
@@ -290,13 +287,8 @@ pub fn start(app: AppHandle) {
             }
             match incoming {
                 Incoming::State { state, cert_digest } => {
-                    // Mesmo evento do caminho do openfortivpn: o front abre a URL no navegador padrão.
-                    if let Some(url) = saml_url(&connecting, &state) {
-                        let _ = app.emit("saml-url", json!({"url": url}));
-                    }
-                    // Mesmo diálogo "Trust & Reconnect" do caminho do openfortivpn.
-                    if let Some(payload) = cert_warning(&mut connecting, &state, cert_digest.as_deref()) {
-                        let _ = app.emit("cert-warning", payload);
+                    if let Some((event, payload)) = transition(&mut connecting, &state, cert_digest.as_deref()) {
+                        let _ = app.emit(event, payload);
                     }
                     crate::tray::update_tray_icon(&app, &state);
                     let _ = app.emit("connection-status-changed", ConnectionStatusPayload::from(&state));
@@ -368,6 +360,10 @@ mod tests {
         frame
     }
 
+    fn password_creds() -> Credentials {
+        Credentials::Password { username: "alice".into(), password: "s3cret".into() }
+    }
+
     fn password_profile() -> VpnProfile {
         VpnProfile {
             id: "p1".into(),
@@ -383,7 +379,7 @@ mod tests {
     #[test]
     fn connect_sends_the_contract_json_with_credentials_in_the_body() {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
-        connect(&path, &password_profile(), Some(("alice", "s3cret")), None, &["192.168.0.1".to_string()]).unwrap();
+        connect(&path, &password_profile(), &password_creds(), None, &["192.168.0.1".to_string()]).unwrap();
         assert_eq!(
             rx.recv().unwrap(),
             json!({
@@ -410,27 +406,27 @@ mod tests {
     fn certificate_warning_comes_from_the_cert_digest_field() {
         let digest = "ab".repeat(32);
         let mut pending = None;
-        assert!(cert_warning(&mut pending, &connecting("p1"), None).is_none());
-        let payload = cert_warning(&mut pending, &error("TLS handshake failed"), Some(&digest)).unwrap();
-        assert_eq!(payload, json!({"digest": digest, "profile_id": "p1"}));
+        assert!(transition(&mut pending, &connecting("p1"), None).is_none());
+        let action = transition(&mut pending, &error("TLS handshake failed"), Some(&digest));
+        assert_eq!(action, Some(("cert-warning", json!({"digest": digest, "profile_id": "p1"}))));
     }
 
     #[test]
     fn digest_text_in_the_reason_does_not_open_the_dialog() {
         let reason = format!("Login failed: sha256 digest {}", "cd".repeat(32));
         let mut pending = None;
-        cert_warning(&mut pending, &connecting("p1"), None);
-        assert!(cert_warning(&mut pending, &error(&reason), None).is_none());
+        transition(&mut pending, &connecting("p1"), None);
+        assert!(transition(&mut pending, &error(&reason), None).is_none());
     }
 
     #[test]
     fn repeated_old_error_after_a_channel_reconnect_does_not_reopen_the_dialog() {
         let digest = "ab".repeat(32);
         let mut pending = None;
-        cert_warning(&mut pending, &connecting("p1"), None);
-        assert!(cert_warning(&mut pending, &error("x"), Some(&digest)).is_some());
+        transition(&mut pending, &connecting("p1"), None);
+        assert!(transition(&mut pending, &error("x"), Some(&digest)).is_some());
         // O estado inicial da conexão reaberta repete o erro, sem um connecting antes.
-        assert!(cert_warning(&mut pending, &error("x"), Some(&digest)).is_none());
+        assert!(transition(&mut pending, &error("x"), Some(&digest)).is_none());
     }
 
     #[test]
@@ -481,7 +477,7 @@ mod tests {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
         let mut profile = password_profile();
         profile.otp_required = true;
-        connect(&path, &profile, Some(("alice", "s3cret")), Some("123456"), &[]).unwrap();
+        connect(&path, &profile, &password_creds(), Some("123456"), &[]).unwrap();
         assert_eq!(rx.recv().unwrap()["otp"], "123456");
     }
 
@@ -597,7 +593,7 @@ mod tests {
     fn saml_connect_sends_no_username_or_password() {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
         let profile = VpnProfile { auth_type: AuthType::Saml, username: None, ..password_profile() };
-        connect(&path, &profile, None, None, &[]).unwrap();
+        connect(&path, &profile, &Credentials::Saml, None, &[]).unwrap();
         assert_eq!(
             rx.recv().unwrap(),
             json!({
@@ -610,13 +606,6 @@ mod tests {
                 "otp": null
             })
         );
-    }
-
-    #[test]
-    fn cancel_sends_the_contract_json() {
-        let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
-        cancel(&path).unwrap();
-        assert_eq!(rx.recv().unwrap(), json!({"v": 2, "cmd": "cancel"}));
     }
 
     #[test]
@@ -634,10 +623,9 @@ mod tests {
         let waiting = ConnectionState::WaitingSaml { profile_id: "p1".into(), url: "https://vpn/x".into() };
         let mut pending = None;
         // Estado inicial de uma reconexão do canal, sem connecting antes: não reabre.
-        assert!(saml_url(&pending, &waiting).is_none());
-        cert_warning(&mut pending, &connecting("p1"), None);
-        assert_eq!(saml_url(&pending, &waiting).as_deref(), Some("https://vpn/x"));
-        cert_warning(&mut pending, &waiting, None);
-        assert!(saml_url(&pending, &waiting).is_none());
+        assert!(transition(&mut pending, &waiting, None).is_none());
+        transition(&mut pending, &connecting("p1"), None);
+        assert_eq!(transition(&mut pending, &waiting, None), Some(("saml-url", json!({"url": "https://vpn/x"}))));
+        assert!(transition(&mut pending, &waiting, None).is_none());
     }
 }
