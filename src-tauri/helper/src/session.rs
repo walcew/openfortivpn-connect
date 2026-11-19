@@ -370,7 +370,7 @@ impl Session {
             }
         };
 
-        // Regra do v1: o fallback (DNS do sistema + Google) só entra sem DNS do gateway, para
+        // O fallback (DNS do sistema + Google) só entra sem DNS do gateway, para
         // resolvedores públicos não pegarem nomes internos do split DNS.
         if config.dns_servers.is_empty() && !profile.dns_fallback_servers.is_empty() {
             for s in profile.dns_fallback_servers.iter().chain(&GOOGLE_DNS) {

@@ -100,16 +100,16 @@ impl VpnManager {
 
         let creds = match profile.auth_type {
             AuthType::Password => Self::resolve_password_creds(&profile)
-                .map(|(username, password)| crate::engine_v2::Credentials::Password { username, password }),
-            AuthType::Saml => Ok(crate::engine_v2::Credentials::Saml),
+                .map(|(username, password)| crate::helper_client::Credentials::Password { username, password }),
+            AuthType::Saml => Ok(crate::helper_client::Credentials::Saml),
         };
         let result = creds.and_then(|creds| {
             self.set_state(
                 ConnectionState::Connecting { profile_id: profile_id.to_string() },
                 app_handle,
             );
-            crate::engine_v2::connect(
-                crate::engine_v2::socket_path(),
+            crate::helper_client::connect(
+                crate::helper_client::socket_path(),
                 &profile,
                 &creds,
                 otp,
@@ -182,14 +182,14 @@ impl VpnManager {
 
     /// Pede o `disconnect` ao Engine, que também encerra um login pendente; o estado final chega por evento.
     pub fn finish_disconnect(&mut self, app_handle: &AppHandle) {
-        let path = crate::engine_v2::socket_path();
-        if let Err(e) = crate::engine_v2::disconnect(path) {
+        let path = crate::helper_client::socket_path();
+        if let Err(e) = crate::helper_client::disconnect(path) {
             self.set_state(ConnectionState::Error { message: e }, app_handle);
             return;
         }
         // Sem sessão ativa o Helper não emite estado novo e o Disconnecting ficaria
         // preso; um `status` fecha esse caso. Se ainda não caiu, o evento fecha.
-        if let Ok(ConnectionState::Disconnected) = crate::engine_v2::status(path) {
+        if let Ok(ConnectionState::Disconnected) = crate::helper_client::status(path) {
             self.set_state(ConnectionState::Disconnected, app_handle);
         }
     }
