@@ -60,6 +60,12 @@ impl VpnProfile {
     pub fn needs_otp(&self) -> bool {
         self.auth_type == AuthType::Password && self.otp_required
     }
+
+    /// O OTP que vale para este Profile: sem espaços nas pontas, e só se ele exigir OTP
+    /// e o código não for vazio. Único ponto de normalização do OTP no app.
+    pub fn otp_to_send<'a>(&self, otp: Option<&'a str>) -> Option<&'a str> {
+        otp.map(str::trim).filter(|o| self.needs_otp() && !o.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,5 +212,16 @@ mod tests {
         assert!(!profile(AuthType::Password, false).needs_otp());
         assert!(!profile(AuthType::Saml, true).needs_otp());
         assert!(!profile(AuthType::Saml, false).needs_otp());
+    }
+
+    #[test]
+    fn test_otp_to_send() {
+        let profile = |otp_required| VpnProfile { otp_required, ..VpnProfile::default() };
+        assert_eq!(profile(true).otp_to_send(Some(" 123456 ")), Some("123456"));
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(profile(true).otp_to_send(blank), None);
+        }
+        // Sem otp_required um código sobrando não vale.
+        assert_eq!(profile(false).otp_to_send(Some("123456")), None);
     }
 }

@@ -111,6 +111,7 @@ impl VpnManager {
             .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
         crate::engine_v2::check_supported(&profile)?;
         check_otp_provided(&profile, otp)?;
+        let otp = profile.otp_to_send(otp);
 
         let result = Self::resolve_password_creds(&profile).and_then(|(username, password)| {
             self.set_state(
@@ -360,7 +361,7 @@ impl VpnManager {
 }
 
 fn check_otp_provided(profile: &VpnProfile, otp: Option<&str>) -> Result<(), String> {
-    if profile.needs_otp() && otp.map(str::trim).unwrap_or("").is_empty() {
+    if profile.needs_otp() && profile.otp_to_send(otp).is_none() {
         return Err("OTP is required for this profile".into());
     }
     Ok(())
@@ -382,7 +383,7 @@ fn build_openfortivpn_args(
         args.push(username);
         args.push("-p".to_string());
         args.push(password);
-        if let Some(otp) = otp.map(str::trim).filter(|value| profile.needs_otp() && !value.is_empty()) {
+        if let Some(otp) = profile.otp_to_send(otp) {
             // shortcut: o OTP fica visível no ps enquanto o openfortivpn roda, trocar por arquivo -c se credenciais em argv virarem problema
             args.push(format!("--otp={}", otp));
         }
