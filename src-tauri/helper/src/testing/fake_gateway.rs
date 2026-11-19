@@ -137,8 +137,7 @@ impl FakeGateway {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        // Livre agora; o teste de porta ocupada a prende antes do connect.
-        let sso_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let sso_port = free_sso_port();
 
         let (from_tx, from_rx) = mpsc::unbounded_channel();
         let (to_tx, to_rx) = mpsc::unbounded_channel();
@@ -205,6 +204,19 @@ impl FakeGateway {
         let mut rx = self.from_client.lock().await;
         tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("no IP packet reached the gateway").unwrap()
     }
+}
+
+/// Porta livre fora da faixa efêmera do macOS (49152–65535): nenhum `bind` em 0 nem conexão de
+/// saída de outro teste em paralelo cai nela, então "listener fechado" só depende do listener
+/// SAML. Entre os testes SAML, quem evita a disputa é o `SAML_PORTS`.
+fn free_sso_port() -> u16 {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // Começa num ponto diferente por processo e por gateway, para não repetir a porta recém-usada.
+    let start = std::process::id() as usize + NEXT.fetch_add(1, Ordering::Relaxed) * 17;
+    (0..10000)
+        .map(|i| 20000 + ((start + i) % 10000) as u16)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .expect("no free port in 20000-29999")
 }
 
 #[derive(Debug)]
