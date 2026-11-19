@@ -137,7 +137,7 @@ struct Inner {
     stopping: bool,
 }
 
-/// Dono do estado da VPN e da fonte de eventos do protocolo v2. Cada `connect` roda
+/// Dono do estado da VPN e da fonte de eventos do protocolo. Cada `connect` roda
 /// numa task própria, que conduz o Engine e a camada de rede e emite os eventos.
 pub struct Session {
     os: Arc<dyn Os>,
