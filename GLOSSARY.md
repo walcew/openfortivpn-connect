@@ -20,6 +20,10 @@ _Avoid_: CLI, system openfortivpn, Homebrew openfortivpn
 A implementação de um protocolo de VPN dentro do Helper. Hoje só existe o Fortinet SSL VPN, ainda em desenvolvimento.
 _Avoid_: Motor externo, backend, driver
 
+**Auto-trust**:
+Opção do Profile que aceita qualquer certificado do gateway, só do host daquele Profile, registrando no log as trocas de digest entre conexões. No código, `ignore_cert_errors`.
+_Avoid_: Ignorar certificado, insecure, skip verify
+
 **OTP**:
 Código de uso único que o usuário digita para concluir o segundo fator de um Profile com senha.
 _Avoid_: Token, 2FA code, TOTP code

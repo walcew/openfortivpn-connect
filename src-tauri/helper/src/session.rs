@@ -6,7 +6,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tokio::sync::{broadcast, Notify};
 
-use crate::fortinet::{Gateway, Profile, Trust};
+use crate::fortinet::{CertTrust, Gateway, LogFn, Profile};
 use crate::net::{self, Os, TunnelConfig};
 
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
@@ -19,6 +19,9 @@ pub enum State {
         /// Ausente numa desconexão normal.
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// sha256 hex do certificado recusado, quando a causa é certificado não confiável.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cert_digest: Option<String>,
     },
     Connecting {
         profile_id: String,
@@ -52,21 +55,27 @@ struct Inner {
 /// numa task própria, que conduz o Engine e a camada de rede e emite os eventos.
 pub struct Session {
     os: Arc<dyn Os>,
-    trust: Arc<Trust>,
+    trust: Arc<CertTrust>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<Event>,
 }
 
 impl Session {
     pub fn new(os: Arc<dyn Os>) -> Self {
-        Self::with_trust(os, Trust::system())
+        Self::build(os, CertTrust::system())
     }
 
-    pub fn with_trust(os: Arc<dyn Os>, trust: Trust) -> Self {
+    /// Só o teste injeta raízes próprias; a produção usa as do sistema.
+    #[cfg(test)]
+    pub fn with_trust(os: Arc<dyn Os>, trust: CertTrust) -> Self {
+        Self::build(os, trust)
+    }
+
+    fn build(os: Arc<dyn Os>, trust: CertTrust) -> Self {
         Self {
             os,
             trust: Arc::new(trust),
-            inner: Mutex::new(Inner { state: State::Disconnected { reason: None }, cancel: None, applied: None }),
+            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None, applied: None }),
             events: broadcast::channel(256).0,
         }
     }
@@ -99,10 +108,10 @@ impl Session {
     /// Começa a conexão e volta logo; o progresso chega pelos eventos de estado.
     pub fn connect(self: &Arc<Self>, profile: Profile, password: String) -> Result<(), String> {
         let events = self.events.clone();
-        let log = Arc::new(move |line| {
+        let log: LogFn = Arc::new(move |line| {
             let _ = events.send(Event::Log { line });
         });
-        let gateway = Gateway::new(&profile, &self.trust, log)?;
+        let gateway = Arc::new(Gateway::new(&profile, &self.trust, log)?);
         let cancel = Arc::new(Notify::new());
         {
             let mut inner = self.inner.lock().unwrap();
@@ -118,7 +127,8 @@ impl Session {
             // A sessão roda numa task supervisionada: um pânico não deixa rede aplicada
             // nem a sessão presa em connecting/connected.
             let s = session.clone();
-            let run = tokio::spawn(async move { s.drive(&profile, &gateway, &password, &cancel).await });
+            let g = gateway.clone();
+            let run = tokio::spawn(async move { s.drive(&profile, &g, &password, &cancel).await });
             let reason = match run.await {
                 Ok(reason) => reason,
                 Err(e) => {
@@ -131,7 +141,9 @@ impl Session {
             }
             let mut inner = session.inner.lock().unwrap();
             inner.cancel = None;
-            Self::set_state(&mut inner, &session.events, State::Disconnected { reason });
+            // Só a recusa de certificado deste connect põe o digest no estado.
+            let cert_digest = reason.as_ref().and_then(|_| gateway.refused_digest());
+            Self::set_state(&mut inner, &session.events, State::Disconnected { reason, cert_digest });
         });
         Ok(())
     }
@@ -327,6 +339,7 @@ mod tests {
         let state = connect_with(&mut c, &gw, "wrong").await;
         assert_eq!(state["state"], "disconnected");
         assert!(state["reason"].as_str().unwrap().contains("invalid username or password"), "{}", state);
+        assert!(state.get("cert_digest").is_none(), "{}", state);
         assert!(os.calls().is_empty());
     }
 
@@ -345,6 +358,7 @@ mod tests {
             }
         };
         assert!(state["reason"].as_str().unwrap().contains(&gw.digest), "{}", state);
+        assert_eq!(state["cert_digest"], gw.digest);
         assert!(os.calls().is_empty());
     }
 
@@ -385,8 +399,48 @@ mod tests {
         let mut c = client(&path).await;
         let (state, _) = connect_logging(&mut c, pinless(&gw)).await;
         assert_eq!(state["state"], "disconnected");
-        assert!(state["reason"].as_str().unwrap().contains(&gw.digest), "{}", state);
+        let reason = state["reason"].as_str().unwrap();
+        assert!(reason.contains(&gw.digest) && reason.contains("UnknownIssuer"), "{}", state);
+        assert_eq!(state["cert_digest"], gw.digest);
         assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_valid_for_another_name_is_refused_with_its_digest() {
+        let gw = FakeGateway::start(GatewayOptions { ca_signed: true, wrong_name: true, ..Default::default() }).await;
+        let (path, _session) = start_with_roots(gw.roots()).await;
+        let mut c = client(&path).await;
+        let (state, _) = connect_logging(&mut c, pinless(&gw)).await;
+        assert_eq!(state["state"], "disconnected");
+        let reason = state["reason"].as_str().unwrap();
+        assert!(reason.contains(&gw.digest) && reason.to_lowercase().contains("name"), "{}", state);
+        assert_eq!(state["cert_digest"], gw.digest);
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_does_not_count_as_a_digest_change() {
+        let good = FakeGateway::start(GatewayOptions::default()).await;
+        // Mesmo host, certificado diferente e sem a chave dele: o handshake não termina.
+        let mitm = FakeGateway::start(GatewayOptions { mismatched_key: true, ..Default::default() }).await;
+        let (path, _session, _os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let auto_trust = |gw: &FakeGateway| {
+            let mut cmd = pinless(gw);
+            cmd["profile"]["ignore_cert_errors"] = json!(true);
+            cmd
+        };
+        assert_eq!(connect_logging(&mut c, auto_trust(&good)).await.0["state"], "connected");
+        disconnect(&mut c).await;
+
+        let (state, lines) = connect_logging(&mut c, auto_trust(&mitm)).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state.get("cert_digest").is_none(), "{}", state);
+        assert!(!lines.iter().any(|l| l.contains("changed")), "{:?}", lines);
+
+        // O digest guardado continua o do certificado que provou a chave.
+        let (state, lines) = connect_logging(&mut c, auto_trust(&good)).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        assert!(!lines.iter().any(|l| l.contains("changed")), "{:?}", lines);
     }
 
     #[tokio::test]

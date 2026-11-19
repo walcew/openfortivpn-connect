@@ -16,6 +16,8 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls::crypto::ring;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
@@ -41,6 +43,10 @@ pub struct GatewayOptions {
     pub mute_logout: bool,
     /// Certificado assinado por uma CA de teste (ver `FakeGateway::roots`) em vez de autoassinado.
     pub ca_signed: bool,
+    /// Com `ca_signed`: o certificado vale para outro nome, não para 127.0.0.1 nem localhost.
+    pub wrong_name: bool,
+    /// Apresenta um certificado cuja chave privada não é a usada no handshake (como um MITM que só copiou o certificado).
+    pub mismatched_key: bool,
 }
 
 struct Shared {
@@ -71,6 +77,9 @@ impl FakeGateway {
             let ca_cert = ca_params.self_signed(&ca_key).unwrap();
             let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
             params.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+            if options.wrong_name {
+                params.subject_alt_names = vec![SanType::DnsName("other.example".try_into().unwrap())];
+            }
             let key_pair = KeyPair::generate().unwrap();
             let cert = params.signed_by(&key_pair, &ca_cert, &ca_key).unwrap();
             (cert.der().clone(), key_pair, Some(ca_cert.der().clone()))
@@ -79,13 +88,15 @@ impl FakeGateway {
             (cert.cert.der().clone(), cert.key_pair, None)
         };
         let digest = Sha256::digest(der.as_ref()).iter().map(|b| format!("{:02x}", b)).collect();
+        let key_pair = if options.mismatched_key { KeyPair::generate().unwrap() } else { key_pair };
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        // O resolvedor não confere se a chave é a do certificado, ao contrário do `with_single_cert`.
+        let signing_key = ring::sign::any_supported_type(&key).unwrap();
         let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
-            .with_single_cert(vec![der], key)
-            .unwrap();
+            .with_cert_resolver(Arc::new(FixedCert(Arc::new(CertifiedKey::new(vec![der], signing_key)))));
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -153,6 +164,15 @@ impl FakeGateway {
     pub async fn recv_ip(&self) -> Vec<u8> {
         let mut rx = self.from_client.lock().await;
         tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("no IP packet reached the gateway").unwrap()
+    }
+}
+
+#[derive(Debug)]
+struct FixedCert(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for FixedCert {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
     }
 }
 

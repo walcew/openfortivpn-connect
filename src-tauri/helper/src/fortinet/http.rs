@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
+use super::Profile;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::rustls::client::WebPkiServerVerifier;
 use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -12,14 +13,14 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
 
 /// Raízes de confiança e histórico de digests, vivos enquanto o Helper roda.
-pub struct Trust {
+pub struct CertTrust {
     /// None usa as raízes do sistema; o teste injeta as suas.
     roots: Option<Arc<RootCertStore>>,
     // shortcut: o histórico de digests vive em memória e se perde quando o Helper reinicia; persistir em disco quando a troca de certificado entre reinícios importar.
     digests: Mutex<HashMap<String, String>>,
 }
 
-impl Trust {
+impl CertTrust {
     pub fn system() -> Self {
         Self { roots: None, digests: Mutex::default() }
     }
@@ -38,29 +39,28 @@ impl Trust {
         }
     }
 
-    /// Guarda o digest do host e devolve o anterior quando ele mudou.
-    fn record(&self, host: &str, digest: &str) -> Option<String> {
-        let old = self.digests.lock().unwrap().insert(host.to_string(), digest.to_string());
-        old.filter(|o| o != digest)
+    /// Guarda o digest do host e devolve (antigo, novo) quando ele mudou.
+    pub fn record(&self, host: &str, cert: &CertificateDer<'_>) -> Option<(String, String)> {
+        let new = digest(cert);
+        let old = self.digests.lock().unwrap().insert(host.to_string(), new.clone())?;
+        (old != new).then_some((old, new))
     }
 }
 
-/// Ponto único da validação do certificado do gateway. Nasce por conexão e só vê o
-/// host do Profile, então o auto-trust não vaza para outro host.
+/// Ponto único da validação do certificado do gateway. Nasce por conexão do Profile,
+/// então o auto-trust não vaza para outro host.
 struct GatewayCertVerifier {
-    host: String,
     trusted_certs: Vec<String>,
     auto_trust: bool,
     roots: Arc<dyn ServerCertVerifier>,
-    trust: Arc<Trust>,
-    /// Emite a linha como evento de log da sessão.
-    log: Arc<dyn Fn(String) + Send + Sync>,
+    /// Digest do último certificado recusado, para o estado `disconnected`.
+    refused: Arc<Mutex<Option<String>>>,
     provider: Arc<CryptoProvider>,
 }
 
 impl std::fmt::Debug for GatewayCertVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GatewayCertVerifier").field("host", &self.host).finish_non_exhaustive()
+        f.debug_struct("GatewayCertVerifier").finish_non_exhaustive()
     }
 }
 
@@ -78,22 +78,17 @@ impl ServerCertVerifier for GatewayCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        let digest = digest(end_entity);
         if self.auto_trust {
-            if let Some(old) = self.trust.record(&self.host, &digest) {
-                let line = format!("gateway certificate of {} changed: sha256 {} -> {}", self.host, old, digest);
-                log::warn!("{}", line);
-                (self.log)(line);
-            }
             return Ok(ServerCertVerified::assertion());
         }
-        if self.trusted_certs.iter().any(|c| c.eq_ignore_ascii_case(&digest))
-            || self.roots.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now).is_ok()
-        {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(Error::General(format!("untrusted gateway certificate, sha256 digest {}", digest)))
+        let digest = digest(end_entity);
+        if self.trusted_certs.iter().any(|c| c.eq_ignore_ascii_case(&digest)) {
+            return Ok(ServerCertVerified::assertion());
         }
+        self.roots.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now).map_err(|cause| {
+            *self.refused.lock().unwrap() = Some(digest.clone());
+            Error::General(format!("untrusted gateway certificate ({}), sha256 digest {}", cause, digest))
+        })
     }
 
     fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
@@ -109,21 +104,13 @@ impl ServerCertVerifier for GatewayCertVerifier {
     }
 }
 
-pub fn client_config(
-    host: &str,
-    trusted_certs: &[String],
-    auto_trust: bool,
-    trust: &Arc<Trust>,
-    log: Arc<dyn Fn(String) + Send + Sync>,
-) -> Result<ClientConfig, String> {
+pub fn client_config(profile: &Profile, trust: &CertTrust, refused: Arc<Mutex<Option<String>>>) -> Result<ClientConfig, String> {
     let provider = Arc::new(crypto::ring::default_provider());
     let verifier = GatewayCertVerifier {
-        host: host.to_string(),
-        trusted_certs: trusted_certs.to_vec(),
-        auto_trust,
+        trusted_certs: profile.trusted_certs.clone(),
+        auto_trust: profile.ignore_cert_errors,
         roots: trust.roots_verifier(&provider)?,
-        trust: trust.clone(),
-        log,
+        refused,
         provider: provider.clone(),
     };
     Ok(ClientConfig::builder_with_provider(provider)
