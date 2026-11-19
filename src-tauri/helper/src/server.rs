@@ -171,7 +171,7 @@ fn handle_v2(session: &Arc<Session>, parsed: serde_json::Result<Value>) -> Respo
             session.disconnect();
             ResponseV2::ok(None)
         }
-        Ok(RequestV2::Connect { profile, password, .. }) => match session.connect(profile, password) {
+        Ok(RequestV2::Connect { profile, password, otp }) => match session.connect(profile, password, otp) {
             Ok(()) => ResponseV2::ok(None),
             Err(e) => ResponseV2::error(e),
         },

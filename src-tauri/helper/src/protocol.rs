@@ -108,8 +108,7 @@ pub enum RequestV2 {
     Connect {
         profile: Profile,
         password: String,
-        // shortcut: o OTP chega e é ignorado, o ticket #13 passa a usá-lo no login.
-        #[allow(dead_code)]
+        /// Código do token; ausente e com o gateway oferecendo push, o Engine pede o push.
         #[serde(default)]
         otp: Option<String>,
     },

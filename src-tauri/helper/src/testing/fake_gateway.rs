@@ -1,7 +1,6 @@
 //! Gateway Fortinet falso em loopback, com TLS de certificado gerado no teste.
-//! Implementa `logincheck` por senha, `fortisslvpn_xml`, `sslvpn-tunnel` com o lado
-//! servidor do PPP (LCP, IPCP e echo) e `logout`. Modos novos (OTP, push, SAML, túnel
-//! morto) entram como campos em `GatewayOptions`.
+//! Implementa `logincheck` por senha (com segundo passo de OTP ou push), `fortisslvpn_xml`, `sslvpn-tunnel` com o lado
+//! servidor do PPP (LCP, IPCP e echo) e `logout`. Modos novos (SAML, túnel morto) entram como campos em `GatewayOptions`.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,6 +33,20 @@ pub const IPCP_DNS: Ipv4Addr = Ipv4Addr::new(10, 9, 9, 9);
 pub const DNS_SUFFIXES: [&str; 2] = ["corp.example", "lab.example"];
 pub const SPLIT_ROUTES: [(&str, &str); 2] = [("10.1.0.0", "255.255.0.0"), ("192.168.50.0", "255.255.255.0")];
 pub const AUTH_TIMEOUT: u64 = 28800;
+/// Código que o modo OTP aceita.
+pub const OTP: &str = "123456";
+/// Quanto o modo push demora para responder, para provar que o cliente espera.
+pub const PUSH_DELAY: Duration = Duration::from_millis(300);
+/// Valores do desafio de token; `magic` leva `=` e `&` para provar o parse e o encoding.
+const CHALLENGE: [(&str, &str); 6] =
+    [("reqid", "4242"), ("polid", "pol-1"), ("grp", "vpn users"), ("portal", "full-access"), ("magic", "m4g=1&c"), ("peer", "10.0.0.1")];
+
+/// Resposta do gateway ao pedido de push.
+#[derive(Clone, Copy)]
+pub enum Push {
+    Approve,
+    Deny,
+}
 
 #[derive(Default, Clone)]
 pub struct GatewayOptions {
@@ -47,6 +60,10 @@ pub struct GatewayOptions {
     pub wrong_name: bool,
     /// Apresenta um certificado cuja chave privada não é a usada no handshake (como um MITM que só copiou o certificado).
     pub mismatched_key: bool,
+    /// O `logincheck` pede um token e só entrega o cookie com `code=<OTP>`.
+    pub require_otp: bool,
+    /// O `logincheck` oferece push; o cookie vem (ou não) depois de `PUSH_DELAY`.
+    pub push: Option<Push>,
 }
 
 struct Shared {
@@ -190,16 +207,37 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
     let response = if request_line.starts_with("POST /remote/logincheck ") {
         let form = parse_form(&body);
         let field = |name: &str| form.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-        let ok = field("username") == Some(USERNAME)
-            && field("credential") == Some(PASSWORD)
-            && field("realm") == Some("")
-            && field("just_logged_in") == Some("1")
-            && field("redir") == Some("/remote/index")
-            && field("ajax") == Some("1");
-        if ok {
-            http(&format!("Set-Cookie: SVPNCOOKIE={}; path=/; secure; httponly\r\n", COOKIE), "ret=1,redir=/remote/fortisslvpn_xml")
+        let granted = http(&format!("Set-Cookie: SVPNCOOKIE={}; path=/; secure; httponly\r\n", COOKIE), "ret=1,redir=/remote/fortisslvpn_xml");
+        let denied = http("Set-Cookie: SVPNCOOKIE=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n", "ret=0,redir=/remote/login?&err=sslvpn_login_permission_denied");
+        let token_mode = shared.options.require_otp || shared.options.push.is_some();
+        if field("reqid").is_some() {
+            // Segundo passo: o cliente devolve o desafio inteiro, mais o código ou o pedido de push.
+            let echoed = field("username") == Some(USERNAME) && CHALLENGE.iter().all(|(k, v)| field(k) == Some(*v));
+            let approved = if field("code").is_some() {
+                shared.options.require_otp && field("code") == Some(OTP)
+            } else if field("ftm_push") == Some("1") {
+                tokio::time::sleep(PUSH_DELAY).await;
+                matches!(shared.options.push, Some(Push::Approve))
+            } else {
+                false
+            };
+            if token_mode && echoed && approved { granted } else { denied }
         } else {
-            http("Set-Cookie: SVPNCOOKIE=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n", "ret=0,redir=/remote/login?&err=sslvpn_login_permission_denied")
+            let ok = field("username") == Some(USERNAME)
+                && field("credential") == Some(PASSWORD)
+                && field("realm") == Some("")
+                && field("just_logged_in") == Some("1")
+                && field("redir") == Some("/remote/index")
+                && field("ajax") == Some("1");
+            if !ok {
+                denied
+            } else if token_mode {
+                let tokeninfo = if shared.options.push.is_some() { "ftm_push" } else { "" };
+                let fields: String = CHALLENGE.iter().map(|(k, v)| format!(",{}={}", k, v)).collect();
+                http("", &format!("ret=2,tokeninfo={},chal_msg=Please enter your token code{}", tokeninfo, fields))
+            } else {
+                granted
+            }
         }
     } else if request_line.starts_with("GET /remote/fortisslvpn_xml ") && has_cookie && header("host").as_deref() == Some("sslvpn") {
         http("", &xml(&shared.options))
