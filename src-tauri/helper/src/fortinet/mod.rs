@@ -32,6 +32,8 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Prazo da aprovação do push. Que o gateway segure a resposta até a aprovação é inferência
 /// (ver `docs/fortinet-protocol.md`); os 60 s são escolha nossa, não do protocolo.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Intervalo do LCP Echo-Request com o túnel de pé; 3 sem resposta = túnel morto (~30 s).
+const ECHO_INTERVAL: Duration = Duration::from_secs(10);
 /// Valores do pedido de token que o segundo passo do login devolve ao gateway.
 const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
 // shortcut: sem `sso_port` e `remoteauthtimeout` no `/remote/info` valem 8020 e 120 s, os do gateway testado; trocar por erro se aparecer gateway com outros valores e sem os campos.
@@ -126,6 +128,7 @@ pub struct Gateway {
     /// Digest do último certificado que o verificador recusou.
     refused: Arc<Mutex<Option<String>>>,
     push_timeout: Duration,
+    echo_interval: Duration,
 }
 
 /// A task do túnel; abortá-la (ou soltá-la) fecha a conexão TLS.
@@ -161,11 +164,17 @@ impl Gateway {
             log,
             refused,
             push_timeout: PUSH_TIMEOUT,
+            echo_interval: ECHO_INTERVAL,
         })
     }
 
     pub fn with_push_timeout(mut self, timeout: Duration) -> Self {
         self.push_timeout = timeout;
+        self
+    }
+
+    pub fn with_echo_interval(mut self, interval: Duration) -> Self {
+        self.echo_interval = interval;
         self
     }
 
@@ -335,7 +344,7 @@ impl Gateway {
         let (to_iface, rx) = mpsc::channel(256);
         let (tx, from_iface) = mpsc::channel(256);
         let (up_tx, up_rx) = oneshot::channel();
-        let mut tunnel = Tunnel(tokio::spawn(ppp::run(stream, mtu, up_tx, to_iface, from_iface)));
+        let mut tunnel = Tunnel(tokio::spawn(ppp::run(stream, mtu, self.echo_interval, up_tx, to_iface, from_iface)));
         let up = match tokio::time::timeout(STEP_TIMEOUT, up_rx).await {
             Ok(Ok(up)) => up,
             Ok(Err(_)) => return Err(tunnel.closed().await),

@@ -17,6 +17,18 @@ const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolução da velocidade que a GUI calcula; mais curto pesa sem ganho visível.
 const BANDWIDTH_INTERVAL: Duration = Duration::from_secs(1);
+/// Antecedência do aviso de expiração da sessão.
+const EXPIRY_WARNING: Duration = Duration::from_secs(15 * 60);
+
+/// Por que uma sessão conectada caiu sem o usuário pedir; a GUI oferece reconectar.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cause {
+    /// Túnel morto: echo sem resposta, TLS fechado ou PPP encerrado pelo gateway.
+    TunnelDropped,
+    /// Chegou o `expires_at` (`auth-timeout` do gateway).
+    Expired,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
@@ -28,6 +40,9 @@ pub enum State {
         /// sha256 hex do certificado recusado, quando a causa é certificado não confiável.
         #[serde(skip_serializing_if = "Option::is_none")]
         cert_digest: Option<String>,
+        /// Só quando uma sessão conectada caiu ou expirou; ausente em erro de login e desconexão normal.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
     Connecting {
         profile_id: String,
@@ -58,6 +73,8 @@ pub enum Event {
     Log { line: String },
     /// Totais da sessão, em bytes de pacotes IP, a cada intervalo (também sem tráfego, para a GUI ver a velocidade cair a zero).
     Bandwidth { rx_bytes: u64, tx_bytes: u64 },
+    /// A sessão expira em até `EXPIRY_WARNING`; sai uma vez por sessão.
+    Expiring { expires_at: String },
 }
 
 /// Bytes IP que passaram pelo túnel desde o início da sessão (rx = do gateway, tx = para ele).
@@ -115,6 +132,7 @@ pub struct Session {
     applied: Mutex<net::Applied>,
     events: broadcast::Sender<Event>,
     push_timeout: Option<Duration>,
+    echo_interval: Option<Duration>,
     bandwidth_interval: Duration,
 }
 
@@ -133,10 +151,11 @@ impl Session {
         Self {
             os,
             trust: Arc::new(trust),
-            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None, stopping: false }),
+            inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None, cause: None }, cancel: None, stopping: false }),
             applied: Mutex::default(),
             events: broadcast::channel(256).0,
             push_timeout: None,
+            echo_interval: None,
             bandwidth_interval: BANDWIDTH_INTERVAL,
         }
     }
@@ -145,6 +164,13 @@ impl Session {
     #[cfg(test)]
     pub fn with_bandwidth_interval(mut self, interval: Duration) -> Self {
         self.bandwidth_interval = interval;
+        self
+    }
+
+    /// Intervalo curto do LCP echo, só para testes.
+    #[cfg(test)]
+    pub fn with_echo_interval(mut self, interval: Duration) -> Self {
+        self.echo_interval = Some(interval);
         self
     }
 
@@ -190,6 +216,9 @@ impl Session {
         if let Some(timeout) = self.push_timeout {
             gateway = gateway.with_push_timeout(timeout);
         }
+        if let Some(interval) = self.echo_interval {
+            gateway = gateway.with_echo_interval(interval);
+        }
         let gateway = Arc::new(gateway);
         let cancel = Arc::new(Notify::new());
         {
@@ -209,11 +238,12 @@ impl Session {
             let s = session.clone();
             let g = gateway.clone();
             let run = tokio::spawn(async move { s.drive(&profile, &g, &password, otp.as_deref(), &cancel).await });
-            let reason = match run.await {
-                Ok(reason) => reason,
+            let (reason, cause) = match run.await {
+                Ok(Some((reason, cause))) => (Some(reason), cause),
+                Ok(None) => (None, None),
                 Err(e) => {
                     session.teardown();
-                    Some(format!("Session task failed: {}", e))
+                    (Some(format!("Session task failed: {}", e)), None)
                 }
             };
             if let Some(r) = &reason {
@@ -223,7 +253,7 @@ impl Session {
             inner.cancel = None;
             // Só a recusa de certificado deste connect põe o digest no estado.
             let cert_digest = reason.as_ref().and_then(|_| gateway.refused_digest());
-            Self::set_state(&mut inner, &session.events, State::Disconnected { reason, cert_digest });
+            Self::set_state(&mut inner, &session.events, State::Disconnected { reason, cert_digest, cause });
         });
         Ok(())
     }
@@ -260,13 +290,14 @@ impl Session {
         net::teardown(&*self.os, &self.applied);
     }
 
-    /// Conduz a sessão até o fim e devolve o motivo (None = desconexão pedida pelo usuário).
-    async fn drive(&self, profile: &Profile, gw: &Gateway, password: &str, otp: Option<&str>, cancel: &Notify) -> Option<String> {
+    /// Conduz a sessão até o fim e devolve o motivo, com a causa se a sessão já estava
+    /// conectada (None = desconexão pedida pelo usuário).
+    async fn drive(&self, profile: &Profile, gw: &Gateway, password: &str, otp: Option<&str>, cancel: &Notify) -> Option<(String, Option<Cause>)> {
         self.log(format!("connecting to {}:{}", profile.host, profile.port));
         let cookie = tokio::select! {
             r = self.authenticate(profile, gw, password, otp) => match r {
                 Ok(c) => c,
-                Err(e) => return Some(e),
+                Err(e) => return Some((e, None)),
             },
             _ = cancel.notified() => return None,
         };
@@ -281,7 +312,7 @@ impl Session {
             Ok(t) => t,
             Err(e) => {
                 self.logout(gw, &cookie).await;
-                return Some(e);
+                return Some((e, None));
             }
         };
 
@@ -314,7 +345,7 @@ impl Session {
                 self.teardown();
                 drop(tunnel);
                 self.logout(gw, &cookie).await;
-                return Some(e);
+                return Some((e, None));
             }
         }
         let stopped = {
@@ -350,16 +381,36 @@ impl Session {
             }
         });
 
-        let reason = tokio::select! {
-            r = tunnel.closed() => Some(r),
+        // shortcut: o prazo corre no relógio monotônico, que no macOS para durante o sleep; com a
+        // máquina dormindo a expiração atrasa, mas o echo derruba o túnel ao acordar. Conferir o
+        // relógio de parede se o aviso atrasado incomodar.
+        let expires_in = config.expires_at.map(|at| (at - Utc::now()).to_std().unwrap_or_default());
+        if let (Some(at), Some(left)) = (config.expires_at, expires_in) {
+            let events = self.events.clone();
+            tasks.spawn(async move {
+                tokio::time::sleep(left.saturating_sub(EXPIRY_WARNING)).await;
+                let _ = events.send(Event::Expiring { expires_at: rfc3339(at) });
+            });
+        }
+        let expired = async {
+            match expires_in {
+                Some(left) => tokio::time::sleep(left).await,
+                None => std::future::pending().await,
+            }
+        };
+        let ended = tokio::select! {
+            r = tunnel.closed() => Some((r, Some(Cause::TunnelDropped))),
+            _ = expired => Some(("Session expired".to_string(), Some(Cause::Expired))),
             _ = cancel.notified() => None,
         };
         drop(tunnel);
         self.teardown();
-        if reason.is_none() {
+        // Sem logout na queda nem na expiração: o gateway não responde ou já encerrou a sessão,
+        // e o prazo do logout só atrasaria o `disconnected`.
+        if ended.is_none() {
             self.logout(gw, &cookie).await;
         }
-        reason
+        ended
     }
 
     /// Login em um ou dois passos. Com o gateway pedindo token: usa o OTP se houver,
@@ -413,7 +464,7 @@ mod tests {
     use crate::net::Route;
     use crate::testing::fake_gateway::*;
     use crate::testing::fake_os::{Failure, FakeOs, OsCall};
-    use crate::testing::{connect, SAML_PORTS, start_with_bandwidth_interval, start_with_os, start_with_push_timeout, start_with_roots, Client};
+    use crate::testing::{connect, SAML_PORTS, start_with_bandwidth_interval, start_with_echo_interval, start_with_os, start_with_push_timeout, start_with_roots, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
         json!({"v": 2, "cmd": "connect", "profile": gw.profile(), "password": password, "otp": null})
@@ -1247,5 +1298,83 @@ mod tests {
         let reason = state["reason"].as_str().unwrap();
         assert!(reason.contains(&format!("port {} is already in use", gw.sso_port)) && reason.contains("FortiClient"), "{}", reason);
         assert!(os.calls().is_empty());
+    }
+
+    // ---- Túnel morto e expiração ----
+
+    /// Intervalo curto do LCP echo nos testes; a produção usa 10 s.
+    const ECHO: Duration = Duration::from_millis(50);
+
+    async fn connected_with_echo(options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value) {
+        let gw = FakeGateway::start(options).await;
+        let (path, _session, os) = start_with_echo_interval(ECHO).await;
+        let mut c = client(&path).await;
+        let state = connect_with(&mut c, &gw, PASSWORD).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        (gw, c, os, state)
+    }
+
+    fn assert_dropped(state: &Value, cause: &str, reason: &str) {
+        assert_eq!(state["state"], "disconnected", "{}", state);
+        assert_eq!(state["cause"], cause, "{}", state);
+        assert!(state["reason"].as_str().unwrap().contains(reason), "{}", state);
+    }
+
+    #[tokio::test]
+    async fn gateway_that_stops_answering_echo_is_a_dead_tunnel_after_three_misses() {
+        let (gw, mut c, os, _) = connected_with_echo(GatewayOptions { mute_echo: true, ..Default::default() }).await;
+        let started = Instant::now();
+        let state = c.recv_skipping_logs().await;
+        assert_dropped(&state, "tunnel-dropped", "Tunnel dropped: no response from the gateway");
+        // 3 echos seguidos sem resposta e o tick seguinte constata a falta; o Echo-Request que o fake
+        // manda logo depois do IPCP pode zerar a contagem depois do primeiro echo, daí até 4.
+        assert!((3..=4).contains(&gw.echo_requests()), "{} echo requests", gw.echo_requests());
+        assert!(started.elapsed() < ECHO * 10, "took {:?}", started.elapsed());
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert!(os.calls().contains(&OsCall::Down));
+        assert_eq!(gw.logouts(), 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_closing_the_tunnel_tears_down_at_once() {
+        // Echo no intervalo de produção (10 s): só o TLS fechado explica a queda dentro do prazo do recv.
+        let (gw, mut c, os, _) = connected(GatewayOptions::default()).await;
+        gw.close_tunnel();
+        let state = c.recv_skipping_logs().await;
+        assert_dropped(&state, "tunnel-dropped", "Tunnel dropped: connection closed by the gateway");
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(gw.logouts(), 0);
+    }
+
+    #[tokio::test]
+    async fn short_auth_timeout_warns_and_then_expires_the_session() {
+        let (gw, mut c, os, connected) = connected(GatewayOptions { auth_timeout: Some(1), ..Default::default() }).await;
+        // Faltando menos que a antecedência do aviso, ele sai logo depois do connected.
+        let warning = c.recv_skipping_logs().await;
+        assert_eq!(warning["event"], "expiring", "{}", warning);
+        assert_eq!(warning["expires_at"], connected["expires_at"]);
+        assert!(!os.applied().is_empty(), "torn down before the expiry");
+
+        let state = c.recv_skipping_logs().await;
+        assert_dropped(&state, "expired", "Session expired");
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(gw.logouts(), 0);
+    }
+
+    #[tokio::test]
+    async fn healthy_session_stays_connected_past_three_echo_intervals() {
+        // Expiração em 8 h (sem aviso agora) e sem expiração (`auth-timeout` 0).
+        for auth_timeout in [None, Some(0)] {
+            let (gw, mut c, os, state) = connected_with_echo(GatewayOptions { auth_timeout, ..Default::default() }).await;
+            assert_eq!(state["expires_at"].is_null(), auth_timeout == Some(0), "{}", state);
+            tokio::time::sleep(ECHO * 6).await;
+            assert!(gw.echo_requests() >= 4, "only {} echo requests", gw.echo_requests());
+            c.send(json!({"v": 2, "cmd": "status"})).await;
+            // Nem `expiring` nem `disconnected` antes da resposta.
+            let resp = c.recv_skipping_logs().await;
+            assert_eq!(resp["type"], "response", "{}", resp);
+            assert_eq!(resp["state"], "connected", "{}", resp);
+            assert!(!os.applied().is_empty());
+        }
     }
 }

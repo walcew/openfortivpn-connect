@@ -95,17 +95,26 @@ Depois vem o PPP sem HDLC (sem flags, escape nem FCS). O Engine envia o campo de
 
 ### PPP
 
-- **LCP** (`0xC021`): o Engine pede MRU (= MTU) e Magic-Number. Do gateway aceita MRU, ACCM e Magic-Number e rejeita o resto (autenticação, PFC, ACFC). Nak troca o valor da opção e Reject a remove; nos dois casos o pedido é refeito (**rfc**). Echo-Request do gateway recebe Echo-Reply com o nosso magic. Terminate-Request recebe Terminate-Ack e encerra o túnel.
+- **LCP** (`0xC021`): o Engine pede MRU (= MTU) e Magic-Number. Do gateway aceita MRU, ACCM e Magic-Number e rejeita o resto (autenticação, PFC, ACFC). Nak troca o valor da opção e Reject a remove; nos dois casos o pedido é refeito (**rfc**). Echo-Request do gateway recebe Echo-Reply com o nosso magic. Terminate-Request recebe Terminate-Ack e encerra o túnel. Com o IPCP aberto, o Engine manda um Echo-Request (com o nosso magic) a cada 10 s; veja "Túnel morto e expiração".
 - **IPCP** (`0x8021`): começa quando o LCP abre. O Engine pede IP-Address `0.0.0.0` e DNS primário e secundário (129 e 131) zerados; o gateway responde com Nak trazendo os valores atribuídos, e o pedido é refeito com eles (**rfc**). Do gateway aceita só IP-Address, que vira o peer. IPCP aberto com IP `0.0.0.0` é erro.
 - **IP** (`0x0021`): depois do IPCP, pacotes IPv4 passam nos dois sentidos entre o túnel e o canal da camada de rede.
 - Outros protocolos (IPv6CP, CCP) recebem Protocol-Reject depois que o LCP abre. Não há IPv6CP.
 
 DNS do XML tem prioridade; os do IPCP só valem se o XML não trouxer nenhum (**inf**). Isso diverge do v1: lá, sem DNS no XML, o `dns_fallback` (DNS do sistema mais Google) entra mesmo que o IPCP traga DNS; no v2 o fallback só entra se nem o XML nem o IPCP trouxerem (o DNS do IPCP é o do próprio gateway).
 
+### Túnel morto e expiração
+
+- **Echo:** o primeiro Echo-Request sai assim que o IPCP abre e os seguintes a cada 10 s. Qualquer pacote LCP do gateway (Echo-Reply, Echo-Request dele etc.) zera a contagem. Três Echo-Request seguidos sem nenhum LCP de volta derrubam o túnel no tick seguinte, cerca de 30 s depois da última resposta, com o motivo `Tunnel dropped: no response from the gateway` (**rfc** para o echo; os 10 s e as 3 faltas são escolha nossa, da spec).
+- **TLS fechado:** EOF no stream vira `Tunnel dropped: connection closed by the gateway`, e erro de leitura vira `Tunnel dropped: read failed: ...`. Terminate-Request e erro de escrita também encerram o túnel.
+- **Expiração:** `expires_at` (agora + `auth-timeout`, calculado ao abrir o túnel) dispara o evento `expiring` 15 min antes (ou logo ao conectar, se faltar menos que isso) e, no horário, encerra a sessão com o motivo `Session expired`. Sem `auth-timeout` (ou com `0`), não há aviso nem encerramento por tempo. O prazo corre no relógio monotônico, que no macOS para durante o sleep: com a máquina dormindo, a expiração atrasa e quem derruba a sessão ao acordar é o echo.
+- Nos dois casos o teardown (utun, rotas, /32 do gateway, DNS) é imediato, sem logout: na queda o gateway não responde, na expiração ele já encerrou a sessão, e o prazo do logout só atrasaria a volta da rede. Não há reconexão automática.
+
+No contrato v2, essas quedas saem como `{"event":"state","state":"disconnected","reason":"...","cause":"tunnel-dropped"|"expired"}`. O campo `cause` só aparece quando uma sessão já conectada caiu ou expirou; erro de login e desconexão pedida pelo usuário não o trazem. O aviso é o evento `{"v":2,"type":"event","event":"expiring","expires_at":"<RFC 3339>"}`, emitido uma vez por sessão e não repetido a quem abrir o canal de eventos depois.
+
 ## 4. Logout
 
-`GET /remote/logout` com o cookie, no disconnect pedido pelo usuário, com prazo de 2 s (**obs**: o FortiClient chama no fim da sessão). Resposta e erro são ignorados.
+`GET /remote/logout` com o cookie, no disconnect pedido pelo usuário, com prazo de 2 s (**obs**: o FortiClient chama no fim da sessão). Resposta e erro são ignorados. Queda do túnel e expiração não fazem logout.
 
 ## O que ainda não está aqui
 
-SAML embutido (sem `redirect`), LCP echo do cliente para detectar túnel morto, aviso e teardown na expiração, DTLS, `tun`/`websocket` e IPv6.
+SAML embutido (sem `redirect`), echo imediato na troca de rede e no wake, DTLS, `tun`/`websocket` e IPv6.

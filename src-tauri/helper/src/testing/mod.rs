@@ -87,6 +87,13 @@ pub async fn start_with_bandwidth_interval(interval: Duration) -> (PathBuf, Arc<
     (path, session, os)
 }
 
+/// Como `start_with_os`, com o LCP echo neste intervalo em vez de a cada 10 s.
+pub async fn start_with_echo_interval(interval: Duration) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
+    let os = Arc::new(FakeOs::default());
+    let (path, session) = start_session(allow_all(), Session::new(os.clone()).with_echo_interval(interval)).await;
+    (path, session, os)
+}
+
 async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<Session>) {
     start_session(authorizer, Session::new(os)).await
 }
