@@ -31,6 +31,7 @@ pub struct FakeOs {
     packets: Mutex<Option<Packets>>,
     add_route: Failure,
     add_gateway_route: Failure,
+    set_dns: Failure,
 }
 
 impl FakeOs {
@@ -42,6 +43,11 @@ impl FakeOs {
     /// Fake cujo `add_gateway_route` falha com erro depois de registrar a chamada.
     pub fn failing_add_gateway_route() -> Self {
         Self { add_gateway_route: Failure::Error, ..Default::default() }
+    }
+
+    /// Fake cujo `set_dns` falha com erro depois de registrar a chamada.
+    pub fn failing_set_dns() -> Self {
+        Self { set_dns: Failure::Error, ..Default::default() }
     }
 
     pub fn calls(&self) -> Vec<OsCall> {
@@ -97,7 +103,10 @@ impl Os for FakeOs {
     }
     fn set_dns(&self, servers: &[Ipv4Addr], suffixes: &[String]) -> Result<(), String> {
         self.record(OsCall::SetDns { servers: servers.to_vec(), suffixes: suffixes.to_vec() });
-        Ok(())
+        match self.set_dns {
+            Failure::Error => Err("fake set_dns failure".into()),
+            _ => Ok(()),
+        }
     }
     fn remove_dns(&self) {
         self.record(OsCall::RemoveDns);
