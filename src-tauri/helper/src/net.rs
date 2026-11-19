@@ -5,6 +5,10 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use tokio::sync::mpsc;
 
+pub mod system;
+
+pub use system::SystemOs;
+
 /// Rede IPv4 por endereço e máscara, como o gateway as envia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Route {
@@ -31,7 +35,6 @@ pub struct TunnelConfig {
 /// Canal de pacotes IP visto do lado da interface: `tx` manda para o gateway e `rx`
 /// entrega o que chegou dele.
 #[derive(Debug)]
-#[allow(dead_code)] // fora dos testes, quem lê é o `SystemOs` do ticket #10
 pub struct Packets {
     pub tx: mpsc::Sender<Vec<u8>>,
     pub rx: mpsc::Receiver<Vec<u8>>,
@@ -78,28 +81,4 @@ pub fn teardown(os: &dyn Os, config: &TunnelConfig) {
     os.remove_dns();
     os.down();
     os.remove_gateway_route(config.gateway);
-}
-
-/// A implementação real da camada de SO.
-// shortcut: todo apply falha com "not implemented" e as remoções não fazem nada, o ticket #10 implementa utun, rotas e DNS.
-pub struct SystemOs;
-
-const NOT_IMPLEMENTED: &str = "network layer not implemented yet";
-
-impl Os for SystemOs {
-    fn up(&self, _ip: Ipv4Addr, _peer: Ipv4Addr, _mtu: u16, _packets: Packets) -> Result<(), String> {
-        Err(NOT_IMPLEMENTED.into())
-    }
-    fn add_route(&self, _route: Route) -> Result<(), String> {
-        Err(NOT_IMPLEMENTED.into())
-    }
-    fn add_gateway_route(&self, _gateway: IpAddr) -> Result<(), String> {
-        Err(NOT_IMPLEMENTED.into())
-    }
-    fn set_dns(&self, _servers: &[Ipv4Addr], _suffixes: &[String]) -> Result<(), String> {
-        Err(NOT_IMPLEMENTED.into())
-    }
-    fn remove_dns(&self) {}
-    fn remove_gateway_route(&self, _gateway: IpAddr) {}
-    fn down(&self) {}
 }
