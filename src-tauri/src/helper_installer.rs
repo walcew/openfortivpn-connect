@@ -5,10 +5,21 @@ use tauri::{AppHandle, Manager};
 
 use crate::helper_client;
 
-const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.openvpngui.helper";
-const PLIST_INSTALL_PATH: &str = "/Library/LaunchDaemons/com.openvpngui.helper.plist";
-// Par de OPENFORTIVPN_PATH em helper/src/validation.rs; o fallback sem Helper usa este.
-pub(crate) const OPENFORTIVPN_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/openfortivpn";
+const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.vpnconnect.helper";
+const PLIST_INSTALL_PATH: &str = "/Library/LaunchDaemons/com.vpnconnect.helper.plist";
+
+// Artefatos da 0.3.0 (label, binário, plist, socket e log do Helper antigo, o openfortivpn
+// bundlado e a chave de DNS dele), removidos no mesmo passo que instala o Helper novo.
+const LEGACY_LABEL: &str = "com.openvpngui.helper";
+const LEGACY_PLIST_PATH: &str = "/Library/LaunchDaemons/com.openvpngui.helper.plist";
+const LEGACY_FILES: [&str; 5] = [
+    "/Library/PrivilegedHelperTools/com.openvpngui.helper",
+    "/Library/PrivilegedHelperTools/openfortivpn",
+    "/var/run/openvpngui-helper.sock",
+    "/var/log/openvpngui-helper.log",
+    "/tmp/openvpngui-*.log",
+];
+const LEGACY_DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
 
 const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -16,10 +27,10 @@ const PLIST_CONTENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.openvpngui.helper</string>
+    <string>com.vpnconnect.helper</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/PrivilegedHelperTools/com.openvpngui.helper</string>
+        <string>/Library/PrivilegedHelperTools/com.vpnconnect.helper</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -48,7 +59,6 @@ pub struct HelperStatus {
 
 /// Check the current status of the helper daemon.
 pub fn check_status() -> HelperStatus {
-    let openfortivpn_installed = Path::new(OPENFORTIVPN_INSTALL_PATH).exists();
     let installed = Path::new(HELPER_INSTALL_PATH).exists()
         && Path::new(PLIST_INSTALL_PATH).exists();
 
@@ -57,11 +67,7 @@ pub fn check_status() -> HelperStatus {
         Err(_) => (false, None),
     };
 
-    let update_needed = needs_update(
-        version.as_deref(),
-        env!("CARGO_PKG_VERSION"),
-        openfortivpn_installed,
-    );
+    let update_needed = needs_update(version.as_deref(), env!("CARGO_PKG_VERSION"));
 
     HelperStatus {
         installed,
@@ -71,14 +77,9 @@ pub fn check_status() -> HelperStatus {
     }
 }
 
-/// Um Helper ativo precisa ser reinstalado quando a versão difere da do app ou
-/// quando falta o Bundled openfortivpn que ele executa.
-fn needs_update(
-    installed_version: Option<&str>,
-    expected_version: &str,
-    openfortivpn_installed: bool,
-) -> bool {
-    installed_version.is_some_and(|v| v != expected_version || !openfortivpn_installed)
+/// Um Helper ativo precisa ser reinstalado quando a versão difere da do app.
+fn needs_update(installed_version: Option<&str>, expected_version: &str) -> bool {
+    installed_version.is_some_and(|v| v != expected_version)
 }
 
 /// Escape a string for inclusion in an AppleScript double-quoted string.
@@ -104,16 +105,54 @@ fn admin_script(cmd: &str) -> String {
     )
 }
 
+/// Comandos de shell que removem o Helper da 0.3.0. Tolerantes: numa instalação nova nada disso
+/// existe, e o passo não pode derrubar o `set -e` do chamador.
+fn legacy_cleanup_cmd() -> String {
+    // O unload derruba o Helper antigo e os filhos dele; o `remove` cobre o label carregado sem plist.
+    let mut cmd = format!(
+        "launchctl unload -w {plist} 2>/dev/null || true; \
+         launchctl remove {label} 2>/dev/null || true; \
+         echo {remove_dns} | /usr/sbin/scutil || true; ",
+        plist = shell_quote(LEGACY_PLIST_PATH),
+        label = LEGACY_LABEL,
+        remove_dns = shell_quote(&format!("remove {}", LEGACY_DNS_KEY)),
+    );
+    // Sem aspas: o glob do /tmp precisa expandir.
+    cmd.push_str(&format!("rm -f {} {}", LEGACY_FILES.join(" "), LEGACY_PLIST_PATH));
+    cmd
+}
+
+/// Script único de instalação: remove o Helper antigo e instala o novo. `set -e`: qualquer
+/// passo que falhe faz o osascript falhar.
+fn install_cmd(bundled_helper: &str) -> String {
+    format!(
+        "set -e; \
+         {legacy}; \
+         launchctl unload -w {plist_path} 2>/dev/null || true; \
+         mkdir -p /Library/PrivilegedHelperTools; \
+         cp {helper_src} {helper_dst}; \
+         chmod 755 {helper_dst}; \
+         chown root:wheel {helper_dst}; \
+         echo {plist_content} > {plist_path}; \
+         chmod 644 {plist_path}; \
+         chown root:wheel {plist_path}; \
+         launchctl load -w {plist_path}",
+        legacy = legacy_cleanup_cmd(),
+        helper_src = shell_quote(bundled_helper),
+        helper_dst = HELPER_INSTALL_PATH,
+        plist_path = PLIST_INSTALL_PATH,
+        plist_content = shell_quote(PLIST_CONTENT),
+    )
+}
+
 /// Install the helper daemon using osascript (one-time admin password).
-/// The helper and openfortivpn binaries are read from the app bundle's resources.
+/// The helper binary is read from the app bundle's resources.
 pub fn install(app_handle: &AppHandle) -> Result<(), String> {
-    // Locate the helper binary in the app bundle resources
     let resource_dir = app_handle
         .path()
         .resource_dir()
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
     let bundled_helper = resource_dir.join("openvpngui-helper");
-    let bundled_openfortivpn = resource_dir.join("openfortivpn");
 
     if !bundled_helper.exists() {
         return Err(format!(
@@ -121,37 +160,8 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
             bundled_helper
         ));
     }
-    if !bundled_openfortivpn.exists() {
-        return Err(format!(
-            "openfortivpn binary not found in bundle at {:?}",
-            bundled_openfortivpn
-        ));
-    }
 
-    // set -e: qualquer passo que falhe (ex.: cp do openfortivpn) faz o osascript falhar.
-    let cmd = format!(
-        "set -e; \
-         launchctl unload -w {plist_path} 2>/dev/null || true; \
-         mkdir -p /Library/PrivilegedHelperTools; \
-         cp {helper_src} {helper_dst}; \
-         chmod 755 {helper_dst}; \
-         chown root:wheel {helper_dst}; \
-         rm -f {openfortivpn_dst}; \
-         cp {openfortivpn_src} {openfortivpn_dst}; \
-         chmod 755 {openfortivpn_dst}; \
-         chown root:wheel {openfortivpn_dst}; \
-         echo {plist_content} > {plist_path}; \
-         chmod 644 {plist_path}; \
-         chown root:wheel {plist_path}; \
-         launchctl load -w {plist_path}",
-        helper_src = shell_quote(&bundled_helper.to_string_lossy()),
-        helper_dst = HELPER_INSTALL_PATH,
-        openfortivpn_src = shell_quote(&bundled_openfortivpn.to_string_lossy()),
-        openfortivpn_dst = OPENFORTIVPN_INSTALL_PATH,
-        plist_path = PLIST_INSTALL_PATH,
-        plist_content = shell_quote(PLIST_CONTENT),
-    );
-    let script = admin_script(&cmd);
+    let script = admin_script(&install_cmd(&bundled_helper.to_string_lossy()));
 
     log::info!("Installing helper daemon via osascript");
 
@@ -184,18 +194,19 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     }
 }
 
-/// Uninstall the helper daemon.
+/// Uninstall the helper daemon (e qualquer resto da 0.3.0).
 pub fn uninstall() -> Result<(), String> {
     let script = admin_script(&format!(
         "set -e; \
+         {legacy}; \
          launchctl unload -w {plist} 2>/dev/null || true; \
          rm -f {helper}; \
-         rm -f {openfortivpn}; \
          rm -f {plist}; \
-         rm -f /var/run/openvpngui-helper.sock",
+         rm -f {socket}",
+        legacy = legacy_cleanup_cmd(),
         helper = HELPER_INSTALL_PATH,
-        openfortivpn = OPENFORTIVPN_INSTALL_PATH,
         plist = PLIST_INSTALL_PATH,
+        socket = helper_client::SOCKET_PATH,
     ));
 
     let output = Command::new("osascript")
@@ -217,7 +228,7 @@ pub fn uninstall() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_script, needs_update, shell_quote};
+    use super::*;
 
     /// Roda o AppleScript de verdade, sem o privilégio de admin, e devolve o stdout.
     fn run_without_admin(script: &str) -> String {
@@ -263,22 +274,49 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_with_openfortivpn_needs_no_update() {
-        assert!(!needs_update(Some("0.2.0"), "0.2.0", true));
+    fn up_to_date_helper_needs_no_update() {
+        assert!(!needs_update(Some("0.4.0"), "0.4.0"));
     }
 
     #[test]
     fn version_mismatch_needs_update() {
-        assert!(needs_update(Some("0.1.9"), "0.2.0", true));
-    }
-
-    #[test]
-    fn missing_openfortivpn_needs_update_even_when_version_matches() {
-        assert!(needs_update(Some("0.2.0"), "0.2.0", false));
+        assert!(needs_update(Some("0.3.0"), "0.4.0"));
     }
 
     #[test]
     fn helper_not_running_is_not_an_update() {
-        assert!(!needs_update(None, "0.2.0", false));
+        assert!(!needs_update(None, "0.4.0"));
+    }
+
+    #[test]
+    fn install_is_one_admin_script_that_removes_the_old_helper_before_the_new_one_loads() {
+        let cmd = install_cmd("/Applications/App.app/Contents/Resources/openvpngui-helper");
+        let at = |needle: &str| cmd.find(needle).unwrap_or_else(|| panic!("missing {needle} in {cmd}"));
+        let old_unload = at("launchctl unload -w '/Library/LaunchDaemons/com.openvpngui.helper.plist'");
+        let old_remove = at("launchctl remove com.openvpngui.helper");
+        let old_dns = at("remove State:/Network/Service/OpenFortiVPN/DNS");
+        let old_files = at("rm -f /Library/PrivilegedHelperTools/com.openvpngui.helper /Library/PrivilegedHelperTools/openfortivpn /var/run/openvpngui-helper.sock");
+        let new_copy = at("cp '/Applications/App.app/Contents/Resources/openvpngui-helper' /Library/PrivilegedHelperTools/com.vpnconnect.helper");
+        let new_load = at("launchctl load -w /Library/LaunchDaemons/com.vpnconnect.helper.plist");
+        assert!(old_unload < old_remove && old_remove < old_dns && old_dns < old_files);
+        assert!(old_files < new_copy && new_copy < new_load);
+        assert!(cmd.starts_with("set -e; "));
+        assert!(cmd.contains(&format!("{}.plist", "/Library/LaunchDaemons/com.openvpngui.helper")), "old plist is removed too");
+    }
+
+    #[test]
+    fn install_and_legacy_cleanup_are_valid_shell() {
+        // `-n` só confere a sintaxe: rodar o script tocaria nos caminhos reais do Mac.
+        for cmd in [legacy_cleanup_cmd(), install_cmd("/tmp/it's/helper")] {
+            let out = std::process::Command::new("/bin/sh").args(["-n", "-c", &cmd]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    #[test]
+    fn no_new_artifact_carries_the_old_names() {
+        for new in [HELPER_INSTALL_PATH, PLIST_INSTALL_PATH, helper_client::SOCKET_PATH, PLIST_CONTENT] {
+            assert!(!new.contains("openvpngui") && !new.to_lowercase().contains("openfortivpn"), "{new}");
+        }
     }
 }
