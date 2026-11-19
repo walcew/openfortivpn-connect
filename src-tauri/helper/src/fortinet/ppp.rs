@@ -29,7 +29,7 @@ const IPCP_ADDRESS: u8 = 3;
 const IPCP_DNS1: u8 = 129;
 const IPCP_DNS2: u8 = 131;
 
-/// Echo-Requests seguidos sem nenhum LCP do gateway que contam como túnel morto.
+/// Intervalos de echo seguidos sem nenhum LCP do gateway que contam como túnel morto.
 const ECHO_MISSES: u8 = 3;
 
 /// Cabeçalho Fortinet: tamanho total, magic e tamanho do PPP, big-endian.
@@ -54,7 +54,8 @@ enum Action {
 
 /// Conduz o túnel até ele cair e devolve o motivo. `up` dispara quando o IPCP abre;
 /// a partir daí os pacotes IP fluem entre o stream e o canal da interface, e um LCP
-/// Echo-Request sai a cada `echo_interval`; `ECHO_MISSES` seguidos sem LCP de volta derrubam o túnel.
+/// Echo-Request sai a cada `echo_interval`. `ECHO_MISSES` intervalos seguidos sem LCP do gateway,
+/// ou uma escrita que não termina em `ECHO_MISSES` intervalos, derrubam o túnel.
 pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     mtu: u16,
@@ -64,16 +65,18 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     mut from_iface: mpsc::Receiver<Vec<u8>>,
 ) -> String {
     let mut ppp = Ppp::new(mtu, up);
-    if let Err(e) = stream.write_all(&ppp.lcp.request()).await {
-        return format!("Tunnel write failed: {}", e);
+    let deadline = echo_interval * ECHO_MISSES as u32;
+    if let Err(e) = write(&mut stream, &ppp.lcp.request(), deadline).await {
+        return e;
     }
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 65536];
-    // O primeiro tick sai assim que o IPCP abre; Delay evita rajada de ticks atrasados.
-    let mut echo = tokio::time::interval(echo_interval);
+    // Primeiro tick um intervalo depois do início (a negociação leva milissegundos); Delay evita
+    // rajada de ticks atrasados.
+    let mut echo = tokio::time::interval_at(tokio::time::Instant::now() + echo_interval, echo_interval);
     echo.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        // Só `read`, `recv` e `tick` dentro do select: os dois podem ser cancelados sem perder dados.
+        // Só `read`, `recv` e `tick` dentro do select: os três podem ser cancelados sem perder dados.
         tokio::select! {
             r = stream.read(&mut chunk) => {
                 match r {
@@ -89,8 +92,8 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                     };
                     for action in ppp.handle(&payload) {
                         match action {
-                            Action::Send(f) => if let Err(e) = stream.write_all(&f).await {
-                                return format!("Tunnel write failed: {}", e);
+                            Action::Send(f) => if let Err(e) = write(&mut stream, &f, deadline).await {
+                                return e;
                             },
                             // A interface já pode ter sido desfeita no teardown.
                             Action::Deliver(p) => { let _ = to_iface.send(p).await; }
@@ -100,21 +103,32 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             Some(packet) = from_iface.recv(), if ppp.up.is_none() => {
-                if let Err(e) = stream.write_all(&frame(IP, &packet)).await {
-                    return format!("Tunnel write failed: {}", e);
+                if let Err(e) = write(&mut stream, &frame(IP, &packet), deadline).await {
+                    return e;
                 }
             }
             _ = echo.tick(), if ppp.up.is_none() => {
+                // Com a última resposta logo depois de um tick, a queda sai ~3 intervalos depois dela.
+                ppp.missed += 1;
                 if ppp.missed == ECHO_MISSES {
                     return "Tunnel dropped: no response from the gateway".into();
                 }
-                ppp.missed += 1;
                 ppp.echo_id = ppp.echo_id.wrapping_add(1);
-                if let Err(e) = stream.write_all(&packet(LCP, ECHO_REQ, ppp.echo_id, &ppp.magic)).await {
-                    return format!("Tunnel write failed: {}", e);
+                if let Err(e) = write(&mut stream, &packet(LCP, ECHO_REQ, ppp.echo_id, &ppp.magic), deadline).await {
+                    return e;
                 }
             }
         }
+    }
+}
+
+/// Escrita com prazo: num TCP meio aberto o buffer enche e um `write_all` sem prazo travaria
+/// o laço, e com ele o echo, para sempre.
+async fn write<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8], deadline: Duration) -> Result<(), String> {
+    match tokio::time::timeout(deadline, stream.write_all(data)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("Tunnel dropped: write failed: {}", e)),
+        Err(_) => Err("Tunnel dropped: write timed out".into()),
     }
 }
 
@@ -188,7 +202,7 @@ struct Ppp {
     peer: Option<Ipv4Addr>,
     /// Some até o IPCP abrir.
     up: Option<oneshot::Sender<Up>>,
-    /// Echo-Requests sem nenhum LCP do gateway desde o último; qualquer LCP prova que ele responde.
+    /// Ticks de echo sem nenhum LCP do gateway; qualquer LCP prova que ele responde.
     missed: u8,
     echo_id: u8,
 }
@@ -242,7 +256,7 @@ impl Ppp {
             }
             TERM_REQ => {
                 out.push(Action::Send(packet(LCP, TERM_ACK, id, &[])));
-                out.push(Action::Close("Gateway terminated the PPP session".into()));
+                out.push(Action::Close("Tunnel dropped: the gateway terminated the PPP session".into()));
             }
             _ => {
                 self.lcp.configure(code, id, data, |t| matches!(t, LCP_MRU | LCP_ACCM | LCP_MAGIC), out);
@@ -342,4 +356,45 @@ fn ipv4_opt(opts: &Opts, kind: u8) -> Option<Ipv4Addr> {
 
 fn encode_opts(opts: &Opts) -> Vec<u8> {
     opts.iter().flat_map(|(t, v)| [*t, (v.len() + 2) as u8].into_iter().chain(v.iter().copied())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::ReadBuf;
+
+    use super::*;
+
+    /// Stream cuja leitura nunca termina e cuja escrita falha, como um socket com o envio quebrado.
+    struct BrokenWrite;
+
+    impl AsyncRead for BrokenWrite {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for BrokenWrite {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_write_drops_the_tunnel_with_a_clear_reason() {
+        let (up, _) = oneshot::channel();
+        let (to_iface, _) = mpsc::channel(1);
+        let (_, from_iface) = mpsc::channel(1);
+        let reason = run(BrokenWrite, 1354, Duration::from_secs(10), up, to_iface, from_iface).await;
+        assert!(reason.starts_with("Tunnel dropped: write failed:"), "{}", reason);
+    }
 }

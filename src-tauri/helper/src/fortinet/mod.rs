@@ -33,7 +33,7 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 /// (ver `docs/fortinet-protocol.md`); os 60 s são escolha nossa, não do protocolo.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Intervalo do LCP Echo-Request com o túnel de pé; 3 sem resposta = túnel morto (~30 s).
-const ECHO_INTERVAL: Duration = Duration::from_secs(10);
+pub const ECHO_INTERVAL: Duration = Duration::from_secs(10);
 /// Valores do pedido de token que o segundo passo do login devolve ao gateway.
 const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
 // shortcut: sem `sso_port` e `remoteauthtimeout` no `/remote/info` valem 8020 e 120 s, os do gateway testado; trocar por erro se aparecer gateway com outros valores e sem os campos.
@@ -326,7 +326,8 @@ impl Gateway {
     }
 
     /// Lê a config do túnel, abre o `sslvpn-tunnel` e negocia o PPP até o IPCP subir.
-    pub async fn open_tunnel(&self, cookie: &str) -> Result<(TunnelConfig, Packets, Tunnel), String> {
+    /// `login_started` é o início do login, de onde o `auth-timeout` conta.
+    pub async fn open_tunnel(&self, cookie: &str, login_started: chrono::DateTime<chrono::Utc>) -> Result<(TunnelConfig, Packets, Tunnel), String> {
         let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(&svpn_header(cookie)), None).await?;
         if resp.status != 200 {
             return Err(format!("Gateway refused the tunnel configuration (HTTP {})", resp.status));
@@ -360,7 +361,7 @@ impl Gateway {
             full_tunnel: xml.routes.is_empty(),
             routes: xml.routes,
             mtu,
-            expires_at: xml.auth_timeout.map(|s| chrono::Utc::now() + chrono::Duration::seconds(s as i64)),
+            expires_at: xml.auth_timeout.map(|s| login_started + chrono::Duration::seconds(s as i64)),
         };
         Ok((config, Packets { tx, rx }, tunnel))
     }

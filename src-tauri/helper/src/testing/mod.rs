@@ -98,7 +98,7 @@ async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<
     start_session(authorizer, Session::new(os)).await
 }
 
-async fn start_session(authorizer: Authorizer, session: Session) -> (PathBuf, Arc<Session>) {
+pub async fn start_session(authorizer: Authorizer, session: Session) -> (PathBuf, Arc<Session>) {
     let path = std::env::temp_dir().join(format!(
         "ovg-{}-{}.sock",
         std::process::id(),

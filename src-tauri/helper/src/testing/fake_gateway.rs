@@ -94,6 +94,8 @@ struct Shared {
     echo_replies: AtomicUsize,
     echo_requests: AtomicUsize,
     close_tunnel: Notify,
+    stop_reading: Notify,
+    terminate: Notify,
     from_client: mpsc::UnboundedSender<Vec<u8>>,
     to_client: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
@@ -154,6 +156,8 @@ impl FakeGateway {
             echo_replies: AtomicUsize::new(0),
             echo_requests: AtomicUsize::new(0),
             close_tunnel: Notify::new(),
+            stop_reading: Notify::new(),
+            terminate: Notify::new(),
             from_client: from_tx,
             to_client: Mutex::new(Some(to_rx)),
         });
@@ -210,6 +214,16 @@ impl FakeGateway {
     /// Fecha o TLS do túnel aberto (close_notify e FIN), como um gateway que encerra a conexão.
     pub fn close_tunnel(&self) {
         self.shared.close_tunnel.notify_one();
+    }
+
+    /// Para de ler o túnel sem fechá-lo, como um TCP meio aberto: o buffer de envio do cliente enche.
+    pub fn stop_reading(&self) {
+        self.shared.stop_reading.notify_one();
+    }
+
+    /// Manda um LCP Terminate-Request pelo túnel.
+    pub fn terminate(&self) {
+        self.shared.terminate.notify_one();
     }
 
     /// Manda um pacote IP ao cliente pelo túnel.
@@ -424,6 +438,7 @@ const ADDRESS_CONTROL: [u8; 2] = [0xff, 0x03];
 const CONFIGURE_REQUEST: u8 = 1;
 const CONFIGURE_ACK: u8 = 2;
 const CONFIGURE_NAK: u8 = 3;
+const TERMINATE_REQUEST: u8 = 5;
 const ECHO_REQUEST: u8 = 9;
 const ECHO_REPLY: u8 = 10;
 
@@ -468,11 +483,16 @@ fn opts(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: S, shared: Arc<Shared>) {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (frames_tx, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
+    let reader = shared.clone();
     tokio::spawn(async move {
         loop {
             let mut header = [0u8; 6];
-            if rd.read_exact(&mut header).await.is_err() {
-                return;
+            tokio::select! {
+                r = rd.read_exact(&mut header) => if r.is_err() {
+                    return;
+                },
+                // Segura o stream aberto e nunca mais lê.
+                _ = reader.stop_reading.notified() => std::future::pending::<()>().await,
             }
             assert_eq!(header[2..4], FRAME_MAGIC, "bad frame magic from client");
             let len = u16::from_be_bytes([header[4], header[5]]) as usize;
@@ -499,6 +519,10 @@ async fn ppp_server<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: 
             f = frames.recv() => match f { Some(f) => f, None => break },
             Some(p) = to_client.recv(), if ipcp_ours && ipcp_theirs => {
                 let _ = wr.write_all(&ppp_frame(IP, 0, 0, &p)).await;
+                continue;
+            }
+            _ = shared.terminate.notified() => {
+                let _ = wr.write_all(&ppp_frame(LCP, TERMINATE_REQUEST, 9, &[])).await;
                 continue;
             }
             _ = shared.close_tunnel.notified() => {
