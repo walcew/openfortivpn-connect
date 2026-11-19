@@ -4,14 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::handlers;
-use crate::protocol::{
-    Frame, RequestV2, Request, Response, ResponseV2, VersionProbe, VERSION_V2,
-};
+use crate::protocol::{Frame, FrameKind, Request, RequestV2, Response, ResponseV2, VERSION_V2};
 use crate::session::{Event, Session};
 
 pub const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
@@ -20,13 +19,15 @@ pub const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
 pub type Authorizer = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 
 /// Só root e o usuário do console. O dono de /dev/console é o usuário logado na
-/// sessão gráfica (root no login window); é lido a cada conexão porque muda
+/// sessão gráfica (root no login window); é lido a cada checagem porque muda
 /// com a troca rápida de usuário.
 pub fn console_authorizer() -> Authorizer {
-    Arc::new(|uid| {
-        let console = fs::metadata("/dev/console").ok().map(|m| m.uid());
-        is_authorized(uid, console)
-    })
+    policy_authorizer(|| fs::metadata("/dev/console").ok().map(|m| m.uid()))
+}
+
+/// A regra de `is_authorized` com a origem do uid do console injetável.
+pub fn policy_authorizer(console_uid: impl Fn() -> Option<u32> + Send + Sync + 'static) -> Authorizer {
+    Arc::new(move |uid| is_authorized(uid, console_uid()))
 }
 
 fn is_authorized(uid: u32, console_uid: Option<u32>) -> bool {
@@ -51,7 +52,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Ponto de entrada do servidor: tudo que chega pelo socket passa por aqui.
+/// Cada conexão roda numa task própria, para um cliente lento não travar o accept.
 pub async fn serve(listener: UnixListener, session: Arc<Session>, authorizer: Authorizer) {
     loop {
         match listener.accept().await {
@@ -71,6 +72,13 @@ pub async fn serve(listener: UnixListener, session: Arc<Session>, authorizer: Au
     }
 }
 
+type Writer = tokio::net::unix::OwnedWriteHalf;
+
+async fn refuse(writer: &mut Writer, uid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    log::warn!("Refused uid {}", uid);
+    write_line(writer, &Response::error("Unauthorized".to_string())).await
+}
+
 async fn handle_connection(
     stream: UnixStream,
     session: Arc<Session>,
@@ -80,14 +88,12 @@ async fn handle_connection(
     let (reader, mut writer) = stream.into_split();
 
     if !authorizer(uid) {
-        log::warn!("Refused connection from uid {}", uid);
-        write_line(&mut writer, &Response::error("Unauthorized".to_string())).await?;
-        return Ok(());
+        return refuse(&mut writer, uid).await;
     }
 
     let mut lines = BufReader::new(reader).lines();
 
-    // Read exactly one line (one JSON request per connection in v1)
+    // No v1 só a primeira linha é lida: uma requisição por conexão.
     let Some(first) = lines.next_line().await? else {
         return Ok(());
     };
@@ -97,14 +103,16 @@ async fn handle_connection(
     }
     log::debug!("Received: {}", first);
 
-    let is_v2 = serde_json::from_str::<VersionProbe>(&first)
-        .map(|p| p.v.is_some())
-        .unwrap_or(false);
+    let parsed = serde_json::from_str::<Value>(&first);
+    let is_v2 = parsed.as_ref().map_or(false, |v| v.get("v").is_some());
 
     if !is_v2 {
-        let response = match serde_json::from_str::<Request>(&first) {
+        let request = parsed
+            .map_err(|e| e.to_string())
+            .and_then(|v| serde_json::from_value::<Request>(v).map_err(|e| e.to_string()));
+        let response = match request {
             Ok(request) => {
-                // Run handler in blocking task since some handlers do I/O
+                // Os handlers fazem I/O bloqueante, então rodam fora do runtime.
                 tokio::task::spawn_blocking(move || handlers::handle(request))
                     .await
                     .unwrap_or_else(|e| Response::error(format!("Handler panicked: {}", e)))
@@ -115,20 +123,28 @@ async fn handle_connection(
     }
 
     // v2: assina antes de responder para não perder eventos, e começa pelo estado atual.
+    // A conexão é longa, então a autorização é reavaliada a cada requisição e a cada
+    // evento: o usuário do console pode mudar (troca rápida de usuário) depois do accept.
     let mut events = session.subscribe();
-    write_frame(&mut writer, "event", &Event::State(session.state())).await?;
-    let mut pending = Some(first);
+    write_frame(&mut writer, FrameKind::Event, &Event::State(session.state())).await?;
+    let mut pending = Some(parsed);
     loop {
-        let line = match pending.take() {
-            Some(l) => l,
+        let parsed = match pending.take() {
+            Some(p) => p,
             None => tokio::select! {
                 line = lines.next_line() => match line? {
-                    Some(l) => l,
+                    Some(l) if l.trim().is_empty() => continue,
+                    Some(l) => serde_json::from_str::<Value>(&l),
                     None => return Ok(()),
                 },
                 event = events.recv() => {
                     match event {
-                        Ok(e) => write_frame(&mut writer, "event", &e).await?,
+                        Ok(e) => {
+                            if !authorizer(uid) {
+                                return refuse(&mut writer, uid).await;
+                            }
+                            write_frame(&mut writer, FrameKind::Event, &e).await?
+                        }
                         Err(RecvError::Lagged(n)) => log::warn!("Client lagged, {} events dropped", n),
                         Err(RecvError::Closed) => return Ok(()),
                     }
@@ -136,29 +152,30 @@ async fn handle_connection(
                 }
             },
         };
-        if line.trim().is_empty() {
-            continue;
+        if !authorizer(uid) {
+            return refuse(&mut writer, uid).await;
         }
-        let response = handle_v2_line(&session, line.trim());
-        write_frame(&mut writer, "response", &response).await?;
+        let response = handle_v2(&session, parsed);
+        write_frame(&mut writer, FrameKind::Response, &response).await?;
     }
 }
 
-fn handle_v2_line(session: &Session, line: &str) -> ResponseV2 {
-    let error = |msg: String| ResponseV2 { ok: false, error: Some(msg), state: None };
-    match serde_json::from_str::<VersionProbe>(line) {
-        Ok(VersionProbe { v: Some(VERSION_V2) }) => {}
-        Ok(VersionProbe { v }) => return error(format!("Unsupported protocol version: {:?}", v)),
-        Err(e) => return error(format!("Invalid request: {}", e)),
-    }
-    match serde_json::from_str::<RequestV2>(line) {
-        Ok(request) => session.handle(request),
-        Err(e) => error(format!("Invalid request: {}", e)),
+fn handle_v2(session: &Session, parsed: serde_json::Result<Value>) -> ResponseV2 {
+    let request = parsed
+        .map_err(|e| format!("Invalid request: {}", e))
+        .and_then(RequestV2::from_value);
+    match request {
+        Ok(RequestV2::Status) => ResponseV2::ok(Some(session.state())),
+        Ok(RequestV2::Disconnect) => {
+            session.disconnect();
+            ResponseV2::ok(None)
+        }
+        Err(msg) => ResponseV2::error(msg),
     }
 }
 
 async fn write_line<T: Serialize>(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut Writer,
     value: &T,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string(value)?;
@@ -170,8 +187,8 @@ async fn write_line<T: Serialize>(
 }
 
 async fn write_frame<T: Serialize>(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    kind: &'static str,
+    writer: &mut Writer,
+    kind: FrameKind,
     body: &T,
 ) -> Result<(), Box<dyn std::error::Error>> {
     write_line(writer, &Frame { v: VERSION_V2, kind, body }).await
@@ -200,7 +217,7 @@ mod tests {
             let _ = self.writer.write_all(format!("{}\n", msg).as_bytes()).await;
         }
 
-        /// Next line from the server, or None on EOF.
+        /// Próxima linha do servidor, ou None no EOF.
         async fn recv(&mut self) -> Option<Value> {
             let line = tokio::time::timeout(Duration::from_secs(2), self.lines.next_line())
                 .await
@@ -210,7 +227,7 @@ mod tests {
         }
     }
 
-    /// Starts the server on a temporary socket (never /var/run).
+    /// Sobe o servidor num socket temporário (nunca em /var/run).
     async fn start(authorizer: Authorizer) -> (PathBuf, Arc<Session>) {
         let path = std::env::temp_dir().join(format!(
             "ovg-{}-{}.sock",
@@ -282,7 +299,7 @@ mod tests {
             json!({"v": 2, "type": "event", "event": "log", "line": "hello"})
         );
 
-        // Same connection still serves requests.
+        // A mesma conexão continua atendendo requisições.
         c.send(json!({"v": 2, "cmd": "status"})).await;
         assert_eq!(c.recv().await.unwrap()["type"], "response");
     }
@@ -292,7 +309,7 @@ mod tests {
         let (path, _s) = start(allow_all()).await;
         let mut c = connect(&path).await;
         c.send(json!({"v": 2, "cmd": "disconnect"})).await;
-        c.recv().await.unwrap(); // initial state event
+        c.recv().await.unwrap(); // evento inicial de estado
         assert_eq!(
             c.recv().await.unwrap(),
             json!({"v": 2, "type": "response", "ok": true})
@@ -351,9 +368,68 @@ mod tests {
         let mut c = connect(&path).await;
         c.send(json!({"cmd": "ping"})).await;
         c.recv().await.unwrap();
-        // The socket file is owned by this process, which is also the peer.
+        // O arquivo do socket é deste processo, que também é o peer.
         let my_uid = std::fs::metadata(&path).unwrap().uid();
         assert_eq!(*seen.lock().unwrap(), Some(my_uid));
+    }
+
+    #[tokio::test]
+    async fn v2_request_is_refused_when_authorization_is_revoked_mid_connection() {
+        use std::sync::atomic::AtomicBool;
+        let allowed = Arc::new(AtomicBool::new(true));
+        let a = allowed.clone();
+        let (path, _s) = start(Arc::new(move |_| a.load(Ordering::SeqCst))).await;
+        let mut c = connect(&path).await;
+        c.send(json!({"v": 2, "cmd": "status"})).await;
+        c.recv().await.unwrap();
+        assert_eq!(c.recv().await.unwrap()["ok"], true);
+
+        // Troca rápida de usuário: o peer deixa de ser o usuário do console.
+        allowed.store(false, Ordering::SeqCst);
+        c.send(json!({"v": 2, "cmd": "disconnect"})).await;
+        assert_eq!(
+            c.recv().await.unwrap(),
+            json!({"ok": false, "error": "Unauthorized"})
+        );
+        assert!(c.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_events_stop_when_authorization_is_revoked_mid_connection() {
+        use std::sync::atomic::AtomicBool;
+        let allowed = Arc::new(AtomicBool::new(true));
+        let a = allowed.clone();
+        let (path, session) = start(Arc::new(move |_| a.load(Ordering::SeqCst))).await;
+        let mut c = connect(&path).await;
+        c.send(json!({"v": 2, "cmd": "status"})).await;
+        c.recv().await.unwrap();
+        c.recv().await.unwrap();
+
+        allowed.store(false, Ordering::SeqCst);
+        session.emit(Event::Log { line: "secret".into() });
+        assert_eq!(
+            c.recv().await.unwrap(),
+            json!({"ok": false, "error": "Unauthorized"})
+        );
+        assert!(c.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_policy_through_the_socket_follows_the_console_user() {
+        use std::os::unix::fs::MetadataExt;
+        let probe = std::env::temp_dir().join(format!("ovg-uid-{}", std::process::id()));
+        std::fs::write(&probe, "").unwrap();
+        let my_uid = std::fs::metadata(&probe).unwrap().uid();
+        std::fs::remove_file(&probe).unwrap();
+        if my_uid == 0 {
+            return; // root é sempre aceito, então a regra não é exercitada
+        }
+        for (console, accepted) in [(my_uid + 1, false), (my_uid, true)] {
+            let (path, _s) = start(policy_authorizer(move || Some(console))).await;
+            let mut c = connect(&path).await;
+            c.send(json!({"cmd": "ping"})).await;
+            assert_eq!(c.recv().await.unwrap()["ok"], accepted);
+        }
     }
 
     #[test]

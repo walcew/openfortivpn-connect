@@ -3,8 +3,6 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::protocol::{RequestV2, ResponseV2};
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum State {
@@ -46,14 +44,8 @@ impl Session {
         let _ = self.events.send(event);
     }
 
-    pub fn handle(&self, request: RequestV2) -> ResponseV2 {
-        match request {
-            RequestV2::Status => ResponseV2 { ok: true, error: None, state: Some(self.state()) },
-            RequestV2::Disconnect => {
-                // Sem Engine ainda não há sessão a encerrar.
-                self.emit(Event::Log { line: "disconnect: no active session".into() });
-                ResponseV2 { ok: true, error: None, state: None }
-            }
-        }
+    pub fn disconnect(&self) {
+        // Sem Engine ainda não há sessão a encerrar.
+        self.emit(Event::Log { line: "disconnect: no active session".into() });
     }
 }
