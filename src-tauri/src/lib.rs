@@ -23,8 +23,10 @@ use vpn_manager::VpnManager;
 pub fn run() {
     let vpn_manager = VpnManager::new().expect("Failed to initialize VPN manager");
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    #[cfg(feature = "engine-v2")]
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    builder
         .manage(Mutex::new(vpn_manager))
         .invoke_handler(tauri::generate_handler![
             commands::get_profiles,
