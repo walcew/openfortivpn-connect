@@ -64,7 +64,7 @@ O fluxo externo do FortiClient (doc de engenharia reversa, seção 4), com o Pro
 | `<dns ip="..."/>` | servidores DNS |
 | `<dns-suffix str="a;b"/>` | sufixos DNS; mais de um separado por `;` (**inf**) |
 | `<split-tunnel-info><addr ip="..." mask="..."/></split-tunnel-info>` | rotas do split tunnel |
-| `<auth-timeout val="segundos"/>` | `expires_at` = agora + val; `0` = sem expiração |
+| `<auth-timeout val="segundos"/>` | `expires_at` = início do login + val; `0` = sem expiração |
 | `<mtu val="..."/>` | MTU; o nome do elemento é **inf**, sem ele vale 1354 |
 
 Sem nenhum `<addr>` em `split-tunnel-info`, o túnel é full tunnel (**inf**). `assigned-addr` é ignorado: vale o IP do IPCP.
@@ -104,9 +104,10 @@ DNS do XML tem prioridade; os do IPCP só valem se o XML não trouxer nenhum (**
 
 ### Túnel morto e expiração
 
-- **Echo:** o primeiro Echo-Request sai assim que o IPCP abre e os seguintes a cada 10 s. Qualquer pacote LCP do gateway (Echo-Reply, Echo-Request dele etc.) zera a contagem. Três Echo-Request seguidos sem nenhum LCP de volta derrubam o túnel no tick seguinte, cerca de 30 s depois da última resposta, com o motivo `Tunnel dropped: no response from the gateway` (**rfc** para o echo; os 10 s e as 3 faltas são escolha nossa, da spec).
-- **TLS fechado:** EOF no stream vira `Tunnel dropped: connection closed by the gateway`, e erro de leitura vira `Tunnel dropped: read failed: ...`. Terminate-Request e erro de escrita também encerram o túnel.
-- **Expiração:** `expires_at` (agora + `auth-timeout`, calculado ao abrir o túnel) dispara o evento `expiring` 15 min antes (ou logo ao conectar, se faltar menos que isso) e, no horário, encerra a sessão com o motivo `Session expired`. Sem `auth-timeout` (ou com `0`), não há aviso nem encerramento por tempo. O prazo corre no relógio monotônico, que no macOS para durante o sleep: com a máquina dormindo, a expiração atrasa e quem derruba a sessão ao acordar é o echo.
+- **Echo:** com o túnel de pé, um Echo-Request sai a cada 10 s (o primeiro 10 s depois de abrir o túnel). Qualquer pacote LCP do gateway (Echo-Reply, Echo-Request dele etc.) zera a contagem. No terceiro tick seguido sem nenhum LCP do gateway o túnel cai, cerca de 30 s depois da última resposta, com o motivo `Tunnel dropped: no response from the gateway` (**rfc** para o echo; os 10 s e os 3 intervalos são escolha nossa, da spec).
+- **Escrita travada:** toda escrita no túnel tem prazo de 3 intervalos de echo (30 s). Num TCP meio aberto com tráfego, o buffer de envio enche e a escrita travaria o laço, e com ele o echo; estourado o prazo, o túnel cai com `Tunnel dropped: write timed out`. Erro de escrita vira `Tunnel dropped: write failed: ...`.
+- **TLS fechado e PPP encerrado:** EOF no stream vira `Tunnel dropped: connection closed by the gateway`, erro de leitura vira `Tunnel dropped: read failed: ...` e Terminate-Request do gateway vira `Tunnel dropped: the gateway terminated the PPP session`.
+- **Expiração:** `expires_at` é o início do login + `auth-timeout` (push e SAML podem levar minutos antes do túnel). Ele dispara o evento `expiring` 15 min antes (ou logo ao conectar, se faltar menos que isso) e, no horário, encerra a sessão com o motivo `Session expired`. Sem `auth-timeout` (ou com `0`), não há aviso nem encerramento por tempo. Além de dormir até o próximo prazo, o Helper confere o relógio de parede a cada 10 s: o relógio monotônico para durante o sleep do macOS, e assim o aviso e a expiração saem no primeiro tick depois de acordar.
 - Nos dois casos o teardown (utun, rotas, /32 do gateway, DNS) é imediato, sem logout: na queda o gateway não responde, na expiração ele já encerrou a sessão, e o prazo do logout só atrasaria a volta da rede. Não há reconexão automática.
 
 No contrato v2, essas quedas saem como `{"event":"state","state":"disconnected","reason":"...","cause":"tunnel-dropped"|"expired"}`. O campo `cause` só aparece quando uma sessão já conectada caiu ou expirou; erro de login e desconexão pedida pelo usuário não o trazem. O aviso é o evento `{"v":2,"type":"event","event":"expiring","expires_at":"<RFC 3339>"}`, emitido uma vez por sessão e não repetido a quem abrir o canal de eventos depois.
