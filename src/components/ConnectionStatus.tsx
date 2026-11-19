@@ -19,6 +19,7 @@ const STATUS_CONFIG: Record<
   Disconnected: { color: "bg-gray-400", bg: "bg-black/40 border border-white/10", label: "Disconnected" },
   Connecting: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Connecting..." },
   WaitingSaml: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for SAML login..." },
+  WaitingPush: { color: "bg-yellow-400", bg: "bg-black/40 border border-yellow-500/20", label: "Waiting for approval on your phone..." },
   Connected: { color: "bg-green-400", bg: "bg-black/40 border border-green-500/20", label: "Connected" },
   Disconnecting: { color: "bg-orange-400", bg: "bg-black/40 border border-orange-500/20", label: "Disconnecting..." },
   Error: { color: "bg-red-400", bg: "bg-black/40 border border-red-500/20", label: "Error" },
@@ -66,7 +67,7 @@ export function ConnectionStatus({
   }, [status.state, pushHint]);
 
   const isConnected = status.state === "Connected";
-  const isBusy = status.state === "Connecting" || status.state === "WaitingSaml" || status.state === "Disconnecting";
+  const isBusy = status.state === "Connecting" || status.state === "WaitingSaml" || status.state === "WaitingPush" || status.state === "Disconnecting";
 
   return (
     <div className={`rounded-xl p-4 ${config.bg}`}>

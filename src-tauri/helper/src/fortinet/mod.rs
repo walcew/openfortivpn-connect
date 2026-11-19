@@ -27,6 +27,10 @@ use crate::validation::is_valid_hostname;
 
 const DEFAULT_MTU: u16 = 1354;
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// O gateway segura a resposta do push até o usuário aprovar ou o pedido expirar.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Valores do pedido de token que o segundo passo do login devolve ao gateway.
+const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
 
 /// Métodos de autenticação que o Engine já fala.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -49,6 +53,29 @@ pub struct Profile {
     /// Auto-trust: aceita qualquer certificado, só deste host.
     #[serde(default)]
     pub ignore_cert_errors: bool,
+}
+
+/// O gateway pediu um token no primeiro passo do login.
+pub struct Challenge {
+    fields: Vec<(&'static str, String)>,
+    /// O gateway oferece aprovação por push do FortiToken Mobile.
+    pub push: bool,
+}
+
+/// Resultado do primeiro passo do login.
+pub enum Login {
+    Cookie(String),
+    Token(Challenge),
+}
+
+/// Pares `chave=valor` do corpo do `logincheck`, separados por vírgula.
+// shortcut: valor com vírgula (ex.: `chal_msg`) vem truncado; só os campos do desafio importam e não levam vírgula.
+fn parse_pairs(body: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(body)
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
 }
 
 /// Endereço e TLS de um gateway.
@@ -132,7 +159,7 @@ impl Gateway {
     }
 
     /// `host` vai no cabeçalho `Host`: o do gateway, ou `sslvpn` nos passos do túnel.
-    async fn request(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
+    async fn request(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>, timeout: Duration) -> Result<http::Response, String> {
         let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path, host);
         if let Some(c) = cookie {
             req.push_str(&format!("Cookie: SVPNCOOKIE={}\r\n", c));
@@ -151,28 +178,57 @@ impl Gateway {
             stream.write_all(req.as_bytes()).await.map_err(|e| format!("{} {} failed: {}", method, path, e))?;
             http::read_response(&mut stream).await.map_err(|e| format!("{} {} failed: {}", method, path, e))
         };
-        tokio::time::timeout(STEP_TIMEOUT, exchange)
+        tokio::time::timeout(timeout, exchange)
             .await
             .map_err(|_| format!("{} {} timed out", method, path))?
     }
 
-    /// `POST /remote/logincheck` e devolve o `SVPNCOOKIE`.
-    pub async fn login(&self, username: &str, password: &str) -> Result<String, String> {
+    /// `POST /remote/logincheck`: devolve o `SVPNCOOKIE` ou o pedido de token do gateway.
+    pub async fn login(&self, username: &str, password: &str) -> Result<Login, String> {
         let form = format!(
             "username={}&credential={}&realm=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1",
             http::form_encode(username),
             http::form_encode(password)
         );
-        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form)).await?;
+        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form), STEP_TIMEOUT).await?;
+        if let Some(c) = resp.cookie("SVPNCOOKIE").filter(|c| !c.is_empty()) {
+            return Ok(Login::Cookie(c));
+        }
+        let pairs = parse_pairs(&resp.body);
+        let Some((_, tokeninfo)) = pairs.iter().find(|(k, _)| k == "tokeninfo") else {
+            return Err("Login failed: invalid username or password".into());
+        };
+        let fields = CHALLENGE_FIELDS
+            .iter()
+            .filter_map(|name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| (*name, v.clone())))
+            .collect();
+        Ok(Login::Token(Challenge { fields, push: tokeninfo == "ftm_push" }))
+    }
+
+    /// Segundo passo do login: reenvia o desafio com o OTP, ou pede o push quando não há OTP.
+    /// Com push a chamada espera a aprovação do usuário.
+    pub async fn complete_token(&self, username: &str, challenge: &Challenge, otp: Option<&str>) -> Result<String, String> {
+        let mut form = format!("username={}", http::form_encode(username));
+        for (name, value) in &challenge.fields {
+            form.push_str(&format!("&{}={}", name, http::form_encode(value)));
+        }
+        match otp {
+            Some(code) => form.push_str(&format!("&code={}", http::form_encode(code))),
+            None => form.push_str("&ftm_push=1"),
+        }
+        form.push_str("&just_logged_in=1&ajax=1");
+        let timeout = if otp.is_some() { STEP_TIMEOUT } else { PUSH_TIMEOUT };
+        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form), timeout).await?;
         match resp.cookie("SVPNCOOKIE") {
             Some(c) if !c.is_empty() => Ok(c),
-            _ => Err("Login failed: invalid username or password".into()),
+            _ if otp.is_some() => Err("Login failed: invalid or expired OTP code".into()),
+            _ => Err("Login failed: push notification was denied or expired".into()),
         }
     }
 
     /// Lê a config do túnel, abre o `sslvpn-tunnel` e negocia o PPP até o IPCP subir.
     pub async fn open_tunnel(&self, cookie: &str) -> Result<(TunnelConfig, Packets, Tunnel), String> {
-        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(cookie), None).await?;
+        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(cookie), None, STEP_TIMEOUT).await?;
         if resp.status != 200 {
             return Err(format!("Gateway refused the tunnel configuration (HTTP {})", resp.status));
         }
@@ -211,6 +267,6 @@ impl Gateway {
     }
 
     pub async fn logout(&self, cookie: &str) -> Result<(), String> {
-        self.request("GET", "/remote/logout", &self.host_header(), Some(cookie), None).await.map(|_| ())
+        self.request("GET", "/remote/logout", &self.host_header(), Some(cookie), None, STEP_TIMEOUT).await.map(|_| ())
     }
 }

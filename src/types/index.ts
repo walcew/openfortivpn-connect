@@ -18,6 +18,7 @@ export interface ConnectionStatus {
     | "Disconnected"
     | "Connecting"
     | "WaitingSaml"
+    | "WaitingPush"
     | "Connected"
     | "Disconnecting"
     | "Error";

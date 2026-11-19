@@ -67,6 +67,8 @@ pub enum ConnectionState {
     Disconnected,
     Connecting { profile_id: String },
     WaitingSaml { profile_id: String, url: String },
+    /// Push do FortiToken enviado, aguardando aprovação no celular.
+    WaitingPush { profile_id: String },
     Connected {
         profile_id: String,
         ip: String,
@@ -124,6 +126,11 @@ impl From<&ConnectionState> for ConnectionStatusPayload {
                 ip: None,
                 since: None,
                 message: Some(url.clone()),
+                ..Default::default()
+            },
+            ConnectionState::WaitingPush { profile_id } => ConnectionStatusPayload {
+                state: "WaitingPush".into(),
+                profile_id: Some(profile_id.clone()),
                 ..Default::default()
             },
             ConnectionState::Connected {

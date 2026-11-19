@@ -34,19 +34,18 @@ pub fn socket_path() -> &'static Path {
 }
 
 /// Recusa o que o Engine ainda não suporta, antes de qualquer tentativa.
-// shortcut: só autenticação por senha sem OTP, evolui nos tickets #13 (OTP/push) e #15 (SAML)
+// shortcut: só senha (com OTP ou push), SAML evolui no ticket #15
 pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
     if profile.auth_type == AuthType::Saml {
         return Err("SAML authentication is not supported yet by the v2 engine".into());
     }
-    if profile.needs_otp() {
-        return Err("OTP authentication is not supported yet by the v2 engine".into());
-    }
     Ok(())
 }
 
-/// Corpo do `connect`: a senha só viaja aqui, nunca em argv.
-fn connect_request(profile: &VpnProfile, username: &str, password: &str) -> Value {
+/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. Sem OTP e com o
+/// gateway oferecendo push, o Helper pede o push.
+fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>) -> Value {
+    let otp = otp.map(str::trim).filter(|o| profile.needs_otp() && !o.is_empty());
     json!({
         "v": 2,
         "cmd": "connect",
@@ -60,7 +59,7 @@ fn connect_request(profile: &VpnProfile, username: &str, password: &str) -> Valu
             "ignore_cert_errors": profile.ignore_cert_errors,
         },
         "password": password,
-        "otp": null,
+        "otp": otp,
     })
 }
 
@@ -100,8 +99,8 @@ fn request(path: &Path, cmd: &Value) -> Result<Value, String> {
     Err("Helper closed the connection without a response".into())
 }
 
-pub fn connect(path: &Path, profile: &VpnProfile, username: &str, password: &str) -> Result<(), String> {
-    request(path, &connect_request(profile, username, password)).map(|_| ())
+pub fn connect(path: &Path, profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>) -> Result<(), String> {
+    request(path, &connect_request(profile, username, password, otp)).map(|_| ())
 }
 
 pub fn disconnect(path: &Path) -> Result<(), String> {
@@ -130,6 +129,7 @@ fn parse_state(v: &Value) -> Option<ConnectionState> {
             None => ConnectionState::Disconnected,
         },
         "connecting" => ConnectionState::Connecting { profile_id: text("profile_id") },
+        "waiting-push" => ConnectionState::WaitingPush { profile_id: text("profile_id") },
         "connected" => ConnectionState::Connected {
             profile_id: text("profile_id"),
             ip: v["ip"].as_str().unwrap_or("unknown").to_string(),
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn connect_sends_the_contract_json_with_credentials_in_the_body() {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
-        connect(&path, &password_profile(), "alice", "s3cret").unwrap();
+        connect(&path, &password_profile(), "alice", "s3cret", None).unwrap();
         assert_eq!(
             rx.recv().unwrap(),
             json!({
@@ -365,6 +365,19 @@ mod tests {
     }
 
     #[test]
+    fn connect_sends_the_otp_in_the_body_only_for_otp_profiles() {
+        let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
+        let mut profile = password_profile();
+        profile.otp_required = true;
+        connect(&path, &profile, "alice", "s3cret", Some(" 123456 ")).unwrap();
+        assert_eq!(rx.recv().unwrap()["otp"], "123456");
+
+        // Sem otp_required um código sobrando não vai ao gateway.
+        connect(&path, &password_profile(), "alice", "s3cret", Some("123456")).unwrap();
+        assert!(rx.recv().unwrap()["otp"].is_null());
+    }
+
+    #[test]
     fn helper_error_comes_back_as_err_even_after_events() {
         let (path, _rx) = fake_helper(
             vec![event(json!({"event": "state", "state": "disconnected"}))],
@@ -401,6 +414,10 @@ mod tests {
         assert!(matches!(
             parse_state(&json!({"state": "connecting", "profile_id": "p1"})),
             Some(ConnectionState::Connecting { profile_id }) if profile_id == "p1"
+        ));
+        assert!(matches!(
+            parse_state(&json!({"state": "waiting-push", "profile_id": "p1"})),
+            Some(ConnectionState::WaitingPush { profile_id }) if profile_id == "p1"
         ));
         assert!(parse_state(&json!({"state": "weird"})).is_none());
     }
@@ -469,11 +486,11 @@ mod tests {
     }
 
     #[test]
-    fn saml_and_otp_profiles_are_not_supported_yet() {
+    fn saml_is_not_supported_yet_but_otp_is() {
         let mut p = password_profile();
         assert!(check_supported(&p).is_ok());
         p.otp_required = true;
-        assert!(check_supported(&p).unwrap_err().contains("not supported yet"));
+        assert!(check_supported(&p).is_ok());
         p.auth_type = AuthType::Saml;
         assert!(check_supported(&p).unwrap_err().contains("not supported yet"));
     }

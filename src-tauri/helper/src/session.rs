@@ -6,7 +6,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tokio::sync::{broadcast, Notify};
 
-use crate::fortinet::{CertTrust, Gateway, LogFn, Profile};
+use crate::fortinet::{CertTrust, Gateway, LogFn, Login, Profile};
 use crate::net::{self, Os, TunnelConfig};
 
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
@@ -24,6 +24,10 @@ pub enum State {
         cert_digest: Option<String>,
     },
     Connecting {
+        profile_id: String,
+    },
+    /// Push do FortiToken enviado; o usuário aprova no celular.
+    WaitingPush {
         profile_id: String,
     },
     Connected {
@@ -106,7 +110,7 @@ impl Session {
     }
 
     /// Começa a conexão e volta logo; o progresso chega pelos eventos de estado.
-    pub fn connect(self: &Arc<Self>, profile: Profile, password: String) -> Result<(), String> {
+    pub fn connect(self: &Arc<Self>, profile: Profile, password: String, otp: Option<String>) -> Result<(), String> {
         let events = self.events.clone();
         let log: LogFn = Arc::new(move |line| {
             let _ = events.send(Event::Log { line });
@@ -128,7 +132,7 @@ impl Session {
             // nem a sessão presa em connecting/connected.
             let s = session.clone();
             let g = gateway.clone();
-            let run = tokio::spawn(async move { s.drive(&profile, &g, &password, &cancel).await });
+            let run = tokio::spawn(async move { s.drive(&profile, &g, &password, otp.as_deref(), &cancel).await });
             let reason = match run.await {
                 Ok(reason) => reason,
                 Err(e) => {
@@ -166,10 +170,10 @@ impl Session {
     }
 
     /// Conduz a sessão até o fim e devolve o motivo (None = desconexão pedida pelo usuário).
-    async fn drive(&self, profile: &Profile, gw: &Gateway, password: &str, cancel: &Notify) -> Option<String> {
+    async fn drive(&self, profile: &Profile, gw: &Gateway, password: &str, otp: Option<&str>, cancel: &Notify) -> Option<String> {
         self.log(format!("connecting to {}:{}", profile.host, profile.port));
         let cookie = tokio::select! {
-            r = gw.login(&profile.username, password) => match r {
+            r = self.authenticate(profile, gw, password, otp) => match r {
                 Ok(c) => c,
                 Err(e) => return Some(e),
             },
@@ -222,6 +226,25 @@ impl Session {
         reason
     }
 
+    /// Login em um ou dois passos. Com o gateway pedindo token: usa o OTP se houver,
+    /// senão pede o push (e emite `waiting-push`) quando o gateway o oferece.
+    async fn authenticate(&self, profile: &Profile, gw: &Gateway, password: &str, otp: Option<&str>) -> Result<String, String> {
+        let challenge = match gw.login(&profile.username, password).await? {
+            Login::Cookie(cookie) => return Ok(cookie),
+            Login::Token(challenge) => challenge,
+        };
+        let otp = otp.map(str::trim).filter(|o| !o.is_empty());
+        if otp.is_none() {
+            if !challenge.push {
+                return Err("Gateway requires an OTP code but none was provided".into());
+            }
+            self.log("waiting for push approval");
+            let mut inner = self.inner.lock().unwrap();
+            Self::set_state(&mut inner, &self.events, State::WaitingPush { profile_id: profile.id.clone() });
+        }
+        gw.complete_token(&profile.username, &challenge, otp).await
+    }
+
     async fn logout(&self, gw: &Gateway, cookie: &str) {
         match tokio::time::timeout(LOGOUT_TIMEOUT, gw.logout(cookie)).await {
             Ok(Ok(())) => self.log("logged out"),
@@ -262,7 +285,13 @@ mod tests {
 
     /// Manda o connect e espera `connecting` e o estado seguinte.
     async fn connect_with(c: &mut Client, gw: &FakeGateway, password: &str) -> Value {
-        c.send(connect_cmd(gw, password)).await;
+        connect_with_otp(c, gw, password, None).await
+    }
+
+    async fn connect_with_otp(c: &mut Client, gw: &FakeGateway, password: &str, otp: Option<&str>) -> Value {
+        let mut cmd = connect_cmd(gw, password);
+        cmd["otp"] = json!(otp);
+        c.send(cmd).await;
         let mut seen_response = false;
         let mut connecting = false;
         loop {
@@ -572,6 +601,73 @@ mod tests {
 
         // E a sessão fica livre para um novo connect.
         assert_eq!(connect_with(&mut c, &gw, PASSWORD).await["state"], "connected");
+    }
+
+    /// Connect contra um gateway que pede token: devolve o primeiro estado depois de `connecting`.
+    async fn connect_to_token_gateway(options: GatewayOptions, otp: Option<&str>) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, Value) {
+        let gw = FakeGateway::start(options).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let state = connect_with_otp(&mut c, &gw, PASSWORD, otp).await;
+        (gw, c, os, state)
+    }
+
+    #[tokio::test]
+    async fn correct_otp_connects() {
+        let (_gw, _c, os, state) = connect_to_token_gateway(GatewayOptions { require_otp: true, ..Default::default() }, Some(OTP)).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        assert_connected_state(&state);
+        assert!(!os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrong_otp_disconnects_with_a_reason_and_applies_nothing() {
+        let (_gw, _c, os, state) = connect_to_token_gateway(GatewayOptions { require_otp: true, ..Default::default() }, Some("000000")).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("invalid or expired OTP"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_requested_without_an_otp_disconnects_with_a_reason() {
+        let (_gw, _c, os, state) = connect_to_token_gateway(GatewayOptions { require_otp: true, ..Default::default() }, None).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("requires an OTP"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    /// O estado seguinte do cliente, sem logs.
+    async fn next_state(c: &mut Client) -> Value {
+        c.recv_skipping_logs().await
+    }
+
+    #[tokio::test]
+    async fn approved_push_waits_and_then_connects() {
+        let (_gw, mut c, _os, waiting) = connect_to_token_gateway(GatewayOptions { push: Some(Push::Approve), ..Default::default() }, None).await;
+        assert_eq!(waiting, json!({"v": 2, "type": "event", "event": "state", "state": "waiting-push", "profile_id": PROFILE_ID}));
+        let started = Instant::now();
+        let state = next_state(&mut c).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        assert!(started.elapsed() >= PUSH_DELAY / 2, "connected before the gateway approved");
+    }
+
+    #[tokio::test]
+    async fn denied_push_disconnects_with_a_reason() {
+        let (_gw, mut c, os, waiting) = connect_to_token_gateway(GatewayOptions { push: Some(Push::Deny), ..Default::default() }, None).await;
+        assert_eq!(waiting["state"], "waiting-push");
+        let state = next_state(&mut c).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("push"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_while_waiting_for_push_returns_to_disconnected() {
+        let (_gw, mut c, os, waiting) = connect_to_token_gateway(GatewayOptions { push: Some(Push::Approve), ..Default::default() }, None).await;
+        assert_eq!(waiting["state"], "waiting-push");
+        let state = disconnect(&mut c).await;
+        assert!(state.get("reason").is_none(), "{}", state);
+        assert!(os.calls().is_empty());
     }
 
     /// Connect contra um fake de SO que falha no `add_route`: devolve o estado final.
