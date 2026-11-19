@@ -20,7 +20,7 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [features]
 # Caminho alternativo: GUI como cliente do protocolo v2 do Helper (Engine). Desligado por padrão.
-engine-v2 = []
+engine-v2 = ["dep:tauri-plugin-notification"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +32,8 @@ tokio = { version = "1", features = ["full"] }
 tauri = { version = "2.10.3", features = ["tray-icon", "image-png", "macos-private-api"] }
 window-vibrancy = "0.6"
 tauri-plugin-opener = "2"
+# Só com `engine-v2`: avisos de queda e expiração da sessão.
+tauri-plugin-notification = { version = "2", optional = true }
 log = "0.4"
 dirs = "6"
 native-tls = "0.2"
