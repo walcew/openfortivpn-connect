@@ -54,6 +54,10 @@ pub struct Profile {
     /// Auto-trust: aceita qualquer certificado, só deste host.
     #[serde(default)]
     pub ignore_cert_errors: bool,
+    /// Split DNS do Profile: se houver, só estes domínios usam o DNS da VPN, no lugar
+    /// dos sufixos do gateway. Vazio mantém os sufixos do gateway.
+    #[serde(default)]
+    pub dns_match_domains: Vec<String>,
 }
 
 /// O gateway pediu o segundo fator (OTP ou push) no primeiro passo do login.
