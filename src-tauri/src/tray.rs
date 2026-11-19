@@ -5,7 +5,7 @@ use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBui
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
-use crate::models::{ConnectionState, ConnectionStatusPayload, OtpRequestedPayload, VpnProfile};
+use crate::models::{ConnectionState, OtpRequestedPayload, VpnProfile};
 use crate::vpn_manager::VpnManager;
 
 const TRAY_ICON_DISCONNECTED: &[u8] = include_bytes!("../icons/tray/disconnected@2x.png");
@@ -25,13 +25,19 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     // Listen for connection state changes to update VpnManager state and refresh tray.
     // The log monitor emits these events but cannot update VpnManager.state directly
     // (no access to the Mutex). This listener bridges that gap.
+    // Com `engine-v2` o canal de eventos do Helper já aplica o estado com lock
+    // bloqueante; sincronizar aqui também (try_lock com desistência) só reordenaria eventos.
     let handle = app.handle().clone();
     app.listen("connection-status-changed", move |event| {
         let h = handle.clone();
+        #[cfg(not(feature = "engine-v2"))]
         let payload_str = event.payload().to_string();
+        #[cfg(feature = "engine-v2")]
+        let _ = event;
         std::thread::spawn(move || {
             // Parse the payload to sync VpnManager.state
-            if let Ok(payload) = serde_json::from_str::<ConnectionStatusPayload>(&payload_str) {
+            #[cfg(not(feature = "engine-v2"))]
+            if let Ok(payload) = serde_json::from_str::<crate::models::ConnectionStatusPayload>(&payload_str) {
                 // Try to update VpnManager.state — retry a few times if locked
                 for _ in 0..10 {
                     let mgr_state = h.state::<Mutex<VpnManager>>();

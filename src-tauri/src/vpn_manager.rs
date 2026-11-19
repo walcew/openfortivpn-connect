@@ -114,7 +114,7 @@ impl VpnManager {
                 app_handle,
             );
             crate::engine_v2::connect(
-                std::path::Path::new(crate::helper_client::SOCKET_PATH),
+                crate::engine_v2::socket_path(),
                 &profile,
                 &username,
                 &password,
@@ -294,13 +294,15 @@ impl VpnManager {
     /// Pede o `disconnect` ao Engine; o estado final chega por evento.
     #[cfg(feature = "engine-v2")]
     fn finish_disconnect_v2(&mut self, app_handle: &AppHandle) {
-        let path = std::path::Path::new(crate::helper_client::SOCKET_PATH);
-        let result = crate::engine_v2::disconnect(path).and_then(|_| crate::engine_v2::status(path));
-        match result {
-            // Já desconectado: não haverá evento novo, então fecha o Disconnecting aqui.
-            Ok(ConnectionState::Disconnected) => self.set_state(ConnectionState::Disconnected, app_handle),
-            Ok(_) => {}
-            Err(e) => self.set_state(ConnectionState::Error { message: e }, app_handle),
+        let path = crate::engine_v2::socket_path();
+        if let Err(e) = crate::engine_v2::disconnect(path) {
+            self.set_state(ConnectionState::Error { message: e }, app_handle);
+            return;
+        }
+        // Sem sessão ativa o Helper não emite estado novo e o Disconnecting ficaria
+        // preso; um `status` fecha esse caso. Se ainda não caiu, o evento fecha.
+        if let Ok(ConnectionState::Disconnected) = crate::engine_v2::status(path) {
+            self.set_state(ConnectionState::Disconnected, app_handle);
         }
     }
 
