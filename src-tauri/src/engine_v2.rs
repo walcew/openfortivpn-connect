@@ -57,6 +57,8 @@ fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Op
             "username": username,
             "trusted_certs": profile.trusted_certs,
             "ignore_cert_errors": profile.ignore_cert_errors,
+            // shortcut: o realm do Profile segue fora do contrato; entra quando o Engine o usar no login
+            "dns_match_domains": profile.dns_match_domains,
         },
         "password": password,
         "otp": otp,
@@ -300,6 +302,7 @@ mod tests {
             port: 443,
             username: Some("alice".into()),
             trusted_certs: vec!["abc".into()],
+            dns_match_domains: vec!["corp.example.com".into()],
             ..VpnProfile::default()
         }
     }
@@ -314,7 +317,8 @@ mod tests {
                 "v": 2, "cmd": "connect",
                 "profile": {
                     "id": "p1", "host": "vpn.example.com", "port": 443, "auth": "password",
-                    "username": "alice", "trusted_certs": ["abc"], "ignore_cert_errors": false
+                    "username": "alice", "trusted_certs": ["abc"], "ignore_cert_errors": false,
+                    "dns_match_domains": ["corp.example.com"]
                 },
                 "password": "s3cret", "otp": null
             })

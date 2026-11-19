@@ -197,7 +197,7 @@ impl Session {
                 return None;
             }
         };
-        let (config, packets, mut tunnel) = match opened {
+        let (mut config, packets, mut tunnel) = match opened {
             Ok(t) => t,
             Err(e) => {
                 self.logout(gw, &cookie).await;
@@ -205,6 +205,9 @@ impl Session {
             }
         };
 
+        if !profile.dns_match_domains.is_empty() {
+            config.dns_suffixes = profile.dns_match_domains.clone();
+        }
         if let Err(e) = net::apply(&*self.os, &config, packets, &self.applied) {
             self.teardown();
             drop(tunnel);
@@ -559,6 +562,29 @@ mod tests {
                 return v;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn profile_match_domains_replace_the_gateway_suffixes() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let mut cmd = connect_cmd(&gw, PASSWORD);
+        cmd["profile"]["dns_match_domains"] = json!(["intra.example"]);
+        c.send(cmd).await;
+        let state = loop {
+            let v = c.recv_skipping_logs().await;
+            if v["state"] == "connected" {
+                break v;
+            }
+        };
+        // Servidores continuam os do gateway; só os domínios de match vêm do Profile.
+        assert_eq!(state["dns_servers"], json!(XML_DNS.map(|d| d.to_string())));
+        assert_eq!(state["dns_suffixes"], json!(["intra.example"]));
+        assert!(os.calls().contains(&OsCall::SetDns { servers: XML_DNS.to_vec(), suffixes: vec!["intra.example".into()] }));
+        disconnect(&mut c).await;
+        assert!(os.calls().contains(&OsCall::RemoveDns));
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
     }
 
     #[tokio::test]
