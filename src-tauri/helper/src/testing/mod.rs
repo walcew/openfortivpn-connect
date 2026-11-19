@@ -22,6 +22,10 @@ use fake_os::FakeOs;
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
+/// Serializa os testes que escutam ou testam o `sso_port` do `FakeGateway`: com um de cada
+/// vez, nenhum outro teste prende a porta que um deles espera achar livre ou fechada.
+pub static SAML_PORTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct Client {
     lines: Lines<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,

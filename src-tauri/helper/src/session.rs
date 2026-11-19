@@ -413,7 +413,7 @@ mod tests {
     use crate::net::Route;
     use crate::testing::fake_gateway::*;
     use crate::testing::fake_os::{Failure, FakeOs, OsCall};
-    use crate::testing::{connect, start_with_bandwidth_interval, start_with_os, start_with_push_timeout, start_with_roots, Client};
+    use crate::testing::{connect, SAML_PORTS, start_with_bandwidth_interval, start_with_os, start_with_push_timeout, start_with_roots, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
         json!({"v": 2, "cmd": "connect", "profile": gw.profile(), "password": password, "otp": null})
@@ -1102,6 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn saml_login_through_the_browser_connects_without_leaking_the_cookie() {
+        let _ports = SAML_PORTS.lock().await;
         let gw = FakeGateway::start(GatewayOptions::default()).await;
         let (path, _session, os) = start_with_os(FakeOs::default()).await;
         let mut c = client(&path).await;
@@ -1135,6 +1136,7 @@ mod tests {
 
     #[tokio::test]
     async fn saml_cookie_that_only_comes_from_logincheck_also_connects() {
+        let _ports = SAML_PORTS.lock().await;
         let (gw, mut c, _os, waiting) = saml_connect(GatewayOptions { saml_cookie_on_logincheck: true, ..Default::default() }).await;
         assert_eq!(waiting["state"], "waiting-saml");
         browser(gw.sso_port, SAML_ID).await;
@@ -1143,6 +1145,7 @@ mod tests {
 
     #[tokio::test]
     async fn requests_other_than_a_valid_id_get_400_and_the_login_goes_on() {
+        let _ports = SAML_PORTS.lock().await;
         let (gw, mut c, _os, waiting) = saml_connect(GatewayOptions::default()).await;
         assert_eq!(waiting["state"], "waiting-saml");
         // Como um `<img src="http://127.0.0.1:<porta>/?id=...">` de uma página qualquer.
@@ -1162,6 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn connections_above_the_limit_are_closed_without_an_answer() {
+        let _ports = SAML_PORTS.lock().await;
         let (gw, mut c, _os, waiting) = saml_connect(GatewayOptions::default()).await;
         assert_eq!(waiting["state"], "waiting-saml");
         let mut idle = Vec::new();
@@ -1177,6 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn well_formed_id_refused_by_the_gateway_disconnects_with_a_reason() {
+        let _ports = SAML_PORTS.lock().await;
         let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
         assert_eq!(waiting["state"], "waiting-saml");
         assert!(browser(gw.sso_port, "unknown-id").await.starts_with("HTTP/1.1 200 OK"));
@@ -1188,6 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_while_waiting_for_saml_returns_to_disconnected_and_closes_the_listener() {
+        let _ports = SAML_PORTS.lock().await;
         let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
         assert_eq!(waiting["state"], "waiting-saml");
         let state = disconnect(&mut c).await;
@@ -1198,6 +1204,7 @@ mod tests {
 
     #[tokio::test]
     async fn saml_login_times_out_after_the_gateway_remoteauthtimeout() {
+        let _ports = SAML_PORTS.lock().await;
         let (_gw, mut c, os, waiting) = saml_connect(GatewayOptions { remoteauthtimeout: Some(1), ..Default::default() }).await;
         assert_eq!(waiting["state"], "waiting-saml");
         let state = next_state(&mut c).await;
@@ -1208,6 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_while_waiting_for_saml_returns_to_disconnected_and_closes_the_listener() {
+        let _ports = SAML_PORTS.lock().await;
         let (gw, mut c, os, waiting) = saml_connect(GatewayOptions::default()).await;
         assert_eq!(waiting["state"], "waiting-saml");
         c.send(json!({"v": 2, "cmd": "cancel"})).await;
@@ -1229,6 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_sso_port_disconnects_with_a_clear_reason() {
+        let _ports = SAML_PORTS.lock().await;
         let gw = FakeGateway::start(GatewayOptions::default()).await;
         let _busy = std::net::TcpListener::bind(("127.0.0.1", gw.sso_port)).unwrap();
         let (path, _session, os) = start_with_os(FakeOs::default()).await;
