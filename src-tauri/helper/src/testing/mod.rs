@@ -76,6 +76,13 @@ pub async fn start_with_push_timeout(timeout: Duration) -> (PathBuf, Arc<Session
     (path, session, os)
 }
 
+/// Como `start_with_os`, com a banda emitida neste intervalo em vez de a cada segundo.
+pub async fn start_with_bandwidth_interval(interval: Duration) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
+    let os = Arc::new(FakeOs::default());
+    let (path, session) = start_session(allow_all(), Session::new(os.clone()).with_bandwidth_interval(interval)).await;
+    (path, session, os)
+}
+
 async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<Session>) {
     start_session(authorizer, Session::new(os)).await
 }
