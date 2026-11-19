@@ -6,7 +6,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tokio::sync::{broadcast, Notify};
 
-use crate::fortinet::{Gateway, Profile};
+use crate::fortinet::{Gateway, Profile, Trust};
 use crate::net::{self, Os, TunnelConfig};
 
 /// Prazo do logout no disconnect pedido pelo usuário: gateway mudo não segura a desconexão.
@@ -52,14 +52,20 @@ struct Inner {
 /// numa task própria, que conduz o Engine e a camada de rede e emite os eventos.
 pub struct Session {
     os: Arc<dyn Os>,
+    trust: Arc<Trust>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<Event>,
 }
 
 impl Session {
     pub fn new(os: Arc<dyn Os>) -> Self {
+        Self::with_trust(os, Trust::system())
+    }
+
+    pub fn with_trust(os: Arc<dyn Os>, trust: Trust) -> Self {
         Self {
             os,
+            trust: Arc::new(trust),
             inner: Mutex::new(Inner { state: State::Disconnected { reason: None }, cancel: None, applied: None }),
             events: broadcast::channel(256).0,
         }
@@ -92,7 +98,11 @@ impl Session {
 
     /// Começa a conexão e volta logo; o progresso chega pelos eventos de estado.
     pub fn connect(self: &Arc<Self>, profile: Profile, password: String) -> Result<(), String> {
-        let gateway = Gateway::new(&profile)?;
+        let events = self.events.clone();
+        let log = Arc::new(move |line| {
+            let _ = events.send(Event::Log { line });
+        });
+        let gateway = Gateway::new(&profile, &self.trust, log)?;
         let cancel = Arc::new(Notify::new());
         {
             let mut inner = self.inner.lock().unwrap();
@@ -223,7 +233,7 @@ mod tests {
     use crate::net::Route;
     use crate::testing::fake_gateway::*;
     use crate::testing::fake_os::{Failure, FakeOs, OsCall};
-    use crate::testing::{connect, start_with_os, Client};
+    use crate::testing::{connect, start_with_os, start_with_roots, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
         json!({"v": 2, "cmd": "connect", "profile": gw.profile(), "password": password, "otp": null})
@@ -336,6 +346,89 @@ mod tests {
         };
         assert!(state["reason"].as_str().unwrap().contains(&gw.digest), "{}", state);
         assert!(os.calls().is_empty());
+    }
+
+    /// Manda o connect e devolve o primeiro estado depois de `connecting`, com as linhas de log vistas.
+    async fn connect_logging(c: &mut Client, cmd: Value) -> (Value, Vec<String>) {
+        c.send(cmd).await;
+        let mut lines = Vec::new();
+        loop {
+            let v = c.recv().await.expect("server closed the connection");
+            if v["event"] == "log" {
+                lines.push(v["line"].as_str().unwrap().to_string());
+            } else if v["type"] != "response" && v["state"] != "connecting" {
+                return (v, lines);
+            }
+        }
+    }
+
+    fn pinless(gw: &FakeGateway) -> Value {
+        let mut cmd = connect_cmd(gw, PASSWORD);
+        cmd["profile"]["trusted_certs"] = json!([]);
+        cmd
+    }
+
+    #[tokio::test]
+    async fn chain_valid_by_the_roots_connects_without_a_pinned_digest() {
+        let gw = FakeGateway::start(GatewayOptions { ca_signed: true, ..Default::default() }).await;
+        let (path, _session) = start_with_roots(gw.roots()).await;
+        let mut c = client(&path).await;
+        let (state, _) = connect_logging(&mut c, pinless(&gw)).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+    }
+
+    #[tokio::test]
+    async fn chain_outside_the_roots_is_refused_with_its_digest() {
+        let gw = FakeGateway::start(GatewayOptions { ca_signed: true, ..Default::default() }).await;
+        // Raízes do sistema: a CA de teste não está lá.
+        let (path, _session, os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let (state, _) = connect_logging(&mut c, pinless(&gw)).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains(&gw.digest), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_trust_connects_with_any_certificate_and_logs_a_digest_change() {
+        let (first, second) = (FakeGateway::start(GatewayOptions::default()).await, FakeGateway::start(GatewayOptions::default()).await);
+        assert_ne!(first.digest, second.digest);
+        let (path, _session, _os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let auto_trust = |gw: &FakeGateway| {
+            let mut cmd = pinless(gw);
+            cmd["profile"]["ignore_cert_errors"] = json!(true);
+            cmd
+        };
+
+        let (state, lines) = connect_logging(&mut c, auto_trust(&first)).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        assert!(!lines.iter().any(|l| l.contains("changed")), "{:?}", lines);
+        disconnect(&mut c).await;
+
+        // Mesmo host (127.0.0.1), outro certificado.
+        let (state, lines) = connect_logging(&mut c, auto_trust(&second)).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        let change = lines.iter().find(|l| l.contains("changed")).unwrap_or_else(|| panic!("no change log in {:?}", lines));
+        assert!(change.contains(&first.digest) && change.contains(&second.digest), "{}", change);
+    }
+
+    #[tokio::test]
+    async fn auto_trust_of_one_profile_does_not_apply_to_another_host() {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, _os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let mut auto = pinless(&gw);
+        auto["profile"]["ignore_cert_errors"] = json!(true);
+        assert_eq!(connect_logging(&mut c, auto).await.0["state"], "connected");
+        disconnect(&mut c).await;
+
+        // Mesmo gateway, mas outro Profile (host diferente) sem auto-trust.
+        let mut other = pinless(&gw);
+        other["profile"]["host"] = json!("localhost");
+        let (state, _) = connect_logging(&mut c, other).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains(&gw.digest), "{}", state);
     }
 
     #[tokio::test]

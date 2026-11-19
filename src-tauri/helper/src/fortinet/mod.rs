@@ -5,6 +5,8 @@ mod http;
 mod ppp;
 mod xml;
 
+pub use http::Trust;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +43,9 @@ pub struct Profile {
     pub username: String,
     #[serde(default)]
     pub trusted_certs: Vec<String>,
+    /// Auto-trust: aceita qualquer certificado, só deste host.
+    #[serde(default)]
+    pub ignore_cert_errors: bool,
 }
 
 /// Endereço e TLS de um gateway.
@@ -68,7 +73,7 @@ impl Drop for Tunnel {
 }
 
 impl Gateway {
-    pub fn new(profile: &Profile) -> Result<Self, String> {
+    pub fn new(profile: &Profile, trust: &Arc<Trust>, log: Arc<dyn Fn(String) + Send + Sync>) -> Result<Self, String> {
         if !is_valid_hostname(&profile.host) {
             return Err(format!("Invalid host: {}", profile.host));
         }
@@ -77,7 +82,13 @@ impl Gateway {
             host: profile.host.clone(),
             port: profile.port,
             server_name,
-            tls: TlsConnector::from(Arc::new(http::client_config(&profile.trusted_certs))),
+            tls: TlsConnector::from(Arc::new(http::client_config(
+                &profile.host,
+                &profile.trusted_certs,
+                profile.ignore_cert_errors,
+                trust,
+                log,
+            )?)),
         })
     }
 

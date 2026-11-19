@@ -6,7 +6,7 @@ Marcas: **obs** = visto no FortiClient ou no gateway real; **rfc** = padrão PPP
 
 ## Conexões
 
-Cada passo HTTP abre uma conexão TLS nova com `Connection: close`. O certificado do gateway é aceito só se o sha256 do DER dele estiver em `trusted_certs` do Profile, no mesmo formato hex minúsculo do app. Raízes do sistema e auto-trust ficam para o ticket #14, no mesmo verificador (`GatewayCertVerifier` em `fortinet/http.rs`).
+Cada passo HTTP abre uma conexão TLS nova com `Connection: close`. O certificado do gateway é validado em `GatewayCertVerifier` (`fortinet/http.rs`), criado por conexão do Profile. Com `ignore_cert_errors: false`, é aceito se a cadeia valer pelas raízes do sistema (`rustls-platform-verifier`, para o host do Profile) ou se o sha256 do DER estiver em `trusted_certs` (hex minúsculo, como no app); sem nenhum dos dois, o erro traz o digest (`untrusted gateway certificate, sha256 digest <hex>`). Com `ignore_cert_errors: true` (auto-trust), qualquer certificado é aceito, só para o host daquele Profile, e as assinaturas do handshake continuam verificadas. O Helper guarda em memória o digest da última conexão por host e, quando ele muda, registra um log (`gateway certificate of <host> changed: sha256 <antigo> -> <novo>`); o histórico se perde quando o Helper reinicia.
 
 ## 1. Login por senha
 
