@@ -23,13 +23,31 @@ const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
 enum Incoming {
-    /// `cert_digest` só vem no `disconnected` por certificado não confiável; `cause`
-    /// (`tunnel-dropped` | `expired`) só no `disconnected` de uma sessão que caiu ou expirou.
-    State { state: ConnectionState, cert_digest: Option<String>, cause: Option<String> },
-    /// A sessão expira em `expires_at` (RFC 3339); vem uma vez, 15 min antes.
+    /// `cert_digest` só vem no `disconnected` por certificado não confiável; `cause` só no
+    /// `disconnected` de uma sessão que caiu ou expirou.
+    State { state: ConnectionState, cert_digest: Option<String>, cause: Option<Cause> },
+    /// A sessão expira em `expires_at` (RFC 3339); o Helper avisa uma vez, com antecedência.
     Expiring(String),
     Log(String),
     Bandwidth(Totals),
+}
+
+/// `cause` do `disconnected`: por que uma sessão conectada caiu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cause {
+    TunnelDropped,
+    Expired,
+}
+
+impl Cause {
+    /// Valor desconhecido (de um Helper mais novo) vira None: sem notificação.
+    fn parse(v: &Value) -> Option<Self> {
+        match v.as_str()? {
+            "tunnel-dropped" => Some(Self::TunnelDropped),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
 }
 
 /// Totais acumulados da sessão, contados pelo Engine.
@@ -169,7 +187,7 @@ fn parse_frame(frame: &Value) -> Option<Incoming> {
     match (frame["type"].as_str()?, frame["event"].as_str()) {
         ("event", Some("state")) | ("response", _) => {
             let cert_digest = frame["cert_digest"].as_str().filter(|d| is_sha256_hex(d)).map(str::to_string);
-            let cause = frame["cause"].as_str().map(str::to_string);
+            let cause = Cause::parse(&frame["cause"]);
             parse_state(frame).map(|state| Incoming::State { state, cert_digest, cause })
         }
         ("event", Some("expiring")) => frame["expires_at"].as_str().map(|t| Incoming::Expiring(t.to_string())),
@@ -245,16 +263,19 @@ fn transition(connecting: &mut Option<String>, state: &ConnectionState, cert_dig
 }
 
 const RECONNECT_HINT: &str = "Use Connect in the app or the menu bar to reconnect.";
+const EXPIRING_HINT: &str = "Reconnect afterwards to keep using the VPN.";
 
-/// Notificação (título, corpo) de uma sessão conectada que caiu ou expirou. `connected` guarda
-/// se o estado anterior era `connected`, então o `disconnected` repetido ao reabrir o canal não
-/// notifica de novo.
-fn drop_notice(connected: &mut bool, state: &ConnectionState, cause: Option<&str>) -> Option<(&'static str, &'static str)> {
-    let was_connected = std::mem::replace(connected, matches!(state, ConnectionState::Connected { .. }));
+/// Guarda em `connected` se `state` é `connected` e devolve o valor anterior.
+fn swap_connected(connected: &mut bool, state: &ConnectionState) -> bool {
+    std::mem::replace(connected, matches!(state, ConnectionState::Connected { .. }))
+}
+
+/// Notificação (título, corpo) de uma sessão que caiu ou expirou. Só na transição a partir de
+/// `connected`: o `disconnected` repetido ao reabrir o canal de eventos não notifica de novo.
+fn drop_notice(was_connected: bool, cause: Option<Cause>) -> Option<(&'static str, &'static str)> {
     match cause.filter(|_| was_connected)? {
-        "tunnel-dropped" => Some(("Disconnected: tunnel dropped", RECONNECT_HINT)),
-        "expired" => Some(("Session expired", RECONNECT_HINT)),
-        _ => None,
+        Cause::TunnelDropped => Some(("Disconnected: tunnel dropped", RECONNECT_HINT)),
+        Cause::Expired => Some(("Session expired", RECONNECT_HINT)),
     }
 }
 
@@ -324,7 +345,8 @@ pub fn start(app: AppHandle) {
                         let _ = app.emit(event, payload);
                     }
                     // Desktop não tem botão de ação na notificação: reconectar é o Connect da janela e da tray.
-                    if let Some((title, body)) = drop_notice(&mut connected, &state, cause.as_deref()) {
+                    let was_connected = swap_connected(&mut connected, &state);
+                    if let Some((title, body)) = drop_notice(was_connected, cause) {
                         notify(&app, title, body);
                     }
                     crate::tray::update_tray_icon(&app, &state);
@@ -336,7 +358,7 @@ pub fn start(app: AppHandle) {
                 Incoming::Bandwidth(_) => {}
                 Incoming::Expiring(expires_at) => {
                     if let Some(title) = expiring_notice(&expires_at) {
-                        notify(&app, &title, "Reconnect afterwards to keep using the VPN.");
+                        notify(&app, &title, EXPIRING_HINT);
                     }
                 }
                 Incoming::Log(message) => {
@@ -677,29 +699,32 @@ mod tests {
 
     #[test]
     fn dropped_or_expired_session_notifies_only_on_the_transition_from_connected() {
-        for (cause, title) in [("tunnel-dropped", "Disconnected: tunnel dropped"), ("expired", "Session expired")] {
+        // Os estados que o canal entrega em ordem, com o flag carregado entre eles.
+        let notices = |states: &[(ConnectionState, Option<Cause>)]| {
             let mut connected = false;
-            assert!(drop_notice(&mut connected, &connected_state(), None).is_none());
-            assert_eq!(drop_notice(&mut connected, &error("x"), Some(cause)).map(|n| n.0), Some(title));
+            states.iter().map(|(s, c)| drop_notice(swap_connected(&mut connected, s), *c).map(|n| n.0)).collect::<Vec<_>>()
+        };
+        for (cause, title) in [(Cause::TunnelDropped, "Disconnected: tunnel dropped"), (Cause::Expired, "Session expired")] {
             // O estado inicial de um canal reaberto repete o disconnected com a causa.
-            assert!(drop_notice(&mut connected, &error("x"), Some(cause)).is_none());
+            let seen = notices(&[(connected_state(), None), (error("x"), Some(cause)), (error("x"), Some(cause))]);
+            assert_eq!(seen, [None, Some(title), None]);
         }
     }
 
     #[test]
     fn login_error_and_normal_disconnect_do_not_notify() {
-        let mut connected = false;
-        drop_notice(&mut connected, &connected_state(), None);
-        assert!(drop_notice(&mut connected, &ConnectionState::Disconnected, None).is_none());
-        // Erro com causa sem ter passado por connected (ex.: canal aberto depois da queda já notificada).
-        assert!(drop_notice(&mut connected, &connecting("p1"), None).is_none());
-        assert!(drop_notice(&mut connected, &error("Login failed"), None).is_none());
+        assert!(drop_notice(true, None).is_none());
+        assert!(drop_notice(false, None).is_none());
+        // Causa sem ter passado por connected (ex.: canal aberto depois da queda já notificada).
+        assert!(drop_notice(false, Some(Cause::Expired)).is_none());
     }
 
     #[test]
     fn cause_and_expiring_are_read_from_the_frames() {
         let frame = event(json!({"event": "state", "state": "disconnected", "reason": "Session expired", "cause": "expired"}));
-        assert!(matches!(parse_frame(&frame), Some(Incoming::State { cause: Some(c), .. }) if c == "expired"));
+        assert!(matches!(parse_frame(&frame), Some(Incoming::State { cause: Some(Cause::Expired), .. })));
+        let frame = event(json!({"event": "state", "state": "disconnected", "reason": "x", "cause": "something-new"}));
+        assert!(matches!(parse_frame(&frame), Some(Incoming::State { cause: None, .. })));
         let frame = event(json!({"event": "expiring", "expires_at": "2026-01-01T10:00:00Z"}));
         assert!(matches!(parse_frame(&frame), Some(Incoming::Expiring(t)) if t == "2026-01-01T10:00:00Z"));
     }
