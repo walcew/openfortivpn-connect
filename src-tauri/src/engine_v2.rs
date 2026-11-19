@@ -23,7 +23,8 @@ const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
 enum Incoming {
-    State(ConnectionState),
+    /// `cert_digest` só vem no `disconnected` por certificado não confiável.
+    State { state: ConnectionState, cert_digest: Option<String> },
     Log(String),
 }
 
@@ -146,7 +147,10 @@ fn parse_state(v: &Value) -> Option<ConnectionState> {
 
 fn parse_frame(frame: &Value) -> Option<Incoming> {
     match (frame["type"].as_str()?, frame["event"].as_str()) {
-        ("event", Some("state")) | ("response", _) => parse_state(frame).map(Incoming::State),
+        ("event", Some("state")) | ("response", _) => {
+            let cert_digest = frame["cert_digest"].as_str().filter(|d| is_sha256_hex(d)).map(str::to_string);
+            parse_state(frame).map(|state| Incoming::State { state, cert_digest })
+        }
         ("event", Some("log")) => frame["line"].as_str().map(|l| Incoming::Log(l.to_string())),
         _ => None,
     }
@@ -192,27 +196,34 @@ fn apply_state(manager: &Mutex<VpnManager>, state: &ConnectionState) {
         .sync_state_from_payload(&ConnectionStatusPayload::from(state));
 }
 
-/// O digest do erro de certificado do Helper (`... sha256 digest <hex>`).
-fn cert_digest(message: &str) -> Option<String> {
-    let rest = message.split("sha256 digest ").nth(1)?;
-    let digest: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-    (digest.len() == 64).then_some(digest)
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Payload do `cert-warning` quando um estado acabou de falhar por certificado não confiável.
+/// `connecting` guarda o Profile da tentativa em curso: só a transição `connecting` -> erro
+/// abre o diálogo, não o erro antigo repetido no estado inicial de uma reconexão do canal.
+fn cert_warning(connecting: &mut Option<String>, state: &ConnectionState, cert_digest: Option<&str>) -> Option<Value> {
+    if let ConnectionState::Connecting { profile_id } = state {
+        *connecting = Some(profile_id.clone());
+        return None;
+    }
+    let profile_id = connecting.take()?;
+    match (state, cert_digest) {
+        (ConnectionState::Error { .. }, Some(digest)) => Some(json!({"digest": digest, "profile_id": profile_id})),
+        _ => None,
+    }
 }
 
 /// Liga o canal de eventos ao manager, aos eventos do Tauri e à tray.
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
-        let mut profile_id = String::new();
+        let mut connecting = None;
         run_events(socket_path(), |incoming| match incoming {
-            Incoming::State(state) => {
-                if let ConnectionState::Connecting { profile_id: id } = &state {
-                    profile_id = id.clone();
-                }
+            Incoming::State { state, cert_digest } => {
                 // Mesmo diálogo "Trust & Reconnect" do caminho do openfortivpn.
-                if let ConnectionState::Error { message } = &state {
-                    if let Some(digest) = cert_digest(message) {
-                        let _ = app.emit("cert-warning", json!({"digest": digest, "profile_id": profile_id}));
-                    }
+                if let Some(payload) = cert_warning(&mut connecting, &state, cert_digest.as_deref()) {
+                    let _ = app.emit("cert-warning", payload);
                 }
                 crate::tray::update_tray_icon(&app, &state);
                 let _ = app.emit("connection-status-changed", ConnectionStatusPayload::from(&state));
@@ -310,13 +321,47 @@ mod tests {
         );
     }
 
+    fn error(message: &str) -> ConnectionState {
+        ConnectionState::Error { message: message.into() }
+    }
+
+    fn connecting(id: &str) -> ConnectionState {
+        ConnectionState::Connecting { profile_id: id.into() }
+    }
+
     #[test]
-    fn certificate_error_digest_is_extracted() {
+    fn certificate_warning_comes_from_the_cert_digest_field() {
         let digest = "ab".repeat(32);
-        let message = format!("TLS handshake failed: untrusted gateway certificate, sha256 digest {}", digest);
-        assert_eq!(cert_digest(&message), Some(digest));
-        assert_eq!(cert_digest("Login failed: invalid username or password"), None);
-        assert_eq!(cert_digest("sha256 digest 00"), None);
+        let mut pending = None;
+        assert!(cert_warning(&mut pending, &connecting("p1"), None).is_none());
+        let payload = cert_warning(&mut pending, &error("TLS handshake failed"), Some(&digest)).unwrap();
+        assert_eq!(payload, json!({"digest": digest, "profile_id": "p1"}));
+    }
+
+    #[test]
+    fn digest_text_in_the_reason_does_not_open_the_dialog() {
+        let reason = format!("Login failed: sha256 digest {}", "cd".repeat(32));
+        let mut pending = None;
+        cert_warning(&mut pending, &connecting("p1"), None);
+        assert!(cert_warning(&mut pending, &error(&reason), None).is_none());
+    }
+
+    #[test]
+    fn repeated_old_error_after_a_channel_reconnect_does_not_reopen_the_dialog() {
+        let digest = "ab".repeat(32);
+        let mut pending = None;
+        cert_warning(&mut pending, &connecting("p1"), None);
+        assert!(cert_warning(&mut pending, &error("x"), Some(&digest)).is_some());
+        // O estado inicial da conexão reaberta repete o erro, sem um connecting antes.
+        assert!(cert_warning(&mut pending, &error("x"), Some(&digest)).is_none());
+    }
+
+    #[test]
+    fn only_a_well_formed_digest_is_read_from_the_frame() {
+        let frame = |d: &str| json!({"v": 2, "type": "event", "event": "state", "state": "disconnected", "reason": "x", "cert_digest": d});
+        let digest = "ab".repeat(32);
+        assert!(matches!(parse_frame(&frame(&digest)), Some(Incoming::State { cert_digest: Some(d), .. }) if d == digest));
+        assert!(matches!(parse_frame(&frame("not a digest")), Some(Incoming::State { cert_digest: None, .. })));
     }
 
     #[test]
@@ -375,9 +420,9 @@ mod tests {
         std::thread::spawn(move || run_events(&p, |i| { let _ = tx.send(i); }));
 
         let next = || events.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(matches!(next(), Incoming::State(ConnectionState::Connecting { .. })));
+        assert!(matches!(next(), Incoming::State { state: ConnectionState::Connecting { .. }, .. }));
         // A resposta do `status` pedido ao abrir sincroniza o estado.
-        assert!(matches!(next(), Incoming::State(ConnectionState::Disconnected)));
+        assert!(matches!(next(), Incoming::State { state: ConnectionState::Disconnected, .. }));
         assert!(matches!(next(), Incoming::Log(l) if l == "hello"));
         assert_eq!(rx.recv().unwrap()["cmd"], "status");
         let _ = std::fs::remove_file(&path);
@@ -400,7 +445,7 @@ mod tests {
         });
         assert!(matches!(
             events.recv_timeout(Duration::from_secs(5)).unwrap(),
-            Incoming::State(ConnectionState::Disconnected)
+            Incoming::State { state: ConnectionState::Disconnected, .. }
         ));
         let _ = std::fs::remove_file(&path);
     }
