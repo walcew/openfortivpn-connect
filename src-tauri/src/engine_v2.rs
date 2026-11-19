@@ -42,10 +42,10 @@ pub fn check_supported(profile: &VpnProfile) -> Result<(), String> {
     Ok(())
 }
 
-/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. Sem OTP e com o
-/// gateway oferecendo push, o Helper pede o push.
+/// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. O OTP já vem
+/// normalizado por `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo
+/// push, o Helper pede o push.
 fn connect_request(profile: &VpnProfile, username: &str, password: &str, otp: Option<&str>) -> Value {
-    let otp = otp.map(str::trim).filter(|o| profile.needs_otp() && !o.is_empty());
     json!({
         "v": 2,
         "cmd": "connect",
@@ -365,16 +365,12 @@ mod tests {
     }
 
     #[test]
-    fn connect_sends_the_otp_in_the_body_only_for_otp_profiles() {
+    fn connect_sends_the_otp_in_the_body() {
         let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
         let mut profile = password_profile();
         profile.otp_required = true;
-        connect(&path, &profile, "alice", "s3cret", Some(" 123456 ")).unwrap();
+        connect(&path, &profile, "alice", "s3cret", Some("123456")).unwrap();
         assert_eq!(rx.recv().unwrap()["otp"], "123456");
-
-        // Sem otp_required um código sobrando não vai ao gateway.
-        connect(&path, &password_profile(), "alice", "s3cret", Some("123456")).unwrap();
-        assert!(rx.recv().unwrap()["otp"].is_null());
     }
 
     #[test]
