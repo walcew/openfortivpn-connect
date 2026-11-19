@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
+pub const SOCKET_PATH: &str = "/var/run/openvpngui-helper.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]

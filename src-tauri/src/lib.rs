@@ -1,6 +1,8 @@
 mod cert_fetcher;
 mod commands;
 mod dns_manager;
+#[cfg(feature = "engine-v2")]
+mod engine_v2;
 mod keychain;
 mod models;
 mod process_manager;
@@ -39,6 +41,10 @@ pub fn run() {
         ])
         .setup(|app| {
             tray::setup_tray(app)?;
+
+            // Conexão longa de eventos do Helper v2: sincroniza o estado ao abrir o app.
+            #[cfg(feature = "engine-v2")]
+            engine_v2::start(app.handle().clone());
 
             #[cfg(target_os = "macos")]
             {
