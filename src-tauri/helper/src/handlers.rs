@@ -166,36 +166,26 @@ fn cleanup_network(gateway: Option<&str>, vpn_server: Option<&str>) {
     }
 
     // Remove VPN DNS config
-    let _ = Command::new("/usr/sbin/scutil")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(b"remove State:/Network/Service/OpenFortiVPN/DNS\nquit\n")?;
-            }
-            child.wait()
-        });
+    let _ = net::system::remove_dns_config();
 
     // Flush DNS cache
-    let _ = Command::new("/usr/bin/dscacheutil")
-        .args(["-flushcache"])
-        .output();
-    let _ = Command::new("/usr/bin/killall")
-        .args(["-HUP", "mDNSResponder"])
-        .output();
+    net::system::flush_dns_cache();
 }
 
 fn handle_setup_dns(servers: Vec<String>, suffixes: Vec<String>) -> Response {
-    match net::system::set_dns(&servers, &suffixes) {
+    match net::system::write_dns_config(&servers, &suffixes) {
         Ok(()) => Response::success(),
         Err(e) => Response::error(e),
     }
 }
 
 fn handle_teardown_dns() -> Response {
-    match net::system::remove_dns() {
-        Ok(()) => Response::success(),
-        Err(e) => Response::error(format!("Failed to teardown DNS: {}", e)),
+    // O v1 sempre tratou status != 0 do scutil como sucesso; só falha se não rodar.
+    match net::system::remove_dns_config() {
+        Ok(_) => {
+            log::info!("DNS configuration removed");
+            Response::success()
+        }
+        Err(e) => Response::error(e),
     }
 }

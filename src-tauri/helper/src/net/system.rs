@@ -6,11 +6,11 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
 use tokio::io::unix::AsyncFd;
-use tokio::task::JoinHandle;
+use tokio::task::{block_in_place, JoinHandle};
 
 use super::{Os, Packets, Route};
 use crate::validation;
@@ -18,6 +18,8 @@ use crate::validation;
 const IFCONFIG: &str = "/sbin/ifconfig";
 const ROUTE: &str = "/sbin/route";
 const SCUTIL: &str = "/usr/sbin/scutil";
+const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
+const KILLALL: &str = "/usr/bin/killall";
 const DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
 const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 /// Cabeçalho do utun: a família do protocolo em ordem de rede.
@@ -26,7 +28,7 @@ const AF_INET_HEADER: [u8; 4] = (libc::AF_INET as u32).to_be_bytes();
 /// Interface do túnel ativa: o nome e a task que liga o fd ao canal de pacotes.
 struct Utun {
     name: String,
-    pump: JoinHandle<()>,
+    bridge: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -34,15 +36,21 @@ pub struct SystemOs {
     utun: Mutex<Option<Utun>>,
 }
 
+// Os comandos rodam em `block_in_place`: o trait é síncrono e é chamado de dentro da task
+// da sessão, e assim um comando lento não prende a worker thread do runtime.
 impl Os for SystemOs {
     fn up(&self, ip: Ipv4Addr, peer: Ipv4Addr, mtu: u16, packets: Packets) -> Result<(), String> {
         let (fd, name) = open_utun()?;
         let fd = AsyncFd::new(File::from(fd)).map_err(|e| format!("utun AsyncFd: {}", e))?;
         // A task é dona do fd: abortá-la fecha o fd, e o kernel remove a interface e as rotas dela.
-        let pump = tokio::spawn(pump(fd, packets));
-        *self.utun.lock().unwrap() = Some(Utun { name: name.clone(), pump });
+        let bridge = tokio::spawn(bridge_packets(fd, packets));
+        *self.utun.lock().unwrap() = Some(Utun { name: name.clone(), bridge });
         log::info!("{} created", name);
-        run(IFCONFIG, &ifconfig_args(&name, ip, peer, mtu))
+        let configured = block_in_place(|| run(IFCONFIG, &ifconfig_args(&name, ip, peer, mtu)));
+        if configured.is_err() {
+            self.down();
+        }
+        configured
     }
 
     fn add_route(&self, route: Route) -> Result<(), String> {
@@ -50,35 +58,51 @@ impl Os for SystemOs {
             Some(u) => u.name.clone(),
             None => return Err("add_route: tunnel interface is not up".into()),
         };
-        run(ROUTE, &route_args(&name, route))
+        block_in_place(|| run(ROUTE, &route_args(&name, route)))
     }
 
     fn add_gateway_route(&self, gateway: IpAddr) -> Result<(), String> {
         let gateway = ipv4(gateway)?;
-        let out = output(ROUTE, &["-n", "get", "default"])?;
-        let via = parse_default_gateway(&out).ok_or("no IPv4 default gateway to reach the VPN gateway")?;
-        // Um /32 que sobrou de uma sessão anterior faria o add falhar com "File exists".
-        let _ = output(ROUTE, &gateway_route_args("delete", gateway, None));
-        run(ROUTE, &gateway_route_args("add", gateway, Some(via)))
+        block_in_place(|| {
+            let out = output(ROUTE, &["-n", "get", "default"].map(String::from))?;
+            // shortcut: recusa conectar quando a default não tem gateway IP (só de interface, ou
+            // saindo por outra VPN); evoluir se aparecer caso real.
+            let via = parse_default_gateway(&out).ok_or("no IPv4 default gateway to reach the VPN gateway")?;
+            run(ROUTE, &gateway_route_args("add", gateway, Some(via))).map_err(|e| {
+                // Resíduo de uma sessão anterior é limpo pela recuperação de crash, não aqui:
+                // apagar o /32 antes do add poderia tirar uma rota de outro software.
+                if e.contains("File exists") {
+                    format!("a host route to the VPN gateway {} already exists: {}", gateway, e)
+                } else {
+                    e
+                }
+            })
+        })
     }
 
     fn set_dns(&self, servers: &[Ipv4Addr], suffixes: &[String]) -> Result<(), String> {
         let servers: Vec<String> = servers.iter().map(Ipv4Addr::to_string).collect();
-        set_dns(&servers, suffixes)?;
-        flush_dns_cache();
-        Ok(())
+        block_in_place(|| {
+            write_dns_config(&servers, suffixes)?;
+            flush_dns_cache();
+            Ok(())
+        })
     }
 
     fn remove_dns(&self) {
-        if let Err(e) = remove_dns() {
-            log::warn!("{}", e);
-        }
-        flush_dns_cache();
+        block_in_place(|| {
+            match remove_dns_config() {
+                Ok(status) if status.success() => {}
+                Ok(status) => log::warn!("scutil exited with status: {}", status),
+                Err(e) => log::warn!("{}", e),
+            }
+            flush_dns_cache();
+        })
     }
 
     fn remove_gateway_route(&self, gateway: IpAddr) {
         if let Ok(gateway) = ipv4(gateway) {
-            if let Err(e) = run(ROUTE, &gateway_route_args("delete", gateway, None)) {
+            if let Err(e) = block_in_place(|| run(ROUTE, &gateway_route_args("delete", gateway, None))) {
                 log::warn!("{}", e);
             }
         }
@@ -86,7 +110,7 @@ impl Os for SystemOs {
 
     fn down(&self) {
         if let Some(utun) = self.utun.lock().unwrap().take() {
-            utun.pump.abort();
+            utun.bridge.abort();
             log::info!("{} closed", utun.name);
         }
     }
@@ -110,6 +134,10 @@ fn open_utun() -> Result<(OwnedFd, String), String> {
             return Err(err("socket"));
         }
         let fd = OwnedFd::from_raw_fd(raw);
+        // O Helper roda comandos como root: o fd do túnel não vaza para eles.
+        if libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            return Err(err("FD_CLOEXEC"));
+        }
 
         let mut info: libc::ctl_info = std::mem::zeroed();
         for (dst, src) in info.ctl_name.iter_mut().zip(UTUN_CONTROL_NAME.bytes()) {
@@ -158,7 +186,7 @@ fn open_utun() -> Result<(OwnedFd, String), String> {
 }
 
 /// Liga o utun ao canal de pacotes até um dos lados fechar.
-async fn pump(fd: AsyncFd<File>, mut packets: Packets) {
+async fn bridge_packets(fd: AsyncFd<File>, mut packets: Packets) {
     let mut buf = vec![0u8; 65536];
     loop {
         tokio::select! {
@@ -222,10 +250,9 @@ fn parse_default_gateway(out: &str) -> Option<Ipv4Addr> {
 }
 
 /// Roda o comando e devolve o stdout, ou um erro com o stderr.
-fn output<S: AsRef<std::ffi::OsStr>>(cmd: &str, args: &[S]) -> Result<String, String> {
+fn output(cmd: &str, args: &[String]) -> Result<String, String> {
     let out = Command::new(cmd).args(args).output().map_err(|e| format!("{}: {}", cmd, e))?;
     if !out.status.success() {
-        let args: Vec<_> = args.iter().map(|a| a.as_ref().to_string_lossy()).collect();
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("{} {} failed: {}", cmd, args.join(" "), stderr.trim()));
     }
@@ -236,8 +263,9 @@ fn run(cmd: &str, args: &[String]) -> Result<(), String> {
     output(cmd, args).map(|_| ())
 }
 
-fn scutil(input: &str) -> Result<(), String> {
-    let status = Command::new(SCUTIL)
+/// Roda o scutil com a entrada dada; o erro é só de não conseguir rodá-lo.
+fn scutil(input: &str) -> Result<ExitStatus, String> {
+    Command::new(SCUTIL)
         .stdin(Stdio::piped())
         .spawn()
         .and_then(|mut child| {
@@ -247,15 +275,11 @@ fn scutil(input: &str) -> Result<(), String> {
             }
             child.wait()
         })
-        .map_err(|e| format!("Failed to run scutil: {}", e))?;
-    if !status.success() {
-        return Err(format!("scutil exited with status: {}", status));
-    }
-    Ok(())
+        .map_err(|e| format!("Failed to run scutil: {}", e))
 }
 
 /// Split DNS via scutil: os servidores respondem só pelos sufixos (ou por tudo, sem sufixos).
-pub fn set_dns(servers: &[String], suffixes: &[String]) -> Result<(), String> {
+pub fn write_dns_config(servers: &[String], suffixes: &[String]) -> Result<(), String> {
     if servers.is_empty() {
         return Err("No DNS servers provided".to_string());
     }
@@ -271,10 +295,15 @@ pub fn set_dns(servers: &[String], suffixes: &[String]) -> Result<(), String> {
         }
     }
     log::info!("Setting up DNS with servers: {} suffixes: {:?}", servers.join(" "), suffixes);
-    scutil(&scutil_dns_input(servers, suffixes))
+    let status = scutil(&scutil_dns_input(servers, suffixes))?;
+    if !status.success() {
+        return Err(format!("scutil exited with status: {}", status));
+    }
+    Ok(())
 }
 
-pub fn remove_dns() -> Result<(), String> {
+/// Remove a chave de DNS; quem chama decide o que fazer com o status do scutil.
+pub fn remove_dns_config() -> Result<ExitStatus, String> {
     log::info!("Tearing down DNS configuration");
     scutil(&format!("remove {}\nquit\n", DNS_KEY))
 }
@@ -293,9 +322,9 @@ fn scutil_dns_input(servers: &[String], suffixes: &[String]) -> String {
     }
 }
 
-fn flush_dns_cache() {
-    let _ = Command::new("/usr/bin/dscacheutil").arg("-flushcache").output();
-    let _ = Command::new("/usr/bin/killall").args(["-HUP", "mDNSResponder"]).output();
+pub fn flush_dns_cache() {
+    let _ = Command::new(DSCACHEUTIL).arg("-flushcache").output();
+    let _ = Command::new(KILLALL).args(["-HUP", "mDNSResponder"]).output();
 }
 
 #[cfg(test)]
@@ -359,8 +388,23 @@ mod tests {
     }
 
     #[test]
-    fn set_dns_rejects_unsafe_suffixes() {
-        let err = set_dns(&strings(&["10.0.0.53"]), &strings(&["evil;quit"])).unwrap_err();
+    fn scutil_input_without_suffixes_matches_every_domain() {
+        let input = scutil_dns_input(&strings(&["10.0.0.53", "10.0.0.54"]), &[]);
+        assert!(input.contains("d.add ServerAddresses * 10.0.0.53 10.0.0.54\n"));
+        assert!(input.contains("d.add SupplementalMatchDomains * \"\"\n"));
+        assert!(!input.contains("SearchDomains"));
+    }
+
+    #[test]
+    fn dns_config_rejects_invalid_servers() {
+        let err = write_dns_config(&strings(&["10.0.0.53; quit"]), &[]).unwrap_err();
+        assert!(err.contains("Invalid DNS server IP"), "{}", err);
+        assert!(write_dns_config(&[], &[]).unwrap_err().contains("No DNS servers"));
+    }
+
+    #[test]
+    fn dns_config_rejects_unsafe_suffixes() {
+        let err = write_dns_config(&strings(&["10.0.0.53"]), &strings(&["evil;quit"])).unwrap_err();
         assert!(err.contains("Invalid DNS suffix"));
     }
 }
