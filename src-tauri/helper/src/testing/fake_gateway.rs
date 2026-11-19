@@ -46,6 +46,8 @@ const CHALLENGE: [(&str, &str); 6] =
 pub enum Push {
     Approve,
     Deny,
+    /// Aceita o pedido e nunca responde.
+    Silent,
 }
 
 #[derive(Default, Clone)]
@@ -64,6 +66,8 @@ pub struct GatewayOptions {
     pub require_otp: bool,
     /// O `logincheck` oferece push; o cookie vem (ou não) depois de `PUSH_DELAY`.
     pub push: Option<Push>,
+    /// O pedido de token chega sem `reqid`.
+    pub incomplete_challenge: bool,
 }
 
 struct Shared {
@@ -212,10 +216,18 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
         let token_mode = shared.options.require_otp || shared.options.push.is_some();
         if field("reqid").is_some() {
             // Segundo passo: o cliente devolve o desafio inteiro, mais o código ou o pedido de push.
-            let echoed = field("username") == Some(USERNAME) && CHALLENGE.iter().all(|(k, v)| field(k) == Some(*v));
+            let echoed = field("username") == Some(USERNAME)
+                && CHALLENGE.iter().all(|(k, v)| field(k) == Some(*v))
+                && field("just_logged_in") == Some("1")
+                && field("ajax") == Some("1")
+                && field("credential").is_none();
             let approved = if field("code").is_some() {
                 shared.options.require_otp && field("code") == Some(OTP)
             } else if field("ftm_push") == Some("1") {
+                if matches!(shared.options.push, Some(Push::Silent)) {
+                    let _ = stream.read(&mut [0u8; 1]).await; // segura a conexão até o cliente desistir
+                    return;
+                }
                 tokio::time::sleep(PUSH_DELAY).await;
                 matches!(shared.options.push, Some(Push::Approve))
             } else {
@@ -233,7 +245,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: 
                 denied
             } else if token_mode {
                 let tokeninfo = if shared.options.push.is_some() { "ftm_push" } else { "" };
-                let fields: String = CHALLENGE.iter().map(|(k, v)| format!(",{}={}", k, v)).collect();
+                let fields: String = CHALLENGE
+                    .iter()
+                    .filter(|(k, _)| !(shared.options.incomplete_challenge && *k == "reqid"))
+                    .map(|(k, v)| format!(",{}={}", k, v))
+                    .collect();
                 http("", &format!("ret=2,tokeninfo={},chal_msg=Please enter your token code{}", tokeninfo, fields))
             } else {
                 granted

@@ -23,16 +23,18 @@ Os campos e a ordem são os do passo comum do FortiClient (**obs**), que lá vai
 
 ### Segundo passo: OTP e push
 
-Quando o gateway exige token, o primeiro `logincheck` volta sem cookie e com um corpo de pares `chave=valor` separados por vírgula (**inf**: formato e nomes vêm do comportamento público de clientes de terceiros, sem prova contra o gateway real):
+Quando o gateway exige o segundo fator, o primeiro `logincheck` volta sem cookie e com um corpo de pares `chave=valor` separados por vírgula (**inf**: formato e nomes vêm do comportamento público de clientes de terceiros, sem prova contra o gateway real):
 
 ```
 ret=2,tokeninfo=<tipo>,chal_msg=<texto>,reqid=..,polid=..,grp=..,portal=..,peer=..,magic=..
 ```
 
-- A presença da chave `tokeninfo` marca o pedido de token. `tokeninfo=ftm_push` indica que o gateway oferece push do FortiToken Mobile; outro valor (ou vazio) é código digitado (**inf**).
-- O Engine guarda `reqid`, `polid`, `grp`, `portal`, `peer` e `magic` e ignora o resto. Valor com vírgula vem truncado (`chal_msg` não importa).
+- A presença da chave `tokeninfo` marca o pedido do segundo fator. `tokeninfo=ftm_push` indica que o gateway oferece push do FortiToken Mobile; outro valor (ou vazio) é código digitado (**inf**).
+- O Engine guarda `reqid`, `polid`, `grp`, `portal`, `peer` e `magic` e ignora o resto. Valor com vírgula vem truncado (`chal_msg` não importa). Sem `reqid` o login falha com "incomplete login challenge", e não como OTP inválido; os outros cinco são reenviados se vierem, mas não são exigidos (**inf**: quais campos o gateway real sempre manda).
 - O segundo passo é outro `POST /remote/logincheck`, no mesmo formato de formulário, com `username`, os seis valores devolvidos como vieram, e `code=<otp>` **ou** `ftm_push=1`, mais `just_logged_in=1&ajax=1` (**inf**: o conjunto exato de campos). O `credential` não é reenviado (**inf**).
-- Com OTP no `connect`, o Engine manda `code`. Sem OTP e com push oferecido, manda `ftm_push=1`, emite o estado `waiting-push` e espera a resposta por até 60 s (**inf**: se o gateway segura a resposta até a aprovação ou exige novas consultas não foi confirmado; o prazo é escolha nossa). Sem OTP e sem push, o login falha com "requires an OTP".
+- Com OTP no `connect`, o Engine manda `code`. Sem OTP e com push oferecido, manda `ftm_push=1`, emite o estado `waiting-push` e espera a resposta por até 60 s. Passado o prazo, o login falha com "push notification expired". Que o gateway segure a resposta até a aprovação (e não exija novas consultas) é **inf**; os 60 s são escolha nossa. Sem OTP e sem push, o login falha com "requires an OTP".
+- O nome do campo do push é **inf**: o Engine usa `ftm_push=1`, mas clientes de terceiros também usam a variante `ftmpush=1`. Os dois ficam sem validação até o teste contra o gateway real.
+- Cancelar durante `waiting-push` não faz logout: o Engine ainda não tem cookie. Se o usuário aprovar o push depois de cancelar, a sessão fica aberta no gateway até expirar.
 - Sucesso é o mesmo `Set-Cookie: SVPNCOOKIE` não vazio. Sem cookie, o código errado ou expirado e o push recusado ou expirado viram `disconnected` com `reason`. OTP enviado a um gateway que não pede token é ignorado.
 - O OTP só trafega no corpo do `connect` (socket) e no corpo do `POST` (TLS); nunca em argv nem em log.
 
