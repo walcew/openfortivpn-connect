@@ -85,6 +85,56 @@ impl VpnManager {
         dns_fallback: bool,
         otp: Option<String>,
     ) -> Result<(), String> {
+        #[cfg(feature = "engine-v2")]
+        {
+            let _ = (debug_mode, dns_fallback, otp);
+            self.connect_v2(profile_id, &app_handle)
+        }
+        #[cfg(not(feature = "engine-v2"))]
+        self.connect_v1(profile_id, app_handle, debug_mode, dns_fallback, otp)
+    }
+
+    /// Conecta pelo Engine do Helper (protocolo v2). O progresso e o resultado
+    /// chegam depois por eventos de estado.
+    #[cfg(feature = "engine-v2")]
+    fn connect_v2(&mut self, profile_id: &str, app_handle: &AppHandle) -> Result<(), String> {
+        match &self.state {
+            ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
+            _ => return Err("Already connecting or connected".to_string()),
+        }
+        let profile = self
+            .profile_store
+            .get_by_id(profile_id)?
+            .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
+        crate::engine_v2::check_supported(&profile)?;
+
+        let result = Self::resolve_password_creds(&profile).and_then(|(username, password)| {
+            self.set_state(
+                ConnectionState::Connecting { profile_id: profile_id.to_string() },
+                app_handle,
+            );
+            crate::engine_v2::connect(
+                std::path::Path::new(crate::helper_client::SOCKET_PATH),
+                &profile,
+                &username,
+                &password,
+            )
+        });
+        if let Err(e) = &result {
+            self.set_state(ConnectionState::Error { message: e.clone() }, app_handle);
+        }
+        result
+    }
+
+    #[cfg_attr(feature = "engine-v2", allow(dead_code))]
+    fn connect_v1(
+        &mut self,
+        profile_id: &str,
+        app_handle: AppHandle,
+        debug_mode: bool,
+        dns_fallback: bool,
+        otp: Option<String>,
+    ) -> Result<(), String> {
         // Validate state
         match &self.state {
             ConnectionState::Disconnected | ConnectionState::Error { .. } => {}
@@ -235,6 +285,27 @@ impl VpnManager {
 
     /// Perform the heavy disconnect work (kill process, restore routes, DNS).
     pub fn finish_disconnect(&mut self, app_handle: &AppHandle) {
+        #[cfg(feature = "engine-v2")]
+        self.finish_disconnect_v2(app_handle);
+        #[cfg(not(feature = "engine-v2"))]
+        self.finish_disconnect_v1(app_handle);
+    }
+
+    /// Pede o `disconnect` ao Engine; o estado final chega por evento.
+    #[cfg(feature = "engine-v2")]
+    fn finish_disconnect_v2(&mut self, app_handle: &AppHandle) {
+        let path = std::path::Path::new(crate::helper_client::SOCKET_PATH);
+        let result = crate::engine_v2::disconnect(path).and_then(|_| crate::engine_v2::status(path));
+        match result {
+            // Já desconectado: não haverá evento novo, então fecha o Disconnecting aqui.
+            Ok(ConnectionState::Disconnected) => self.set_state(ConnectionState::Disconnected, app_handle),
+            Ok(_) => {}
+            Err(e) => self.set_state(ConnectionState::Error { message: e }, app_handle),
+        }
+    }
+
+    #[cfg_attr(feature = "engine-v2", allow(dead_code))]
+    fn finish_disconnect_v1(&mut self, app_handle: &AppHandle) {
         match self.process_manager.kill_vpn() {
             Ok(()) => {
                 self.set_state(ConnectionState::Disconnected, app_handle);
