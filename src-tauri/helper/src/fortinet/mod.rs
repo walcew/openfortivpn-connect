@@ -34,10 +34,9 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Valores do pedido de token que o segundo passo do login devolve ao gateway.
 const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
-/// Nosso prazo do login SAML, o mesmo do fluxo interno do FortiClient; vale o menor entre ele e o `remoteauthtimeout`.
-const SAML_TIMEOUT: Duration = Duration::from_secs(300);
-// shortcut: sem `sso_port` no `/remote/info` usa 8020, a porta do gateway testado; trocar por erro se aparecer gateway com outra porta e sem o campo.
+// shortcut: sem `sso_port` e `remoteauthtimeout` no `/remote/info` valem 8020 e 120 s, os do gateway testado; trocar por erro se aparecer gateway com outros valores e sem os campos.
 const DEFAULT_SSO_PORT: u16 = 8020;
+const DEFAULT_SAML_TIMEOUT: u64 = 120;
 /// Passo comum do FortiClient depois do SAML: `logincheck` sem credencial.
 const SAML_LOGINCHECK: &str = "username=&credential=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1";
 
@@ -86,6 +85,16 @@ pub struct Challenge {
 pub enum Login {
     Cookie(String),
     Challenge(Challenge),
+}
+
+/// Valor do cabeçalho `Cookie` com o cookie de sessão.
+fn svpn_header(cookie: &str) -> String {
+    format!("SVPNCOOKIE={}", cookie)
+}
+
+/// O `SVPNCOOKIE` de uma resposta; vazio conta como ausente (é como o gateway o apaga).
+fn session_cookie(resp: &http::Response) -> Option<String> {
+    resp.cookie("SVPNCOOKIE").filter(|c| !c.is_empty())
 }
 
 /// Número de um atributo `nome='valor'` (ou com aspas duplas) no corpo do `/remote/info`.
@@ -226,7 +235,7 @@ impl Gateway {
             http::form_encode(password)
         );
         let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form)).await?;
-        if let Some(c) = resp.cookie("SVPNCOOKIE").filter(|c| !c.is_empty()) {
+        if let Some(c) = session_cookie(&resp) {
             return Ok(Login::Cookie(c));
         }
         let pairs = parse_pairs(&resp.body);
@@ -263,8 +272,8 @@ impl Gateway {
                 .await
                 .map_err(|_| "Login failed: push notification expired".to_string())??,
         };
-        match resp.cookie("SVPNCOOKIE") {
-            Some(c) if !c.is_empty() => Ok(c),
+        match session_cookie(&resp) {
+            Some(c) => Ok(c),
             _ if otp.is_some() => Err("Login failed: invalid or expired OTP code".into()),
             _ => Err("Login failed: push notification was denied or expired".into()),
         }
@@ -275,9 +284,19 @@ impl Gateway {
     pub async fn saml_login(&self, waiting: impl FnOnce(String)) -> Result<String, String> {
         let host = self.host_header();
         let info = self.request("GET", "/remote/info", &host, None, None).await?;
-        let info = String::from_utf8_lossy(&info.body);
-        let port = info_number(&info, "sso_port").and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_SSO_PORT);
-        let timeout = info_number(&info, "remoteauthtimeout").map_or(SAML_TIMEOUT, |s| SAML_TIMEOUT.min(Duration::from_secs(s)));
+        let body = if (200..300).contains(&info.status) { String::from_utf8_lossy(&info.body).into_owned() } else { String::new() };
+        let port = info_number(&body, "sso_port").and_then(|p| u16::try_from(p).ok());
+        let secs = info_number(&body, "remoteauthtimeout");
+        if port.is_none() || secs.is_none() {
+            let line = format!(
+                "GET /remote/info (HTTP {}) lacks sso_port or remoteauthtimeout; using sso_port {} and {} s where missing",
+                info.status, DEFAULT_SSO_PORT, DEFAULT_SAML_TIMEOUT
+            );
+            log::warn!("{}", line);
+            (self.log)(line);
+        }
+        let port = port.unwrap_or(DEFAULT_SSO_PORT);
+        let timeout = Duration::from_secs(secs.unwrap_or(DEFAULT_SAML_TIMEOUT));
 
         let listener = saml::listen(port).await?;
         waiting(format!("https://{}/remote/saml/start?redirect=1", host));
@@ -286,7 +305,7 @@ impl Gateway {
             .map_err(|_| format!("SAML login timed out after {} s", timeout.as_secs()))??;
 
         let resp = self.request("GET", &format!("/remote/saml/auth_id?id={}", id), &host, None, None).await?;
-        if let Some(c) = resp.cookie("SVPNCOOKIE").filter(|c| !c.is_empty()) {
+        if let Some(c) = session_cookie(&resp) {
             return Ok(c);
         }
         // Sem o cookie no `auth_id`, o passo comum do FortiClient, levando os cookies que o `auth_id` deixou (**inf**).
@@ -294,14 +313,12 @@ impl Gateway {
         let resp = self
             .request("POST", "/remote/logincheck", &host, Some(&cookies).filter(|c| !c.is_empty()).map(String::as_str), Some(SAML_LOGINCHECK))
             .await?;
-        resp.cookie("SVPNCOOKIE")
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| "SAML login failed: the gateway returned no session cookie".into())
+        session_cookie(&resp).ok_or_else(|| "SAML login failed: the gateway returned no session cookie".into())
     }
 
     /// Lê a config do túnel, abre o `sslvpn-tunnel` e negocia o PPP até o IPCP subir.
     pub async fn open_tunnel(&self, cookie: &str) -> Result<(TunnelConfig, Packets, Tunnel), String> {
-        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(&format!("SVPNCOOKIE={}", cookie)), None).await?;
+        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(&svpn_header(cookie)), None).await?;
         if resp.status != 200 {
             return Err(format!("Gateway refused the tunnel configuration (HTTP {})", resp.status));
         }
@@ -312,7 +329,7 @@ impl Gateway {
             .await
             .map_err(|_| "Tunnel connection timed out".to_string())??;
         let gateway = stream.get_ref().0.peer_addr().map_err(|e| e.to_string())?.ip();
-        let req = format!("GET /remote/sslvpn-tunnel HTTP/1.1\r\nHost: sslvpn\r\nCookie: SVPNCOOKIE={}\r\n\r\n", cookie);
+        let req = format!("GET /remote/sslvpn-tunnel HTTP/1.1\r\nHost: sslvpn\r\nCookie: {}\r\n\r\n", svpn_header(cookie));
         stream.write_all(req.as_bytes()).await.map_err(|e| format!("Tunnel request failed: {}", e))?;
 
         let (to_iface, rx) = mpsc::channel(256);
@@ -340,6 +357,6 @@ impl Gateway {
     }
 
     pub async fn logout(&self, cookie: &str) -> Result<(), String> {
-        self.request("GET", "/remote/logout", &self.host_header(), Some(&format!("SVPNCOOKIE={}", cookie)), None).await.map(|_| ())
+        self.request("GET", "/remote/logout", &self.host_header(), Some(&svpn_header(cookie)), None).await.map(|_| ())
     }
 }

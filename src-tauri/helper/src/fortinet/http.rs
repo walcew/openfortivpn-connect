@@ -121,7 +121,7 @@ pub fn client_config(profile: &Profile, trust: &CertTrust, refused: Arc<Mutex<Op
         .with_no_client_auth())
 }
 
-#[derive(Debug)]
+/// Sem `Debug` de propósito: guarda o `Set-Cookie` com o cookie de sessão.
 pub struct Response {
     pub status: u16,
     headers: Vec<(String, String)>,

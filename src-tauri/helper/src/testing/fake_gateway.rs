@@ -38,11 +38,11 @@ pub const AUTH_TIMEOUT: u64 = 28800;
 pub const OTP: &str = "123456";
 /// Quanto o modo push demora para responder, para provar que o cliente espera.
 pub const PUSH_DELAY: Duration = Duration::from_millis(300);
-/// Valores do desafio de token; `magic` leva `=` e `&` para provar o parse e o encoding.
 /// `id` que o navegador falso entrega no listener SAML e que o `saml/auth_id` aceita.
 pub const SAML_ID: &str = "Zx9-q_7Lm.42";
 /// Cookie de sessão que o `auth_id` entrega no modo `saml_cookie_on_logincheck`, no lugar do `SVPNCOOKIE`.
 const SAML_SESSION: &str = "FGTSAMLSESSION=pending-saml-session";
+/// Valores do desafio de token; `magic` leva `=` e `&` para provar o parse e o encoding.
 const CHALLENGE: [(&str, &str); 6] =
     [("reqid", "4242"), ("polid", "pol-1"), ("grp", "vpn users"), ("portal", "full-access"), ("magic", "m4g=1&c"), ("peer", "10.0.0.1")];
 
