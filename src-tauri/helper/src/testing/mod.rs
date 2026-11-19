@@ -41,11 +41,11 @@ impl Client {
         Some(serde_json::from_str(&line).unwrap())
     }
 
-    /// Próximo quadro que não é evento de log.
+    /// Próximo quadro que não é evento de log nem de banda, que chegam a qualquer momento.
     pub async fn recv_skipping_logs(&mut self) -> Value {
         loop {
             let v = self.recv().await.expect("server closed the connection");
-            if v["event"] != "log" {
+            if v["event"] != "log" && v["event"] != "bandwidth" {
                 return v;
             }
         }
