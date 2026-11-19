@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run build:openfortivpn && npm run dev",
-    "beforeBuildCommand": "npm run build:openfortivpn && npm run build"
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "withGlobalTauri": true,
@@ -36,11 +36,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "target/release/openvpngui-helper": "openvpngui-helper",
-      "binaries/openfortivpn": "openfortivpn",
-      "licenses/openfortivpn-LICENSE.txt": "licenses/openfortivpn-LICENSE.txt",
-      "licenses/openfortivpn-LICENSE.OpenSSL.txt": "licenses/openfortivpn-LICENSE.OpenSSL.txt",
-      "licenses/openssl-LICENSE.txt": "licenses/openssl-LICENSE.txt"
+      "target/release/openvpngui-helper": "openvpngui-helper"
     },
     "icon": [
       "icons/32x32.png",

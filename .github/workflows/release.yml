@@ -28,16 +28,12 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             arch: aarch64
-            ofv_arch: arm64
+            lipo_arch: arm64
           - platform: macos-latest
             target: x86_64-apple-darwin
             arch: x86_64
-            ofv_arch: x86_64
+            lipo_arch: x86_64
     runs-on: ${{ matrix.platform }}
-    env:
-      # O beforeBuildCommand do Tauri roda build:openfortivpn sem argumento; sem isso o script
-      # usaria a arquitetura do host (arm64) e sobrescreveria o binário x86_64 do job cruzado.
-      OPENFORTIVPN_ARCH: ${{ matrix.ofv_arch }}
 
     steps:
       - name: Checkout repository
@@ -71,12 +67,6 @@ jobs:
           mkdir -p target/release
           cp target/${{ matrix.target }}/release/openvpngui-helper target/release/openvpngui-helper
 
-      - name: Build bundled openfortivpn
-        run: |
-          # Só dependência de build; o script não usa o OpenSSL do Homebrew.
-          brew install autoconf automake
-          scripts/build-openfortivpn.sh "${{ matrix.ofv_arch }}"
-
       - name: Build and release with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -101,10 +91,9 @@ jobs:
           args: '--target ${{ matrix.target }}'
 
       # Depois do Tauri: o prebuild dele pode sobrescrever o helper com o do host.
-      - name: Verify bundled binary architectures
+      - name: Verify bundled Helper architecture
         run: |
-          lipo src-tauri/binaries/openfortivpn -verify_arch ${{ matrix.ofv_arch }}
-          lipo src-tauri/target/release/openvpngui-helper -verify_arch ${{ matrix.ofv_arch }}
+          lipo src-tauri/target/release/openvpngui-helper -verify_arch ${{ matrix.lipo_arch }}
 
       - name: Upload DMGs (dry run)
         if: inputs.dry_run == true
