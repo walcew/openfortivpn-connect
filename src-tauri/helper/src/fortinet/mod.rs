@@ -74,7 +74,12 @@ pub struct Profile {
     /// sem DNS no sistema). Só valem, com os do Google, se o gateway não mandar servidor.
     #[serde(default)]
     pub dns_fallback_servers: Vec<Ipv4Addr>,
+    /// Realm do login por senha; ausente ou vazio manda `realm=` vazio.
+    #[serde(default)]
+    pub realm: Option<String>,
 }
+
+const MAX_REALM_LEN: usize = 64;
 
 /// O gateway pediu o segundo fator (OTP ou push) no primeiro passo do login.
 pub struct Challenge {
@@ -119,6 +124,7 @@ fn parse_pairs(body: &[u8]) -> Vec<(String, String)> {
 pub struct Gateway {
     host: String,
     port: u16,
+    realm: String,
     server_name: ServerName<'static>,
     tls: TlsConnector,
     /// Só o auto-trust registra o digest de cada conexão.
@@ -162,11 +168,16 @@ impl Gateway {
         if !is_valid_hostname(&profile.host) {
             return Err(format!("Invalid host: {}", profile.host));
         }
+        let realm = profile.realm.clone().unwrap_or_default();
+        if realm.len() > MAX_REALM_LEN || realm.chars().any(char::is_control) {
+            return Err("Invalid realm".into());
+        }
         let server_name = ServerName::try_from(profile.host.clone()).map_err(|e| format!("Invalid host: {}", e))?;
         let refused = Arc::new(Mutex::new(None));
         Ok(Self {
             host: profile.host.clone(),
             port: profile.port,
+            realm,
             server_name,
             tls: TlsConnector::from(Arc::new(http::client_config(profile, trust, refused.clone())?)),
             auto_trust: profile.ignore_cert_errors,
@@ -249,9 +260,10 @@ impl Gateway {
     /// `POST /remote/logincheck`: devolve o `SVPNCOOKIE` ou o pedido de token do gateway.
     pub async fn login(&self, username: &str, password: &str) -> Result<Login, String> {
         let form = format!(
-            "username={}&credential={}&realm=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1",
+            "username={}&credential={}&realm={}&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1",
             http::form_encode(username),
-            http::form_encode(password)
+            http::form_encode(password),
+            http::form_encode(&self.realm)
         );
         let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form)).await?;
         if let Some(c) = session_cookie(&resp) {

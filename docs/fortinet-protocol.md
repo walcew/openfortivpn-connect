@@ -13,10 +13,12 @@ Cada passo HTTP abre uma conexão TLS nova com `Connection: close`. O certificad
 `POST /remote/logincheck` com corpo `application/x-www-form-urlencoded`:
 
 ```
-username=<usuário>&credential=<senha>&realm=&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1
+username=<usuário>&credential=<senha>&realm=<realm>&just_logged_in=1&redir=%2Fremote%2Findex&ajax=1
 ```
 
 Os campos e a ordem são os do passo comum do FortiClient (**obs**), que lá vai com `username` e `credential` vazios, depois do SAML. Preencher os dois com usuário e senha no login por senha é **inf**.
+
+`realm` vem do campo opcional `realm` do `profile` do `connect` (string, urlencoded no formulário). Ausente, nulo ou vazio manda `realm=` vazio. O Helper recusa o `connect` com `Invalid realm` se ele passar de 64 bytes ou tiver caractere de controle. Só o primeiro passo do login leva o realm: o segundo passo (OTP e push) reenvia o desafio sem ele, e o SAML não o envia (**inf**: não há fonte de que `/remote/saml/start` ou o `logincheck` pós-SAML aceitem `realm`, então não foi inventado; a confirmar contra um gateway real com realm).
 
 - Sucesso: `Set-Cookie: SVPNCOOKIE=<valor>` com valor não vazio (**obs**).
 - Falha: o cookie não vem ou vem vazio, e o corpo traz `ret=0` (**inf**). Sem cookie e sem `tokeninfo` no corpo, o Engine trata como credencial inválida.

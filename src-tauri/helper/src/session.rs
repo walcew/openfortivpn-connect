@@ -664,6 +664,51 @@ mod tests {
         assert!(os.calls().is_empty());
     }
 
+    async fn connect_with_realm(realm: Option<&str>) -> (FakeGateway, Value) {
+        let gw = FakeGateway::start(GatewayOptions::default()).await;
+        let (path, _session, _os) = start_with_os(FakeOs::default()).await;
+        let mut c = client(&path).await;
+        let mut cmd = connect_cmd(&gw, PASSWORD);
+        if let Some(realm) = realm {
+            cmd["profile"]["realm"] = json!(realm);
+        }
+        let state = send_connect(&mut c, cmd).await;
+        (gw, state)
+    }
+
+    #[tokio::test]
+    async fn profile_realm_goes_urlencoded_in_the_logincheck() {
+        let (gw, state) = connect_with_realm(Some("corp&x=1 \u{e7}")).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        assert_eq!(gw.realms(), ["corp&x=1 \u{e7}"]);
+    }
+
+    #[tokio::test]
+    async fn profile_without_realm_sends_it_empty_as_before() {
+        for realm in [None, Some("")] {
+            let (gw, state) = connect_with_realm(realm).await;
+            assert_eq!(state["state"], "connected", "{}", state);
+            assert_eq!(gw.realms(), [""]);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_realm_is_refused_before_any_login() {
+        for realm in ["a\r\nb", "tab\there", &"x".repeat(65)] {
+            let gw = FakeGateway::start(GatewayOptions::default()).await;
+            let (path, _session, os) = start_with_os(FakeOs::default()).await;
+            let mut c = client(&path).await;
+            let mut cmd = connect_cmd(&gw, PASSWORD);
+            cmd["profile"]["realm"] = json!(realm);
+            c.send(cmd).await;
+            let r = c.recv_skipping_logs().await;
+            assert_eq!(r["ok"], false, "{}", r);
+            assert!(r["error"].as_str().unwrap().contains("Invalid realm"), "{}", r);
+            assert!(gw.realms().is_empty());
+            assert!(os.calls().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn untrusted_certificate_is_refused_with_its_digest() {
         let gw = FakeGateway::start(GatewayOptions::default()).await;

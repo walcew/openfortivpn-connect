@@ -72,7 +72,6 @@ pub enum Credentials {
 
 /// Corpo do `connect`: senha e OTP só viajam aqui, nunca em argv. O OTP já vem normalizado por
 /// `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo push, o Helper pede o push.
-/// O realm do Profile fica fora do contrato.
 /// `dns_fallback_servers` é o DNS do sistema lido antes de conectar (vazio com o fallback
 /// desligado); o Helper o usa, com os do Google, só se o gateway não mandar DNS.
 fn connect_request(profile: &VpnProfile, creds: &Credentials, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
@@ -91,6 +90,7 @@ fn connect_request(profile: &VpnProfile, creds: &Credentials, otp: Option<&str>,
             "ignore_cert_errors": profile.ignore_cert_errors,
             "dns_match_domains": profile.dns_match_domains,
             "dns_fallback_servers": dns_fallback_servers,
+            "realm": profile.realm,
         },
         "otp": otp,
     });
@@ -457,7 +457,8 @@ mod tests {
                 "profile": {
                     "id": "p1", "host": "vpn.example.com", "port": 443, "auth": "password",
                     "username": "alice", "trusted_certs": ["abc"], "ignore_cert_errors": false,
-                    "dns_match_domains": ["corp.example.com"], "dns_fallback_servers": ["192.168.0.1"]
+                    "dns_match_domains": ["corp.example.com"], "dns_fallback_servers": ["192.168.0.1"],
+                    "realm": null
                 },
                 "password": "s3cret", "otp": null
             })
@@ -474,6 +475,14 @@ mod tests {
     #[test]
     fn version_fails_when_the_helper_is_not_running() {
         assert!(version(&socket_path()).is_err());
+    }
+
+    #[test]
+    fn connect_carries_the_profile_realm() {
+        let (path, rx) = fake_helper(vec![], |_| vec![ok()]);
+        let profile = VpnProfile { realm: Some("corp".into()), ..password_profile() };
+        connect(&path, &profile, &password_creds(), None, &[]).unwrap();
+        assert_eq!(rx.recv().unwrap()["profile"]["realm"], "corp");
     }
 
     fn error(message: &str) -> ConnectionState {
@@ -683,7 +692,7 @@ mod tests {
                 "profile": {
                     "id": "p1", "host": "vpn.example.com", "port": 443, "auth": "saml",
                     "trusted_certs": ["abc"], "ignore_cert_errors": false,
-                    "dns_match_domains": ["corp.example.com"], "dns_fallback_servers": []
+                    "dns_match_domains": ["corp.example.com"], "dns_fallback_servers": [], "realm": null
                 },
                 "otp": null
             })
