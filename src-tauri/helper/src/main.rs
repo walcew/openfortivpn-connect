@@ -1,6 +1,7 @@
 mod handlers;
 mod protocol;
 mod server;
+mod session;
 mod validation;
 
 use std::fs;
