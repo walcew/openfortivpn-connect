@@ -108,7 +108,8 @@ pub enum RequestV2 {
     Connect {
         profile: Profile,
         password: String,
-        #[allow(dead_code)] // shortcut: OTP entra no ticket do OTP
+        // shortcut: o OTP chega e é ignorado, o ticket #13 passa a usá-lo no login.
+        #[allow(dead_code)]
         #[serde(default)]
         otp: Option<String>,
     },
