@@ -17,6 +17,8 @@ const LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolução da velocidade que a GUI calcula; mais curto pesa sem ganho visível.
 const BANDWIDTH_INTERVAL: Duration = Duration::from_secs(1);
+/// Janela que agrupa a rajada de avisos de uma troca de rede num único refazer.
+const NETWORK_SETTLE: Duration = Duration::from_secs(1);
 /// Antecedência do aviso de expiração da sessão.
 const EXPIRY_WARNING: Duration = Duration::from_secs(15 * 60);
 
@@ -144,6 +146,8 @@ pub struct Session {
     /// O que a camada de rede aplicou e ainda não foi desfeito.
     applied: Mutex<net::Applied>,
     events: broadcast::Sender<Event>,
+    /// Troca de rede ou wake durante uma sessão conectada.
+    network: Notify,
     push_timeout: Option<Duration>,
     echo_interval: Duration,
     expiry_warning: Duration,
@@ -163,12 +167,14 @@ impl Session {
     }
 
     fn build(os: Arc<dyn Os>, trust: CertTrust) -> Self {
+        net::recover(&*os);
         Self {
             os,
             trust: Arc::new(trust),
             inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None, cause: None }, cancel: None, stopping: false }),
             applied: Mutex::default(),
             events: broadcast::channel(256).0,
+            network: Notify::new(),
             push_timeout: None,
             echo_interval: ECHO_INTERVAL,
             expiry_warning: EXPIRY_WARNING,
@@ -285,6 +291,20 @@ impl Session {
             Self::set_state(&mut inner, &session.events, State::Disconnected { reason, cert_digest, cause });
         });
         Ok(())
+    }
+
+    /// Aviso do observador de rede (troca de rota default ou wake). Só conta com sessão
+    /// conectada; a rajada é agrupada na sessão.
+    pub fn network_changed(&self) {
+        if matches!(self.inner.lock().unwrap().state, State::Connected { .. }) {
+            self.network.notify_one();
+        }
+    }
+
+    /// Volta quando a rede para de mudar por `NETWORK_SETTLE` depois de um aviso.
+    async fn network_settled(&self) {
+        self.network.notified().await;
+        while tokio::time::timeout(NETWORK_SETTLE, self.network.notified()).await.is_ok() {}
     }
 
     pub fn disconnect(&self) {
@@ -415,10 +435,21 @@ impl Session {
             }
         });
 
-        let end = tokio::select! {
-            r = tunnel.closed() => End::Lost(r, Cause::TunnelDropped),
-            _ = self.expiry(config.expires_at) => End::Lost("Session expired".into(), Cause::Expired),
-            _ = cancel.notified() => End::Stopped,
+        let expiry = self.expiry(config.expires_at);
+        tokio::pin!(expiry);
+        let end = loop {
+            tokio::select! {
+                r = tunnel.closed() => break End::Lost(r, Cause::TunnelDropped),
+                _ = &mut expiry => break End::Lost("Session expired".into(), Cause::Expired),
+                _ = cancel.notified() => break End::Stopped,
+                _ = self.network_settled() => {
+                    self.log("network changed: moving the gateway route to the current default and checking the tunnel");
+                    if let Err(e) = net::rehome_gateway_route(&*self.os, &self.applied) {
+                        self.log(format!("gateway route not restored, the tunnel may drop: {}", e));
+                    }
+                    tunnel.probe();
+                }
+            }
         };
         drop(tunnel);
         self.teardown();
@@ -957,10 +988,13 @@ mod tests {
     #[tokio::test]
     async fn disconnect_logs_out_and_tears_everything_down() {
         let (gw, mut c, os, _state) = connected(GatewayOptions::default()).await;
+        // O arquivo de estado da recuperação de crash guarda o /32 e o DNS aplicados.
+        assert_eq!(os.saved_state(), Some(json!({"gateway_route": "127.0.0.1", "dns": true})));
         let state = disconnect(&mut c).await;
         assert_eq!(state, json!({"v": 2, "type": "event", "event": "state", "state": "disconnected"}));
         assert_eq!(gw.logouts(), 1);
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(os.saved_state(), None);
         assert!(os.calls().contains(&OsCall::Down));
     }
 
@@ -1140,6 +1174,7 @@ mod tests {
         assert_eq!(state["state"], "disconnected");
         assert!(state["reason"].as_str().unwrap().contains("Session task failed"), "{}", state);
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(os.saved_state(), None);
     }
 
     #[tokio::test]
@@ -1392,6 +1427,7 @@ mod tests {
         assert_eq!(gw.echo_requests(), 2);
         assert!(started.elapsed() >= ECHO * 2 && started.elapsed() < ECHO * 5, "took {:?}", started.elapsed());
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(os.saved_state(), None);
         assert!(os.calls().contains(&OsCall::Down));
         assert_eq!(gw.logouts(), 0);
     }
@@ -1440,6 +1476,7 @@ mod tests {
         let state = c.recv_skipping_logs().await;
         assert_dropped(&state, "expired", "Session expired");
         assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(os.saved_state(), None);
         assert_eq!(gw.logouts(), 0);
     }
 
@@ -1520,5 +1557,87 @@ mod tests {
             assert_eq!(resp["state"], "connected", "{}", resp);
             assert!(!os.applied().is_empty());
         }
+    }
+
+    // ---- Troca de rede, wake e recuperação de crash ----
+
+    /// Conectada com o echo neste intervalo; devolve também a sessão, para injetar a troca de rede.
+    async fn connected_session(echo: Duration, options: GatewayOptions) -> (FakeGateway, Client, std::sync::Arc<FakeOs>, std::sync::Arc<Session>) {
+        let gw = FakeGateway::start(options).await;
+        let (path, session, os) = start_with_echo_interval(echo).await;
+        let mut c = client(&path).await;
+        let state = connect_with(&mut c, &gw, PASSWORD).await;
+        assert_eq!(state["state"], "connected", "{}", state);
+        (gw, c, os, session)
+    }
+
+    const GW: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// Chamadas ao SO depois do apply.
+    fn calls_after_connect(os: &FakeOs) -> Vec<OsCall> {
+        let calls = os.calls();
+        let start = calls.iter().position(|c| matches!(c, OsCall::SetDns { .. })).unwrap() + 1;
+        calls[start..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn network_change_moves_the_gateway_route_and_probes_the_tunnel_at_once() {
+        // Echo no intervalo de produção (10 s): o echo que chega é o da troca de rede.
+        let (gw, _c, os, session) = connected_session(Duration::from_secs(10), GatewayOptions::default()).await;
+        let started = Instant::now();
+        session.network_changed();
+        while gw.echo_requests() == 0 {
+            assert!(started.elapsed() < Duration::from_secs(3), "no echo after the network change");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls_after_connect(&os), [OsCall::RemoveGatewayRoute(GW), OsCall::AddGatewayRoute(GW)]);
+        assert_eq!(os.saved_state().unwrap()["gateway_route"], "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn burst_of_network_changes_moves_the_route_once() {
+        let (gw, mut c, os, session) = connected_session(Duration::from_secs(10), GatewayOptions::default()).await;
+        for _ in 0..5 {
+            session.network_changed();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(super::NETWORK_SETTLE * 2).await;
+        assert_eq!(calls_after_connect(&os), [OsCall::RemoveGatewayRoute(GW), OsCall::AddGatewayRoute(GW)]);
+        assert_eq!(gw.echo_requests(), 1);
+        c.send(json!({"v": 2, "cmd": "status"})).await;
+        assert_eq!(c.recv_skipping_logs().await["state"], "connected");
+    }
+
+    #[tokio::test]
+    async fn network_change_with_a_mute_gateway_drops_the_tunnel() {
+        // Echo a cada 600 ms: o refazer (~1 s depois do aviso) vem antes da queda (~1,8 s).
+        let (_gw, mut c, os, session) = connected_session(Duration::from_millis(600), GatewayOptions { mute_echo: true, ..Default::default() }).await;
+        session.network_changed();
+        let state = c.recv_skipping_logs().await;
+        assert_dropped(&state, "tunnel-dropped", "Tunnel dropped: no response from the gateway");
+        assert!(calls_after_connect(&os).starts_with(&[OsCall::RemoveGatewayRoute(GW), OsCall::AddGatewayRoute(GW)]), "{:?}", os.calls());
+        assert!(os.applied().is_empty(), "left behind: {:?}", os.applied());
+        assert_eq!(os.saved_state(), None);
+    }
+
+    #[tokio::test]
+    async fn network_change_while_disconnected_does_nothing() {
+        let (_path, session, os) = start_with_os(FakeOs::default()).await;
+        session.network_changed();
+        tokio::time::sleep(super::NETWORK_SETTLE + Duration::from_millis(200)).await;
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn helper_start_undoes_the_leftovers_of_a_crash() {
+        let file = std::env::temp_dir().join(format!("ovg-crash-{}.json", std::process::id()));
+        std::fs::write(&file, r#"{"gateway_route":"203.0.113.5","dns":true}"#).unwrap();
+        let (_path, _session, os) = start_with_os(FakeOs::with_state_file(file.clone())).await;
+        assert_eq!(os.calls(), [OsCall::RemoveDns, OsCall::RemoveGatewayRoute("203.0.113.5".parse().unwrap())]);
+        assert!(!file.exists());
+
+        // Sem arquivo, nada a desfazer.
+        let (_path, _session, os) = start_with_os(FakeOs::default()).await;
+        assert!(os.calls().is_empty());
     }
 }

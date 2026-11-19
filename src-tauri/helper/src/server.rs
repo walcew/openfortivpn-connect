@@ -10,7 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::handlers;
-use crate::net::SystemOs;
+use crate::net::{self, SystemOs};
 use crate::protocol::{Frame, FrameKind, Request, RequestV2, Response, ResponseV2, VERSION_V2};
 use crate::session::{Event, Session};
 
@@ -49,7 +49,10 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = bind(Path::new(SOCKET_PATH))?;
     log::info!("Listening on {}", SOCKET_PATH);
-    serve(listener, Arc::new(Session::new(Arc::new(SystemOs::default()))), console_authorizer()).await;
+    let session = Arc::new(Session::new(Arc::new(SystemOs::default())));
+    let watched = session.clone();
+    tokio::spawn(async move { net::watch::run(|| watched.network_changed()).await });
+    serve(listener, session, console_authorizer()).await;
     Ok(())
 }
 

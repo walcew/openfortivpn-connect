@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
@@ -20,6 +21,8 @@ const ROUTE: &str = "/sbin/route";
 const SCUTIL: &str = "/usr/sbin/scutil";
 const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
+/// No diretório de suporte de root, com o nome do Helper instalado pelo app.
+const STATE_FILE: &str = "/Library/Application Support/com.openvpngui.helper/session-state.json";
 const DNS_KEY: &str = "State:/Network/Service/OpenFortiVPN/DNS";
 const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 /// Cabeçalho do utun: a família do protocolo em ordem de rede.
@@ -106,6 +109,10 @@ impl Os for SystemOs {
                 log::warn!("{}", e);
             }
         }
+    }
+
+    fn state_file(&self) -> PathBuf {
+        PathBuf::from(STATE_FILE)
     }
 
     fn down(&self) {
