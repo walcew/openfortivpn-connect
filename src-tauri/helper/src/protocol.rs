@@ -108,7 +108,7 @@ pub enum RequestV2 {
     Connect {
         profile: Profile,
         password: String,
-        /// Código do token; ausente e com o gateway oferecendo push, o Engine pede o push.
+        /// Código OTP; ausente e com o gateway oferecendo push, o Engine pede o push.
         #[serde(default)]
         otp: Option<String>,
     },

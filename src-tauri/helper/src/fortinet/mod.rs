@@ -27,7 +27,8 @@ use crate::validation::is_valid_hostname;
 
 const DEFAULT_MTU: u16 = 1354;
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
-/// O gateway segura a resposta do push até o usuário aprovar ou o pedido expirar.
+/// Prazo da aprovação do push. Que o gateway segure a resposta até a aprovação é inferência
+/// (ver `docs/fortinet-protocol.md`); os 60 s são escolha nossa, não do protocolo.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Valores do pedido de token que o segundo passo do login devolve ao gateway.
 const CHALLENGE_FIELDS: [&str; 6] = ["reqid", "polid", "grp", "portal", "peer", "magic"];
@@ -55,7 +56,7 @@ pub struct Profile {
     pub ignore_cert_errors: bool,
 }
 
-/// O gateway pediu um token no primeiro passo do login.
+/// O gateway pediu o segundo fator (OTP ou push) no primeiro passo do login.
 pub struct Challenge {
     fields: Vec<(&'static str, String)>,
     /// O gateway oferece aprovação por push do FortiToken Mobile.
@@ -65,11 +66,11 @@ pub struct Challenge {
 /// Resultado do primeiro passo do login.
 pub enum Login {
     Cookie(String),
-    Token(Challenge),
+    Challenge(Challenge),
 }
 
 /// Pares `chave=valor` do corpo do `logincheck`, separados por vírgula.
-// shortcut: valor com vírgula (ex.: `chal_msg`) vem truncado; só os campos do desafio importam e não levam vírgula.
+// shortcut: valor com vírgula vem truncado, trocar por um parser de verdade se um campo do desafio passar a levar vírgula.
 fn parse_pairs(body: &[u8]) -> Vec<(String, String)> {
     String::from_utf8_lossy(body)
         .split(',')
@@ -90,6 +91,7 @@ pub struct Gateway {
     log: LogFn,
     /// Digest do último certificado que o verificador recusou.
     refused: Arc<Mutex<Option<String>>>,
+    push_timeout: Duration,
 }
 
 /// A task do túnel; abortá-la (ou soltá-la) fecha a conexão TLS.
@@ -124,7 +126,13 @@ impl Gateway {
             trust: trust.clone(),
             log,
             refused,
+            push_timeout: PUSH_TIMEOUT,
         })
+    }
+
+    pub fn with_push_timeout(mut self, timeout: Duration) -> Self {
+        self.push_timeout = timeout;
+        self
     }
 
     /// Digest do certificado que o verificador recusou, se foi o caso.
@@ -159,7 +167,14 @@ impl Gateway {
     }
 
     /// `host` vai no cabeçalho `Host`: o do gateway, ou `sslvpn` nos passos do túnel.
-    async fn request(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>, timeout: Duration) -> Result<http::Response, String> {
+    async fn request(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
+        tokio::time::timeout(STEP_TIMEOUT, self.exchange(method, path, host, cookie, form))
+            .await
+            .map_err(|_| format!("{} {} timed out", method, path))?
+    }
+
+    /// Uma troca HTTP sem prazo próprio; quem chama decide quanto esperar.
+    async fn exchange(&self, method: &str, path: &str, host: &str, cookie: Option<&str>, form: Option<&str>) -> Result<http::Response, String> {
         let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path, host);
         if let Some(c) = cookie {
             req.push_str(&format!("Cookie: SVPNCOOKIE={}\r\n", c));
@@ -173,14 +188,9 @@ impl Gateway {
         } else {
             req.push_str("\r\n");
         }
-        let exchange = async {
-            let mut stream = self.connect().await?;
-            stream.write_all(req.as_bytes()).await.map_err(|e| format!("{} {} failed: {}", method, path, e))?;
-            http::read_response(&mut stream).await.map_err(|e| format!("{} {} failed: {}", method, path, e))
-        };
-        tokio::time::timeout(timeout, exchange)
-            .await
-            .map_err(|_| format!("{} {} timed out", method, path))?
+        let mut stream = self.connect().await?;
+        stream.write_all(req.as_bytes()).await.map_err(|e| format!("{} {} failed: {}", method, path, e))?;
+        http::read_response(&mut stream).await.map_err(|e| format!("{} {} failed: {}", method, path, e))
     }
 
     /// `POST /remote/logincheck`: devolve o `SVPNCOOKIE` ou o pedido de token do gateway.
@@ -190,7 +200,7 @@ impl Gateway {
             http::form_encode(username),
             http::form_encode(password)
         );
-        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form), STEP_TIMEOUT).await?;
+        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form)).await?;
         if let Some(c) = resp.cookie("SVPNCOOKIE").filter(|c| !c.is_empty()) {
             return Ok(Login::Cookie(c));
         }
@@ -198,16 +208,20 @@ impl Gateway {
         let Some((_, tokeninfo)) = pairs.iter().find(|(k, _)| k == "tokeninfo") else {
             return Err("Login failed: invalid username or password".into());
         };
-        let fields = CHALLENGE_FIELDS
+        let fields: Vec<_> = CHALLENGE_FIELDS
             .iter()
             .filter_map(|name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| (*name, v.clone())))
             .collect();
-        Ok(Login::Token(Challenge { fields, push: tokeninfo == "ftm_push" }))
+        // shortcut: só `reqid` é exigido, o gateway real pode omitir os outros; apertar quando houver prova contra ele.
+        if !fields.iter().any(|(k, _)| *k == "reqid") {
+            return Err("Login failed: incomplete login challenge from the gateway".into());
+        }
+        Ok(Login::Challenge(Challenge { fields, push: tokeninfo == "ftm_push" }))
     }
 
     /// Segundo passo do login: reenvia o desafio com o OTP, ou pede o push quando não há OTP.
     /// Com push a chamada espera a aprovação do usuário.
-    pub async fn complete_token(&self, username: &str, challenge: &Challenge, otp: Option<&str>) -> Result<String, String> {
+    pub async fn complete_challenge(&self, username: &str, challenge: &Challenge, otp: Option<&str>) -> Result<String, String> {
         let mut form = format!("username={}", http::form_encode(username));
         for (name, value) in &challenge.fields {
             form.push_str(&format!("&{}={}", name, http::form_encode(value)));
@@ -217,8 +231,13 @@ impl Gateway {
             None => form.push_str("&ftm_push=1"),
         }
         form.push_str("&just_logged_in=1&ajax=1");
-        let timeout = if otp.is_some() { STEP_TIMEOUT } else { PUSH_TIMEOUT };
-        let resp = self.request("POST", "/remote/logincheck", &self.host_header(), None, Some(&form), timeout).await?;
+        let host = self.host_header();
+        let resp = match otp {
+            Some(_) => self.request("POST", "/remote/logincheck", &host, None, Some(&form)).await?,
+            None => tokio::time::timeout(self.push_timeout, self.exchange("POST", "/remote/logincheck", &host, None, Some(&form)))
+                .await
+                .map_err(|_| "Login failed: push notification expired".to_string())??,
+        };
         match resp.cookie("SVPNCOOKIE") {
             Some(c) if !c.is_empty() => Ok(c),
             _ if otp.is_some() => Err("Login failed: invalid or expired OTP code".into()),
@@ -228,7 +247,7 @@ impl Gateway {
 
     /// Lê a config do túnel, abre o `sslvpn-tunnel` e negocia o PPP até o IPCP subir.
     pub async fn open_tunnel(&self, cookie: &str) -> Result<(TunnelConfig, Packets, Tunnel), String> {
-        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(cookie), None, STEP_TIMEOUT).await?;
+        let resp = self.request("GET", "/remote/fortisslvpn_xml", "sslvpn", Some(cookie), None).await?;
         if resp.status != 200 {
             return Err(format!("Gateway refused the tunnel configuration (HTTP {})", resp.status));
         }
@@ -267,6 +286,6 @@ impl Gateway {
     }
 
     pub async fn logout(&self, cookie: &str) -> Result<(), String> {
-        self.request("GET", "/remote/logout", &self.host_header(), Some(cookie), None, STEP_TIMEOUT).await.map(|_| ())
+        self.request("GET", "/remote/logout", &self.host_header(), Some(cookie), None).await.map(|_| ())
     }
 }

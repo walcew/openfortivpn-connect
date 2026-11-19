@@ -69,6 +69,13 @@ pub async fn start_with_roots(roots: RootCertStore) -> (PathBuf, Arc<Session>) {
     start_session(allow_all(), Session::with_trust(Arc::new(FakeOs::default()), CertTrust::with_roots(roots))).await
 }
 
+/// Como `start_with_os`, com um prazo curto para o push.
+pub async fn start_with_push_timeout(timeout: Duration) -> (PathBuf, Arc<Session>, Arc<FakeOs>) {
+    let os = Arc::new(FakeOs::default());
+    let (path, session) = start_session(allow_all(), Session::new(os.clone()).with_push_timeout(timeout)).await;
+    (path, session, os)
+}
+
 async fn start_server(authorizer: Authorizer, os: Arc<FakeOs>) -> (PathBuf, Arc<Session>) {
     start_session(authorizer, Session::new(os)).await
 }

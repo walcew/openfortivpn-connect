@@ -62,6 +62,7 @@ pub struct Session {
     trust: Arc<CertTrust>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<Event>,
+    push_timeout: Option<Duration>,
 }
 
 impl Session {
@@ -81,7 +82,15 @@ impl Session {
             trust: Arc::new(trust),
             inner: Mutex::new(Inner { state: State::Disconnected { reason: None, cert_digest: None }, cancel: None, applied: None }),
             events: broadcast::channel(256).0,
+            push_timeout: None,
         }
+    }
+
+    /// Prazo curto do push, só para testes.
+    #[cfg(test)]
+    pub fn with_push_timeout(mut self, timeout: Duration) -> Self {
+        self.push_timeout = Some(timeout);
+        self
     }
 
     pub fn state(&self) -> State {
@@ -115,7 +124,11 @@ impl Session {
         let log: LogFn = Arc::new(move |line| {
             let _ = events.send(Event::Log { line });
         });
-        let gateway = Arc::new(Gateway::new(&profile, &self.trust, log)?);
+        let mut gateway = Gateway::new(&profile, &self.trust, log)?;
+        if let Some(timeout) = self.push_timeout {
+            gateway = gateway.with_push_timeout(timeout);
+        }
+        let gateway = Arc::new(gateway);
         let cancel = Arc::new(Notify::new());
         {
             let mut inner = self.inner.lock().unwrap();
@@ -231,7 +244,7 @@ impl Session {
     async fn authenticate(&self, profile: &Profile, gw: &Gateway, password: &str, otp: Option<&str>) -> Result<String, String> {
         let challenge = match gw.login(&profile.username, password).await? {
             Login::Cookie(cookie) => return Ok(cookie),
-            Login::Token(challenge) => challenge,
+            Login::Challenge(challenge) => challenge,
         };
         let otp = otp.map(str::trim).filter(|o| !o.is_empty());
         if otp.is_none() {
@@ -242,7 +255,7 @@ impl Session {
             let mut inner = self.inner.lock().unwrap();
             Self::set_state(&mut inner, &self.events, State::WaitingPush { profile_id: profile.id.clone() });
         }
-        gw.complete_token(&profile.username, &challenge, otp).await
+        gw.complete_challenge(&profile.username, &challenge, otp).await
     }
 
     async fn logout(&self, gw: &Gateway, cookie: &str) {
@@ -268,7 +281,7 @@ mod tests {
     use crate::net::Route;
     use crate::testing::fake_gateway::*;
     use crate::testing::fake_os::{Failure, FakeOs, OsCall};
-    use crate::testing::{connect, start_with_os, start_with_roots, Client};
+    use crate::testing::{connect, start_with_os, start_with_push_timeout, start_with_roots, Client};
 
     fn connect_cmd(gw: &FakeGateway, password: &str) -> Value {
         json!({"v": 2, "cmd": "connect", "profile": gw.profile(), "password": password, "otp": null})
@@ -667,6 +680,28 @@ mod tests {
         assert_eq!(waiting["state"], "waiting-push");
         let state = disconnect(&mut c).await;
         assert!(state.get("reason").is_none(), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_that_never_gets_an_answer_expires_with_a_clear_reason() {
+        let gw = FakeGateway::start(GatewayOptions { push: Some(Push::Silent), ..Default::default() }).await;
+        let (path, _session, os) = start_with_push_timeout(Duration::from_millis(300)).await;
+        let mut c = client(&path).await;
+        let waiting = connect_with(&mut c, &gw, PASSWORD).await;
+        assert_eq!(waiting["state"], "waiting-push");
+        let state = next_state(&mut c).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("push notification expired"), "{}", state);
+        assert!(os.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_challenge_is_reported_instead_of_a_wrong_otp() {
+        let options = GatewayOptions { require_otp: true, incomplete_challenge: true, ..Default::default() };
+        let (_gw, _c, os, state) = connect_to_token_gateway(options, Some(OTP)).await;
+        assert_eq!(state["state"], "disconnected");
+        assert!(state["reason"].as_str().unwrap().contains("incomplete login challenge"), "{}", state);
         assert!(os.calls().is_empty());
     }
 
