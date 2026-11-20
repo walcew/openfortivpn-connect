@@ -8,7 +8,7 @@ mod fake_helper;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use fake_helper::{refusal, response, state, unauthorized, FakeHelper};
+use fake_helper::{event, hang_up, refusal, response, state, unauthorized, FakeHelper};
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_openvpngui");
@@ -580,4 +580,123 @@ fn disconnect_without_a_helper_fails_with_255() {
     let out = Home::new().run(&["disconnect", "--json"]);
     assert_eq!(out.status.code(), Some(255));
     assert_eq!(json_err(&out)["error"]["code"], "HELPER_UNAVAILABLE");
+}
+
+/// Um `vpnconnect watch` em andamento: as linhas da stdout chegam por um canal, com prazo, para
+/// um teste que falha não ficar preso. O filho morre junto com o teste.
+struct Watch {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Watch {
+    fn spawn(home: &Home, args: &[&str]) -> Self {
+        let mut child = home.command(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in stdout.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { child, lines }
+    }
+
+    /// A próxima linha da stdout, como JSON.
+    fn next(&self) -> Value {
+        let line = self.lines.recv_timeout(std::time::Duration::from_secs(10)).expect("no line on stdout in 10 s");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"))
+    }
+
+    /// Ctrl-C no filho e o código de saída dele.
+    fn interrupt(mut self) -> Option<i32> {
+        // SAFETY: SIGINT ao filho que este teste criou.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGINT) };
+        self.child.wait().unwrap().code()
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn watch_streams_each_helper_event_as_one_json_line_with_or_without_json() {
+    for args in [&["watch"][..], &["watch", "--json"][..]] {
+        let home = Home::new();
+        home.profiles(json!([profile("p1", "Corp")]));
+        let _helper = FakeHelper::start(&home.socket(), connected(), |req| match req["cmd"].as_str() {
+            Some("status") => vec![
+                response(connected()),
+                event(json!({"event": "log", "line": "Tunnel is up"})),
+                event(json!({"event": "bandwidth", "rx_bytes": 10, "tx_bytes": 20})),
+                event(json!({"event": "expiring", "expires_at": "2026-01-01T18:00:00Z"})),
+            ],
+            _ => vec![response(json!({}))],
+        });
+
+        let watch = Watch::spawn(&home, args);
+
+        let mut state = connected();
+        state["event"] = json!("state");
+        state["profile"] = json!({"id": "p1", "name": "Corp"});
+        assert_eq!(watch.next(), state, "{args:?}");
+        assert_eq!(watch.next(), json!({"event": "log", "line": "Tunnel is up"}));
+        assert_eq!(watch.next(), json!({"event": "bandwidth", "rx_bytes": 10, "tx_bytes": 20}));
+        assert_eq!(watch.next(), json!({"event": "expiring", "expires_at": "2026-01-01T18:00:00Z"}));
+        assert_eq!(watch.interrupt(), Some(130));
+    }
+}
+
+#[test]
+fn watch_reconnects_when_the_helper_closes_the_socket_and_emits_the_current_state_again() {
+    let home = Home::new();
+    let sessions = std::sync::atomic::AtomicUsize::new(0);
+    let _helper = FakeHelper::start(&home.socket(), json!({"state": "disconnected"}), move |req| {
+        if req["cmd"] != "status" {
+            return vec![response(json!({}))];
+        }
+        // A primeira conexão cai depois de um log; a segunda segue aberta.
+        match sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => vec![response(json!({})), event(json!({"event": "log", "line": "before"})), hang_up()],
+            _ => vec![response(json!({})), event(json!({"event": "log", "line": "after"}))],
+        }
+    });
+
+    let watch = Watch::spawn(&home, &["watch"]);
+
+    assert_eq!(watch.next(), json!({"event": "state", "state": "disconnected", "profile": null}));
+    assert_eq!(watch.next(), json!({"event": "log", "line": "before"}));
+    assert_eq!(watch.next(), json!({"event": "reconnecting", "in_ms": 1000}));
+    assert_eq!(watch.next(), json!({"event": "state", "state": "disconnected", "profile": null}));
+    assert_eq!(watch.next(), json!({"event": "log", "line": "after"}));
+}
+
+#[test]
+fn watch_without_a_helper_keeps_trying_and_streams_once_it_is_up() {
+    let home = Home::new();
+    let watch = Watch::spawn(&home, &["watch", "--json"]);
+
+    assert_eq!(watch.next(), json!({"event": "reconnecting", "in_ms": 1000}));
+    let _helper = FakeHelper::with_state(&home.socket(), json!({"state": "disconnected"}));
+
+    assert_eq!(watch.next(), json!({"event": "state", "state": "disconnected", "profile": null}));
+}
+
+#[test]
+fn watch_refused_by_the_helper_fails_with_255_without_retrying() {
+    let home = Home::new();
+    let _helper = FakeHelper::start(&home.socket(), json!({"state": "disconnected"}), |_| vec![unauthorized()]);
+
+    let out = home.run(&["watch", "--json"]);
+
+    assert_eq!(out.status.code(), Some(255));
+    assert_eq!(json_err(&out)["error"]["code"], "HELPER_UNAUTHORIZED");
+    assert!(!text(&out.stdout).contains("reconnecting"), "{}", text(&out.stdout));
 }

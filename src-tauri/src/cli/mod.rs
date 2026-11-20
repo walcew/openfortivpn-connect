@@ -11,6 +11,7 @@ mod disconnect;
 mod output;
 mod status;
 mod target;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -36,6 +37,7 @@ pub fn main() -> ExitCode {
         Cmd::Status => status::run(&out),
         Cmd::Connect { profile, otp, timeout, no_browser } => connect::run(&out, &profile, otp.as_deref(), timeout, no_browser),
         Cmd::Disconnect => disconnect::run(&out),
+        Cmd::Watch => watch::run(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

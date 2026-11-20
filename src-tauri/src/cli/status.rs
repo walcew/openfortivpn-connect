@@ -25,7 +25,7 @@ pub fn print(out: &Out, mut state: Value) {
 
 /// O Profile da sessão, como a GUI o acha: pelo `profile_id` que o Helper manda nos estados de
 /// uma sessão ativa. Sem sessão não há `profile_id`, e o Profile é null.
-fn profile(id: Option<&str>) -> Value {
+pub(super) fn profile(id: Option<&str>) -> Value {
     let Some(id) = id else { return Value::Null };
     // Um profiles.json ilegível não derruba o status: o Profile só fica sem nome.
     let name = ProfileStore::new().and_then(|s| s.get_by_id(id)).ok().flatten().map(|p| p.name);

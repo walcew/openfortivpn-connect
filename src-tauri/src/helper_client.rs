@@ -17,8 +17,8 @@ use crate::models::*;
 /// Socket do Helper; par de `SOCKET_PATH` em helper/src/server.rs.
 pub const SOCKET_PATH: &str = "/var/run/vpnconnect-helper.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
-const RECONNECT_MIN: Duration = Duration::from_secs(1);
-const RECONNECT_MAX: Duration = Duration::from_secs(15);
+pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
+pub const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
 pub enum Incoming {
     /// `cert_digest` só vem no `disconnected` por certificado não confiável; `cause` só no
@@ -149,9 +149,14 @@ impl Channel {
         Ok(Self { reader: BufReader::new(open(path).map_err(HelperError::Unavailable)?), line: String::new() })
     }
 
+    /// Envia `cmd` sem esperar a resposta; quem quer os eventos lê com [`Channel::next`].
+    pub fn send(&mut self, cmd: &Value) -> Result<(), HelperError> {
+        send(self.reader.get_ref(), cmd).map_err(HelperError::Unavailable)
+    }
+
     /// Envia `cmd` e devolve a resposta; eventos intercalados são descartados.
     pub fn request(&mut self, cmd: &Value) -> Result<Value, HelperError> {
-        send(self.reader.get_ref(), cmd).map_err(HelperError::Unavailable)?;
+        self.send(cmd)?;
         loop {
             let frame = self
                 .next(TIMEOUT)?
@@ -171,10 +176,9 @@ impl Channel {
     /// O próximo quadro em até `wait`; `None` se o prazo venceu antes.
     pub fn next(&mut self, wait: Duration) -> Result<Option<Value>, HelperError> {
         use HelperError::Unavailable;
-        self.reader
-            .get_ref()
-            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
-            .map_err(|e| Unavailable(format!("Failed to set timeout: {}", e)))?;
+        // No macOS o `setsockopt` falha (EINVAL) depois que o Helper fecha o socket, e o que ele
+        // mandou antes de fechar ainda deve ser lido. Com o socket fechado a leitura não bloqueia.
+        let _ = self.reader.get_ref().set_read_timeout(Some(wait.max(Duration::from_millis(1))));
         match self.reader.read_line(&mut self.line) {
             Ok(0) => Err(Unavailable("Helper closed the connection".into())),
             Ok(_) => {

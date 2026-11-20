@@ -64,4 +64,23 @@ pub enum Cmd {
         whether the app or the CLI started it. Waits until the Helper reports disconnected and \
         prints the status. Without a session it is not an error: exits 0 and says so on stderr.")]
     Disconnect,
+    /// Stream the Helper events as NDJSON until Ctrl-C
+    #[command(
+        long_about = "Stream the Helper events as NDJSON (one JSON object per line on stdout, always, with or \
+            without --json) until Ctrl-C, which exits 130. It follows the same session the app shows, \
+            whoever started it. Nothing is read from the past: the first line is the current state.\n\n\
+            If the Helper is not running, or the socket closes (the Helper restarted), it emits a \"reconnecting\" \
+            event and retries with a growing wait (1 s to 15 s), then streams again, starting with the \
+            current state. It never gives up for a missing Helper. If the Helper refuses this user it exits \
+            255 (HELPER_UNAUTHORIZED), since retrying would not help.",
+        after_help = "Each line has an \"event\" field that says which one it is:\n\
+            \x20 {\"event\":\"state\",\"state\":\"connected\",\"profile_id\":\"…\",\"ip\":\"10.0.0.2\",\"since\":\"…\",\"expires_at\":\"…\",\"dns_servers\":[…],\"dns_suffixes\":[…],\"profile\":{\"id\":\"…\",\"name\":\"…\"}}\n\
+            \x20   the session state, the same fields as `status --json` plus \"event\"; the other states are \"connecting\",\n\
+            \x20   \"waiting-saml\" (with \"url\"), \"waiting-push\" and \"disconnected\" (with \"reason\", \"cause\" or \"cert_digest\" when they apply)\n\
+            \x20 {\"event\":\"log\",\"line\":\"…\"}                                  a line of the Helper's session log\n\
+            \x20 {\"event\":\"bandwidth\",\"rx_bytes\":1024,\"tx_bytes\":512}      session totals in IP bytes, every few seconds\n\
+            \x20 {\"event\":\"expiring\",\"expires_at\":\"…\"}                      the session expires soon (once per session)\n\
+            \x20 {\"event\":\"reconnecting\",\"in_ms\":1000}                      the Helper is unreachable; retrying in in_ms"
+    )]
+    Watch,
 }

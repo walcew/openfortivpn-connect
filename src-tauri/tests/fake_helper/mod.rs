@@ -44,6 +44,10 @@ impl FakeHelper {
                         }
                         log.lock().unwrap().push(request.clone());
                         for frame in script(&request) {
+                            // `hang_up()` fecha a conexão, como um Helper que reinicia.
+                            if frame.is_null() {
+                                return;
+                            }
                             let _ = writeln!(stream, "{}", frame);
                         }
                     }
@@ -129,4 +133,9 @@ pub fn state(body: Value) -> Value {
 /// A recusa do Helper a um uid que não é root nem o usuário do console: sai sem envelope.
 pub fn unauthorized() -> Value {
     json!({"ok": false, "error": "Unauthorized"})
+}
+
+/// Um quadro especial do roteiro: o Helper fecha esta conexão ao chegar nele.
+pub fn hang_up() -> Value {
+    Value::Null
 }
