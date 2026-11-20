@@ -45,7 +45,7 @@ pub fn main() -> ExitCode {
         Cmd::Profile(cmd) => profile::run(&out, cmd),
         Cmd::Settings(cmd) => settings::run(&out, cmd),
         Cmd::Helper(cmd) => helper::run(&out, cmd),
-        Cmd::Skill { cmd: None } => Ok(skill::print()),
+        Cmd::Skill { cmd: None } => Ok(skill::print(&out)),
         Cmd::Skill { cmd: Some(SkillCmd::Install) } => skill::install(&out),
     };
     match result {

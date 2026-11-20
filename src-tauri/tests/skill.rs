@@ -52,6 +52,15 @@ fn skill_prints_the_embedded_file() {
 }
 
 #[test]
+fn skill_json_wraps_the_markdown_and_nothing_else() {
+    let out = Home::new().run(&[], &["skill", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(text(&out.stdout).trim()).unwrap();
+    assert_eq!(v["name"], "vpnconnect");
+    assert_eq!(v["content"], SKILL);
+}
+
+#[test]
 fn install_writes_the_canonical_copy_and_links_only_present_agents() {
     let home = Home::new();
     std::fs::create_dir_all(home.0.join(".claude")).unwrap();

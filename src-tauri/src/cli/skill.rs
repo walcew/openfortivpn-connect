@@ -13,8 +13,9 @@ use super::{CliError, Out};
 const SKILL: &str = include_str!("skill/SKILL.md");
 const NAME: &str = "vpnconnect";
 
-pub fn print() {
-    print!("{SKILL}");
+/// O Markdown cru; com `--json`, `{"name","content"}` para o agente não ter de separar nada.
+pub fn print(out: &Out) {
+    out.emit(&json!({ "name": NAME, "content": SKILL }), || print!("{SKILL}"));
 }
 
 pub fn install(out: &Out) -> Result<(), CliError> {
