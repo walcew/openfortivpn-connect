@@ -103,6 +103,21 @@ pub enum Cmd {
         in the terminal. Cancelling the dialog exits 1 with HELPER_INSTALL_CANCELLED; other failures exit 1 \
         with HELPER_INSTALL_FAILED.")]
     Helper(HelperCmd),
+    /// Print the agent skill that teaches this CLI, or install it for the agents on this Mac
+    #[command(long_about = "Print the agent skill (SKILL.md) embedded in this binary, so it always \
+        matches the installed version. `skill install` writes it to ~/.agents/skills/vpnconnect/ and \
+        links it from the skills folder of Claude Code ($CLAUDE_CONFIG_DIR or ~/.claude), Windsurf, \
+        Goose and Kiro, only for the agents whose folder exists. Run it again after updating the app.")]
+    Skill {
+        #[command(subcommand)]
+        cmd: Option<SkillCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SkillCmd {
+    /// Install the skill in ~/.agents/skills/vpnconnect/ and link it for the agents present
+    Install,
 }
 
 #[derive(Subcommand)]

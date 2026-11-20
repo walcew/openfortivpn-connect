@@ -12,6 +12,7 @@ mod helper;
 mod output;
 mod profile;
 mod settings;
+mod skill;
 mod status;
 mod target;
 mod watch;
@@ -20,7 +21,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use args::{Cli, Cmd};
+use args::{Cli, Cmd, SkillCmd};
 pub use output::{CliError, Out};
 
 /// O executável foi chamado como CLI: há argumentos além do nome. O `-psn_…` que o macOS antigo
@@ -44,6 +45,8 @@ pub fn main() -> ExitCode {
         Cmd::Profile(cmd) => profile::run(&out, cmd),
         Cmd::Settings(cmd) => settings::run(&out, cmd),
         Cmd::Helper(cmd) => helper::run(&out, cmd),
+        Cmd::Skill { cmd: None } => Ok(skill::print()),
+        Cmd::Skill { cmd: Some(SkillCmd::Install) } => skill::install(&out),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
