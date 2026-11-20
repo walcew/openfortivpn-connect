@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::models::{ConnectionState, OtpRequestedPayload, VpnProfile};
@@ -20,6 +20,15 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .icon_as_template(true)
         .menu(&menu)
         .on_menu_event(handle_menu_event)
+        // O macOS não avisa que o menu vai abrir (o Click é proxied pelo event loop, que não roda
+        // durante o tracking do menu), então o passar do mouse (Enter) reconstrói o menu antes do clique.
+        // shortcut: abrir o menu por teclado ou VoiceOver não passa pelo Enter, então mostra a lista da
+        // última reconstrução; melhora se o tray-icon expor um evento de menu abrindo.
+        .on_tray_icon_event(|tray, event| {
+            if matches!(event, TrayIconEvent::Enter { .. }) {
+                refresh_tray_menu(tray.app_handle());
+            }
+        })
         .build(app)?;
 
     // O canal de eventos do Helper já aplica o estado no VpnManager com lock bloqueante;
@@ -66,7 +75,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     // Use try_lock to avoid deadlock: if the Mutex is held (e.g. during
     // connect/disconnect), skip this refresh — the next event will catch up.
     let mgr_state = app.state::<Mutex<VpnManager>>();
-    let guard = match mgr_state.try_lock() {
+    let mut guard = match mgr_state.try_lock() {
         Ok(g) => g,
         Err(_) => {
             // Mutex is busy, build a minimal placeholder menu
@@ -83,6 +92,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     };
     let state = guard.get_state().clone();
     let profiles = guard.get_profiles().unwrap_or_default();
+    guard.clear_selection_if_missing(&profiles);
     let selected_id = guard.selected_profile_id().map(|s| s.to_string());
     drop(guard);
 

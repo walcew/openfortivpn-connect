@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { VpnProfile } from "../types";
+import { useOnFocus } from "./useOnFocus";
 
 export function useProfiles() {
   const [profiles, setProfiles] = useState<VpnProfile[]>([]);
@@ -21,6 +22,9 @@ export function useProfiles() {
   useEffect(() => {
     fetchProfiles();
   }, [fetchProfiles]);
+
+  // Só a lista: o editor de Profile guarda a própria cópia e não perde a edição em andamento.
+  useOnFocus(fetchProfiles);
 
   const saveProfile = async (profile: VpnProfile, password?: string) => {
     const saved = await invoke<VpnProfile>("save_profile", {

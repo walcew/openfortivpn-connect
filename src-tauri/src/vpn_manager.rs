@@ -32,6 +32,15 @@ impl VpnManager {
         self.selected_profile_id = Some(id.to_string());
     }
 
+    /// Limpa a seleção da tray se o Profile sumiu (por exemplo, removido pela CLI).
+    pub fn clear_selection_if_missing(&mut self, profiles: &[VpnProfile]) {
+        if let Some(id) = &self.selected_profile_id {
+            if !profiles.iter().any(|p| &p.id == id) {
+                self.selected_profile_id = None;
+            }
+        }
+    }
+
     /// Atualiza o estado interno a partir de um payload de estado, vindo dos eventos do Helper.
     pub fn sync_state_from_payload(&mut self, payload: &ConnectionStatusPayload) {
         let new_state = match payload.state.as_str() {
@@ -265,6 +274,17 @@ mod tests {
             username: username.map(str::to_string),
             ..VpnProfile::default()
         }
+    }
+
+    #[test]
+    fn selection_is_cleared_only_when_its_profile_is_gone() {
+        let profile = |id: &str| VpnProfile { id: id.to_string(), ..VpnProfile::default() };
+        let mut mgr = VpnManager::new().unwrap();
+        mgr.set_selected_profile("p1");
+        mgr.clear_selection_if_missing(&[profile("p1"), profile("p2")]);
+        assert_eq!(mgr.selected_profile_id(), Some("p1"));
+        mgr.clear_selection_if_missing(&[profile("p2")]);
+        assert_eq!(mgr.selected_profile_id(), None);
     }
 
     #[test]

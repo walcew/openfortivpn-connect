@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useOnFocus } from "./useOnFocus";
 
 export interface AppSettings {
   helper_install_declined: boolean;
@@ -24,6 +25,8 @@ export function useSettings() {
   useEffect(() => {
     fetchSettings();
   }, [fetchSettings]);
+
+  useOnFocus(fetchSettings);
 
   const updateSettings = async (newSettings: AppSettings) => {
     await invoke("save_settings", { settings: newSettings });

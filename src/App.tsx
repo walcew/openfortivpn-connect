@@ -33,6 +33,11 @@ function App() {
   const [showHelperInstall, setShowHelperInstall] = useState(false);
   const [otpProfile, setOtpProfile] = useState<VpnProfile | null>(null);
 
+  // Profile removido pela CLI: a seleção não pode apontar para ele
+  useEffect(() => {
+    setSelectedProfileId((id) => (id && profiles.some((p) => p.id === id) ? id : null));
+  }, [profiles]);
+
   // Listen for cert warnings
   useEffect(() => {
     const unlisten = listen<CertWarningPayload>("cert-warning", (event) => {
