@@ -217,7 +217,7 @@ fn unknown_argument_fails_with_255_and_the_envelope_under_json() {
     let out = Home::new().run(&["statu", "--json"]);
     assert_eq!(out.status.code(), Some(255));
     let err: Value = serde_json::from_str(text(&out.stderr).trim()).unwrap();
-    assert_eq!(err["error"]["code"], "CLI_ERROR");
+    assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
 }
 
 /// O erro `--json` da stderr.
@@ -548,7 +548,7 @@ fn password_is_never_accepted_as_an_argument() {
     let home = home_with_corp(&[]);
     let out = home.run(&["connect", "Corp", "--password", "s3cret", "--json"]);
     assert_eq!(out.status.code(), Some(255));
-    assert_eq!(json_err(&out)["error"]["code"], "CLI_ERROR");
+    assert_eq!(json_err(&out)["error"]["code"], "INVALID_ARGUMENT");
 }
 
 /// Helper com a sessão em `current` que, no `disconnect`, responde e emite `disconnected`.
@@ -841,11 +841,11 @@ fn profile_add_saml_never_requires_otp() {
 #[test]
 fn profile_add_needs_name_and_host_and_refuses_blank_ones() {
     let home = Home::new();
-    assert_refused(&home.run(&["profile", "add", "--host", "h", "--json"]), 255, "CLI_ERROR");
-    assert_refused(&home.run(&["profile", "add", "--name", "x", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["profile", "add", "--host", "h", "--json"]), 255, "INVALID_ARGUMENT");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--json"]), 255, "INVALID_ARGUMENT");
     assert_refused(&home.run(&["profile", "add", "--name", " ", "--host", "h", "--json"]), 255, "INVALID_ARGUMENT");
     assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--port", "0", "--json"]), 255, "INVALID_ARGUMENT");
-    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--auth", "kerberos", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--auth", "kerberos", "--json"]), 255, "INVALID_ARGUMENT");
     assert_eq!(home.stored_profiles(), json!([]));
 }
 
@@ -906,7 +906,7 @@ fn profile_edit_clears_dns_domains_and_blank_username_and_realm() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let p = &home.stored_profiles()[0];
     assert_eq!((p["dns_match_domains"].clone(), p["username"].clone(), p["realm"].clone()), (json!([]), Value::Null, Value::Null));
-    assert_refused(&home.run(&["profile", "edit", "Corp", "--clear-dns-domains", "--dns-domain", "a.example.com", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["profile", "edit", "Corp", "--clear-dns-domains", "--dns-domain", "a.example.com", "--json"]), 255, "INVALID_ARGUMENT");
 }
 
 #[test]
@@ -960,9 +960,9 @@ fn set_password_refuses_an_empty_password_and_keeps_the_old_one() {
 #[test]
 fn set_password_needs_the_stdin_flag_and_has_no_password_argument() {
     let home = home_with_corp(&[]);
-    assert_refused(&home.run_with_stdin(&["profile", "set-password", "Corp", "--json"], "new\n"), 255, "CLI_ERROR");
-    assert_refused(&home.run_with_stdin(&["profile", "set-password", "Corp", "--password", "new", "--json"], ""), 255, "CLI_ERROR");
-    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--password", "new", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run_with_stdin(&["profile", "set-password", "Corp", "--json"], "new\n"), 255, "INVALID_ARGUMENT");
+    assert_refused(&home.run_with_stdin(&["profile", "set-password", "Corp", "--password", "new", "--json"], ""), 255, "INVALID_ARGUMENT");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--password", "new", "--json"]), 255, "INVALID_ARGUMENT");
     assert_eq!(home.stored_password("p1").as_deref(), Some("s3cret"));
     assert!(home.stored_profiles().as_array().unwrap().len() == 1);
 }
@@ -1029,8 +1029,8 @@ fn settings_show_defaults_and_set_dns_fallback_keeps_the_other_fields() {
 #[test]
 fn settings_set_refuses_an_unknown_key_or_value() {
     let home = Home::new();
-    assert_refused(&home.run(&["settings", "set", "dns-fallback", "maybe", "--json"]), 255, "CLI_ERROR");
-    assert_refused(&home.run(&["settings", "set", "debug-mode", "on", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["settings", "set", "dns-fallback", "maybe", "--json"]), 255, "INVALID_ARGUMENT");
+    assert_refused(&home.run(&["settings", "set", "debug-mode", "on", "--json"]), 255, "INVALID_ARGUMENT");
     assert!(!home.0.join("settings.json").exists());
 }
 

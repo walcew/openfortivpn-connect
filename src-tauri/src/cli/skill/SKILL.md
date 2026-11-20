@@ -154,8 +154,8 @@ Without `--json`, stdout is for people. With `--json`, stdout carries only JSON,
 | `TIMEOUT` | 1 | No session within `--timeout`; the login was cancelled. Ask the human, retry once |
 | `HELPER_INSTALL_CANCELLED` | 1 | The human closed the administrator dialog; do not retry |
 | `HELPER_INSTALL_FAILED` | 1 | The install failed; report the message |
-| `CLI_ERROR` | 255 | Usage or unexpected CLI failure; read `--help` of the command |
-| `INVALID_ARGUMENT` | 255 | A bad value or flag combination; read `--help` of the command |
+| `INVALID_ARGUMENT` | 255 | An unknown or missing flag, a bad value or flag combination; read `--help` of the command |
+| `CLI_ERROR` | 255 | An unexpected CLI failure (IO, closed output); report the message |
 | `HELPER_UNAVAILABLE` | 255 | The Helper does not answer; `helper status`, then the human |
 | `HELPER_UNAUTHORIZED` | 255 | Not the console user, as over SSH; report and stop |
 | `HELPER_NOT_INSTALLED` | 255 | No Helper; the human runs `vpnconnect helper install` |
