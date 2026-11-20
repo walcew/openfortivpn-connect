@@ -47,6 +47,28 @@ impl Home {
         std::fs::read_to_string(self.0.join("opened-urls")).unwrap_or_default().lines().map(str::to_string).collect()
     }
 
+    /// O que a CLI gravou em `profiles.json`; array vazio se o arquivo não existe.
+    fn stored_profiles(&self) -> Value {
+        std::fs::read_to_string(self.0.join("profiles.json")).map_or(json!([]), |s| serde_json::from_str(&s).unwrap())
+    }
+
+    fn stored_settings(&self) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(self.0.join("settings.json")).unwrap()).unwrap()
+    }
+
+    /// A senha do Profile no Keychain em arquivo, se houver.
+    fn stored_password(&self, id: &str) -> Option<String> {
+        std::fs::read_to_string(self.0.join("keychain").join(format!("vpn-{id}"))).ok()
+    }
+
+    /// Roda com `input` na stdin.
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = self.command(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.args(args).env("VPNCONNECT_TEST_HOME", &self.0);
@@ -699,4 +721,331 @@ fn watch_refused_by_the_helper_fails_with_255_without_retrying() {
     assert_eq!(out.status.code(), Some(255));
     assert_eq!(json_err(&out)["error"]["code"], "HELPER_UNAUTHORIZED");
     assert!(!text(&out.stdout).contains("reconnecting"), "{}", text(&out.stdout));
+}
+
+// --- profile e settings ---
+
+const DIGEST: &str = "aa11bb22cc33dd44ee55ff6600770088aa11bb22cc33dd44ee55ff6600770088";
+
+fn assert_refused(out: &Output, exit: i32, code: &str) {
+    assert_eq!(out.status.code(), Some(exit), "stderr: {}", text(&out.stderr));
+    assert_eq!(json_err(out)["error"]["code"], code);
+}
+
+/// O Profile `p1` completo, como a GUI o grava, para conferir o que a CLI preserva.
+fn full_profile() -> Value {
+    json!({"id": "p1", "name": "Corp", "host": "vpn.example.com", "port": 443, "auth_type": "Password",
+           "username": "alice", "otp_required": true, "realm": "corp", "trusted_certs": [DIGEST],
+           "ignore_cert_errors": true, "dns_match_domains": ["corp.example.com"], "extra_args": ["--set-dns=0"]})
+}
+
+#[test]
+fn profile_ls_lists_the_profiles_as_a_json_array_and_as_a_table() {
+    let home = home_with_corp(&[profile("p2", "Other")]);
+
+    let out = home.run(&["profile", "ls", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let list = json_out(&out);
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert_eq!(list[0]["id"], "p1");
+    assert_eq!(list[0]["has_password"], true);
+    assert_eq!(list[1]["has_password"], false);
+
+    let out = home.run(&["profile", "ls"]);
+    let table = text(&out.stdout);
+    assert!(table.lines().next().unwrap().contains("NAME"), "{table}");
+    assert!(table.contains("Corp") && table.contains("Other") && table.contains("vpn.example.com"), "{table}");
+}
+
+#[test]
+fn profile_ls_without_profiles_is_an_empty_array() {
+    let out = Home::new().run(&["profile", "ls", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_out(&out), json!([]));
+}
+
+#[test]
+fn profile_show_prints_every_field_but_never_the_password_or_extra_args() {
+    let home = Home::new();
+    home.profiles(json!([full_profile()]));
+    home.password("p1", "s3cret");
+
+    let out = home.run(&["profile", "show", "Corp", "--json"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json_out(&out), json!({
+        "id": "p1", "name": "Corp", "host": "vpn.example.com", "port": 443, "auth": "password",
+        "username": "alice", "realm": "corp", "otp_required": true, "auto_trust": true,
+        "trusted_certs": [DIGEST], "dns_domains": ["corp.example.com"], "has_password": true,
+    }));
+    let human = home.run(&["profile", "show", "p1"]);
+    let human = text(&human.stdout);
+    assert!(human.contains("vpn.example.com") && human.contains(DIGEST), "{human}");
+    assert!(!human.contains("s3cret") && !human.contains("set-dns"), "{human}");
+}
+
+#[test]
+fn profile_targets_by_id_or_exact_name_only() {
+    let home = home_with_corp(&[profile("p2", "Corp")]);
+    assert_refused(&home.run(&["profile", "show", "Corp", "--json"]), 1, "PROFILE_AMBIGUOUS");
+    assert_refused(&home.run(&["profile", "show", "Cor", "--json"]), 1, "PROFILE_NOT_FOUND");
+    assert_refused(&home.run(&["profile", "edit", "Cor", "--port", "1", "--json"]), 1, "PROFILE_NOT_FOUND");
+    assert_refused(&home.run(&["profile", "rm", "Cor", "--json"]), 1, "PROFILE_NOT_FOUND");
+    assert_eq!(home.run(&["profile", "show", "p2"]).status.code(), Some(0));
+    assert_eq!(home.stored_profiles().as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn profile_add_creates_the_profile_the_gui_would() {
+    let home = Home::new();
+
+    let out = home.run(&[
+        "profile", "add", "--name", "Corp", "--host", "vpn.example.com", "--port", "443", "--username", "alice",
+        "--realm", "corp", "--otp-required", "--auto-trust", "--dns-domain", "*.Corp.Example.com", "--dns-domain", "intra.local", "--json",
+    ]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = json_out(&out);
+    let stored = home.stored_profiles();
+    assert_eq!(stored.as_array().unwrap().len(), 1);
+    let id = stored[0]["id"].as_str().unwrap();
+    assert!(!id.is_empty());
+    assert_eq!(shown["id"], id);
+    assert_eq!(shown["has_password"], false);
+    assert_eq!(stored[0], json!({
+        "id": id, "name": "Corp", "host": "vpn.example.com", "port": 443, "auth_type": "Password",
+        "username": "alice", "otp_required": true, "realm": "corp", "trusted_certs": [],
+        "ignore_cert_errors": true, "dns_match_domains": ["corp.example.com", "intra.local"], "extra_args": [],
+    }));
+}
+
+#[test]
+fn profile_add_defaults_to_the_gui_new_profile() {
+    let home = Home::new();
+    let out = home.run(&["profile", "add", "--name", "Plain", "--host", "h.example.com"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let p = &home.stored_profiles()[0];
+    assert_eq!((p["port"].clone(), p["auth_type"].clone(), p["otp_required"].clone()), (json!(8443), json!("Password"), json!(false)));
+    assert_eq!((p["username"].clone(), p["realm"].clone(), p["ignore_cert_errors"].clone()), (Value::Null, Value::Null, json!(false)));
+}
+
+#[test]
+fn profile_add_saml_never_requires_otp() {
+    let home = Home::new();
+    let out = home.run(&["profile", "add", "--name", "Sso", "--host", "h", "--auth", "saml", "--otp-required"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(home.stored_profiles()[0]["auth_type"], "Saml");
+    assert_eq!(home.stored_profiles()[0]["otp_required"], false);
+}
+
+#[test]
+fn profile_add_needs_name_and_host_and_refuses_blank_ones() {
+    let home = Home::new();
+    assert_refused(&home.run(&["profile", "add", "--host", "h", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["profile", "add", "--name", " ", "--host", "h", "--json"]), 255, "INVALID_ARGUMENT");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--port", "0", "--json"]), 255, "INVALID_ARGUMENT");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--auth", "kerberos", "--json"]), 255, "CLI_ERROR");
+    assert_eq!(home.stored_profiles(), json!([]));
+}
+
+#[test]
+fn profile_add_refuses_a_name_already_in_use() {
+    let home = home_with_corp(&[]);
+    let before = home.stored_profiles();
+    assert_refused(&home.run(&["profile", "add", "--name", "Corp", "--host", "h", "--json"]), 1, "PROFILE_NAME_TAKEN");
+    assert_eq!(home.stored_profiles(), before);
+}
+
+#[test]
+fn invalid_dns_domains_are_refused_and_nothing_is_saved() {
+    let home = Home::new();
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--dns-domain", "ok.example.com", "--dns-domain", "bad_domain!", "--json"]), 1, "INVALID_DNS_DOMAIN");
+    assert!(!home.0.join("profiles.json").exists());
+
+    home.profiles(json!([full_profile()]));
+    let before = std::fs::read(home.0.join("profiles.json")).unwrap();
+    assert_refused(&home.run(&["profile", "edit", "Corp", "--port", "1234", "--dns-domain=-bad.example.com", "--json"]), 1, "INVALID_DNS_DOMAIN");
+    assert_eq!(std::fs::read(home.0.join("profiles.json")).unwrap(), before);
+}
+
+#[test]
+fn profile_edit_changes_only_what_was_passed() {
+    let home = Home::new();
+    home.profiles(json!([full_profile()]));
+
+    let out = home.run(&["profile", "edit", "Corp", "--port", "8443", "--no-otp-required", "--json"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let mut expected = full_profile();
+    expected["port"] = json!(8443);
+    expected["otp_required"] = json!(false);
+    assert_eq!(home.stored_profiles(), json!([expected]));
+    assert_eq!(json_out(&out)["port"], 8443);
+}
+
+#[test]
+fn profile_edit_renames_and_swaps_the_dns_domains() {
+    let home = home_with_corp(&[profile("p2", "Other")]);
+    home.run(&["profile", "edit", "p1", "--name", "Renamed", "--dns-domain", "a.example.com", "--dns-domain", "b.example.com"]);
+    let p = &home.stored_profiles()[0];
+    assert_eq!((p["name"].clone(), p["dns_match_domains"].clone()), (json!("Renamed"), json!(["a.example.com", "b.example.com"])));
+
+    assert_refused(&home.run(&["profile", "edit", "p1", "--name", "Other", "--json"]), 1, "PROFILE_NAME_TAKEN");
+    // Manter o próprio nome não é conflito.
+    assert_eq!(home.run(&["profile", "edit", "p1", "--name", "Renamed"]).status.code(), Some(0));
+}
+
+#[test]
+fn profile_edit_clears_dns_domains_and_blank_username_and_realm() {
+    let home = Home::new();
+    home.profiles(json!([full_profile()]));
+
+    let out = home.run(&["profile", "edit", "Corp", "--clear-dns-domains", "--username", "", "--realm", ""]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let p = &home.stored_profiles()[0];
+    assert_eq!((p["dns_match_domains"].clone(), p["username"].clone(), p["realm"].clone()), (json!([]), Value::Null, Value::Null));
+    assert_refused(&home.run(&["profile", "edit", "Corp", "--clear-dns-domains", "--dns-domain", "a.example.com", "--json"]), 255, "CLI_ERROR");
+}
+
+#[test]
+fn profile_edit_to_saml_drops_the_otp_requirement() {
+    let home = Home::new();
+    home.profiles(json!([full_profile()]));
+    home.run(&["profile", "edit", "Corp", "--auth", "saml"]);
+    let p = &home.stored_profiles()[0];
+    assert_eq!((p["auth_type"].clone(), p["otp_required"].clone()), (json!("Saml"), json!(false)));
+}
+
+#[test]
+fn profile_rm_deletes_the_profile_and_its_password_only() {
+    let home = home_with_corp(&[profile("p2", "Other")]);
+    home.password("p2", "keep-me");
+
+    let out = home.run(&["profile", "rm", "Corp", "--json"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json_out(&out)["id"], "p1");
+    let left = home.stored_profiles();
+    assert_eq!(left.as_array().unwrap().len(), 1);
+    assert_eq!(left[0]["id"], "p2");
+    assert_eq!(home.stored_password("p1"), None);
+    assert_eq!(home.stored_password("p2").as_deref(), Some("keep-me"));
+}
+
+#[test]
+fn set_password_reads_stdin_and_strips_one_trailing_newline() {
+    let home = Home::new();
+    home.profiles(json!([profile("p1", "Corp")]));
+
+    let out = home.run_with_stdin(&["profile", "set-password", "Corp", "--password-stdin", "--json"], "s3 cret\n");
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(home.stored_password("p1").as_deref(), Some("s3 cret"));
+    assert_eq!(json_out(&out)["has_password"], true);
+    assert!(!text(&out.stdout).contains("s3 cret") && !text(&out.stderr).contains("s3 cret"));
+}
+
+#[test]
+fn set_password_refuses_an_empty_password_and_keeps_the_old_one() {
+    let home = home_with_corp(&[]);
+    for input in ["", "\n"] {
+        let out = home.run_with_stdin(&["profile", "set-password", "Corp", "--password-stdin", "--json"], input);
+        assert_refused(&out, 255, "INVALID_ARGUMENT");
+    }
+    assert_eq!(home.stored_password("p1").as_deref(), Some("s3cret"));
+}
+
+#[test]
+fn set_password_needs_the_stdin_flag_and_has_no_password_argument() {
+    let home = home_with_corp(&[]);
+    assert_refused(&home.run_with_stdin(&["profile", "set-password", "Corp", "--json"], "new\n"), 255, "CLI_ERROR");
+    assert_refused(&home.run_with_stdin(&["profile", "set-password", "Corp", "--password", "new", "--json"], ""), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["profile", "add", "--name", "x", "--host", "h", "--password", "new", "--json"]), 255, "CLI_ERROR");
+    assert_eq!(home.stored_password("p1").as_deref(), Some("s3cret"));
+    assert!(home.stored_profiles().as_array().unwrap().len() == 1);
+}
+
+#[test]
+fn clear_password_removes_it() {
+    let home = home_with_corp(&[]);
+    let out = home.run(&["profile", "clear-password", "Corp", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json_out(&out)["has_password"], false);
+    assert_eq!(home.stored_password("p1"), None);
+    // Sem senha salva também não é erro.
+    assert_eq!(home.run(&["profile", "clear-password", "Corp"]).status.code(), Some(0));
+}
+
+#[test]
+fn trust_and_untrust_are_idempotent_and_normalize_the_digest() {
+    let home = home_with_corp(&[]);
+    let colons = DIGEST.to_uppercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
+
+    for digest in [DIGEST.to_uppercase(), colons, DIGEST.to_string()] {
+        let out = home.run(&["profile", "trust", "Corp", &digest, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(json_out(&out)["trusted_certs"], json!([DIGEST]));
+    }
+    assert_eq!(home.stored_profiles()[0]["trusted_certs"], json!([DIGEST]));
+
+    let other = "ab".repeat(32);
+    home.run(&["profile", "trust", "Corp", &other]);
+    assert_eq!(home.run(&["profile", "untrust", "Corp", DIGEST]).status.code(), Some(0));
+    assert_eq!(home.run(&["profile", "untrust", "Corp", DIGEST]).status.code(), Some(0));
+    assert_eq!(home.stored_profiles()[0]["trusted_certs"], json!([other]));
+}
+
+#[test]
+fn trust_refuses_a_malformed_digest_and_changes_nothing() {
+    let home = home_with_corp(&[]);
+    let before = home.stored_profiles();
+    for bad in ["abc", &"z".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+        assert_refused(&home.run(&["profile", "trust", "Corp", bad, "--json"]), 1, "INVALID_CERT_DIGEST");
+        assert_refused(&home.run(&["profile", "untrust", "Corp", bad, "--json"]), 1, "INVALID_CERT_DIGEST");
+    }
+    assert_eq!(home.stored_profiles(), before);
+}
+
+#[test]
+fn settings_show_defaults_and_set_dns_fallback_keeps_the_other_fields() {
+    let home = Home::new();
+    let out = home.run(&["settings", "show", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json_out(&out)["dns_fallback"], true);
+    assert!(text(&home.run(&["settings", "show"]).stdout).contains("dns-fallback"));
+
+    home.settings(json!({"helper_install_declined": true, "dns_fallback": true}));
+    let out = home.run(&["settings", "set", "dns-fallback", "off", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json_out(&out)["dns_fallback"], false);
+    assert_eq!(home.stored_settings(), json!({"helper_install_declined": true, "dns_fallback": false}));
+
+    home.run(&["settings", "set", "dns-fallback", "on"]);
+    assert_eq!(home.stored_settings()["dns_fallback"], true);
+}
+
+#[test]
+fn settings_set_refuses_an_unknown_key_or_value() {
+    let home = Home::new();
+    assert_refused(&home.run(&["settings", "set", "dns-fallback", "maybe", "--json"]), 255, "CLI_ERROR");
+    assert_refused(&home.run(&["settings", "set", "debug-mode", "on", "--json"]), 255, "CLI_ERROR");
+    assert!(!home.0.join("settings.json").exists());
+}
+
+#[test]
+fn a_profile_created_by_the_cli_connects() {
+    let home = Home::new();
+    home.run(&["profile", "add", "--name", "Fresh", "--host", "fresh.example.com", "--username", "bob", "--dns-domain", "corp.example.com"]);
+    home.run_with_stdin(&["profile", "set-password", "Fresh", "--password-stdin"], "pw\n");
+    let helper = FakeHelper::idle(&home.socket(), vec![connected_event()]);
+
+    let out = home.run(&["connect", "Fresh", "--json"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let request = connect_request(&helper);
+    assert_eq!(request["profile"]["host"], "fresh.example.com");
+    assert_eq!(request["profile"]["dns_match_domains"], json!(["corp.example.com"]));
+    assert_eq!(request["password"], "pw");
 }

@@ -9,6 +9,8 @@ mod args;
 mod connect;
 mod disconnect;
 mod output;
+mod profile;
+mod settings;
 mod status;
 mod target;
 mod watch;
@@ -38,6 +40,8 @@ pub fn main() -> ExitCode {
         Cmd::Connect { profile, otp, timeout, no_browser } => connect::run(&out, &profile, otp.as_deref(), timeout, no_browser),
         Cmd::Disconnect => disconnect::run(&out),
         Cmd::Watch => watch::run(),
+        Cmd::Profile(cmd) => profile::run(&out, cmd),
+        Cmd::Settings(cmd) => settings::run(&out, cmd),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

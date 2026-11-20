@@ -123,7 +123,7 @@ impl VpnManager {
     /// Limpa os domínios de split DNS digitados: apara, põe em minúsculas e tira o `*.` ou `.`
     /// inicial (o domínio do scutil é o sufixo puro), depois descarta vazios e duplicados.
     /// Rejeita o que a validação de hostname do Helper recusaria.
-    fn normalize_dns_domains(domains: &[String]) -> Result<Vec<String>, String> {
+    pub(crate) fn normalize_dns_domains(domains: &[String]) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = Vec::new();
         for d in domains {
             let d = d.trim().to_lowercase();

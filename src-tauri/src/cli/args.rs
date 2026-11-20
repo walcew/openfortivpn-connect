@@ -1,6 +1,6 @@
 //! A linha de comando. Nomes de comando e de opção em inglês e estáveis; help só em inglês.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -83,4 +83,164 @@ pub enum Cmd {
             \x20 {\"event\":\"reconnecting\",\"in_ms\":1000}                      the Helper is unreachable; retrying in in_ms"
     )]
     Watch,
+    /// Manage the saved Profiles, their passwords and trusted certificates
+    #[command(subcommand, long_about = "Manage the saved Profiles, the same ones the app shows. Every command \
+        takes <profile> as the Profile id or its exact name; partial or ambiguous names are refused. \
+        --json prints a Profile as {\"id\", \"name\", \"host\", \"port\", \"auth\" (password|saml), \"username\", \
+        \"realm\", \"otp_required\", \"auto_trust\", \"trusted_certs\", \"dns_domains\", \"has_password\"}; the \
+        password itself is never printed. `ls` prints an array of them.\n\n\
+        Profile names are unique. Refusals (exit 1): PROFILE_NAME_TAKEN, INVALID_DNS_DOMAIN, \
+        INVALID_CERT_DIGEST. Bad usage (exit 255): INVALID_ARGUMENT.")]
+    Profile(ProfileCmd),
+    /// Show or change the app settings
+    #[command(subcommand, long_about = "Show or change the app settings, stored in the same file the app uses. \
+        --json prints {\"dns_fallback\", \"helper_install_declined\"}. Changing one setting keeps the others.")]
+    Settings(SettingsCmd),
+}
+
+#[derive(Subcommand)]
+pub enum ProfileCmd {
+    /// List the Profiles
+    Ls,
+    /// Show every field of a Profile and whether it has a saved password
+    Show {
+        /// Profile id or exact name
+        profile: String,
+    },
+    /// Create a Profile and print it
+    #[command(long_about = "Create a Profile and print it. --name and --host are required and the name must be \
+        unique. Defaults are the app's: port 8443, password authentication, no OTP, no DNS domains. \
+        The password is not set here: pipe it to `profile set-password --password-stdin`.")]
+    Add {
+        /// Profile name, unique among Profiles
+        #[arg(long)]
+        name: String,
+        /// Gateway host name or address
+        #[arg(long)]
+        host: String,
+        #[command(flatten)]
+        fields: Fields,
+    },
+    /// Change only the fields passed and print the Profile
+    #[command(long_about = "Change only the fields passed and print the resulting Profile. Fields not passed, \
+        including trusted certificates, keep their value. --dns-domain replaces the whole list; \
+        --clear-dns-domains empties it. An empty --username or --realm clears it.")]
+    Edit {
+        /// Profile id or exact name
+        profile: String,
+        /// New name, unique among Profiles
+        #[arg(long)]
+        name: Option<String>,
+        /// New gateway host name or address
+        #[arg(long)]
+        host: Option<String>,
+        #[command(flatten)]
+        fields: Fields,
+    },
+    /// Delete a Profile and its saved password; asks nothing
+    Rm {
+        /// Profile id or exact name
+        profile: String,
+    },
+    /// Save the password read from stdin
+    #[command(long_about = "Save the Profile's password in the Keychain. It is read from stdin only (there is no \
+        password argument, so it never reaches `ps` or the shell history): one trailing newline is \
+        dropped and an empty password is refused. Never prompts: with a terminal on stdin it fails \
+        instead of waiting.\n\nExample: printf '%s' \"$PASSWORD\" | vpnconnect profile set-password Corp --password-stdin")]
+    SetPassword {
+        /// Profile id or exact name
+        profile: String,
+        /// Read the password from stdin
+        #[arg(long, required = true)]
+        password_stdin: bool,
+    },
+    /// Remove the saved password
+    ClearPassword {
+        /// Profile id or exact name
+        profile: String,
+    },
+    /// Trust a certificate (sha256 digest) for a Profile
+    #[command(long_about = "Add a certificate digest to the Profile's trusted certificates, as the app's \
+        \"Trust & Reconnect\" does. The digest is 64 hex characters (sha256 of the certificate); \
+        upper case and `:` separators are accepted and normalized. Adding a digest already trusted \
+        succeeds. Only a human decides whether to trust a certificate.")]
+    Trust {
+        /// Profile id or exact name
+        profile: String,
+        /// sha256 digest of the certificate, 64 hex characters
+        digest: String,
+    },
+    /// Stop trusting a certificate (sha256 digest) for a Profile
+    Untrust {
+        /// Profile id or exact name
+        profile: String,
+        /// sha256 digest of the certificate, 64 hex characters
+        digest: String,
+    },
+}
+
+/// Os campos de `profile add` e `profile edit` que não são obrigatórios.
+#[derive(Args)]
+pub struct Fields {
+    /// Gateway port (default 8443)
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Authentication method; saml never asks for an OTP
+    #[arg(long, value_enum)]
+    pub auth: Option<Auth>,
+    /// User name, for password authentication
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Realm of the gateway login
+    #[arg(long)]
+    pub realm: Option<String>,
+    /// Ask for an OTP on every connect (password authentication only)
+    #[arg(long, conflicts_with = "no_otp_required")]
+    pub otp_required: bool,
+    /// Do not ask for an OTP
+    #[arg(long)]
+    pub no_otp_required: bool,
+    /// Trust whatever certificate the gateway presents, like the app's "Ignore certificate errors"; only for gateways you control
+    #[arg(long, conflicts_with = "no_auto_trust")]
+    pub auto_trust: bool,
+    /// Do not trust certificates automatically
+    #[arg(long)]
+    pub no_auto_trust: bool,
+    /// Split-DNS domain that uses the VPN DNS; repeat for several. Without any, the gateway's DNS suffixes apply
+    #[arg(long = "dns-domain", value_name = "DOMAIN", conflicts_with = "clear_dns_domains")]
+    pub dns_domains: Vec<String>,
+    /// Empty the DNS domains list
+    #[arg(long)]
+    pub clear_dns_domains: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Auth {
+    Password,
+    Saml,
+}
+
+#[derive(Subcommand)]
+pub enum SettingsCmd {
+    /// Show the settings
+    Show,
+    /// Change one setting
+    #[command(subcommand)]
+    Set(SettingCmd),
+}
+
+#[derive(Subcommand)]
+pub enum SettingCmd {
+    /// Use the system DNS as a fallback for names the VPN DNS cannot resolve
+    DnsFallback {
+        /// on or off
+        #[arg(value_enum)]
+        value: Toggle,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Toggle {
+    On,
+    Off,
 }

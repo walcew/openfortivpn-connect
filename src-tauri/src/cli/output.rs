@@ -3,8 +3,8 @@
 //! | saída | quando | `code` no `--json` |
 //! |---|---|---|
 //! | 0 | sucesso | — |
-//! | 1 | recusa do Helper, do gateway ou da checagem antes de conectar | `HELPER_REFUSED`, `PROFILE_NOT_FOUND`, `PROFILE_AMBIGUOUS`, `OTP_REQUIRED`, `CREDENTIALS_MISSING`, `SESSION_ACTIVE`, `CERT_UNTRUSTED`, `LOGIN_FAILED`, `CONNECT_FAILED`, `CONNECT_CANCELLED`, `TIMEOUT` |
-//! | 255 | falha da CLI: argumento, Helper inacessível | `CLI_ERROR`, `HELPER_UNAVAILABLE`, `HELPER_UNAUTHORIZED`, `HELPER_NOT_INSTALLED`, `HELPER_OUTDATED` |
+//! | 1 | recusa do Helper, do gateway ou da checagem antes de conectar | `HELPER_REFUSED`, `PROFILE_NOT_FOUND`, `PROFILE_AMBIGUOUS`, `PROFILE_NAME_TAKEN`, `INVALID_DNS_DOMAIN`, `INVALID_CERT_DIGEST`, `OTP_REQUIRED`, `CREDENTIALS_MISSING`, `SESSION_ACTIVE`, `CERT_UNTRUSTED`, `LOGIN_FAILED`, `CONNECT_FAILED`, `CONNECT_CANCELLED`, `TIMEOUT` |
+//! | 255 | falha da CLI: argumento, Helper inacessível | `CLI_ERROR`, `INVALID_ARGUMENT`, `HELPER_UNAVAILABLE`, `HELPER_UNAUTHORIZED`, `HELPER_NOT_INSTALLED`, `HELPER_OUTDATED` |
 //! | 130 | Ctrl-C | — |
 //!
 //! Com `--json`, a stdout leva só o JSON do resultado, numa linha, e o erro sai na stderr como
