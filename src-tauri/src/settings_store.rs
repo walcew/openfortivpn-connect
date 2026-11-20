@@ -48,7 +48,7 @@ impl SettingsStore {
     pub fn save(&self, settings: &AppSettings) -> Result<(), String> {
         let data = serde_json::to_string_pretty(settings)
             .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-        fs::write(&self.settings_path, data)
+        crate::paths::write_atomic(&self.settings_path, &data)
             .map_err(|e| format!("Failed to write settings: {}", e))
     }
 }

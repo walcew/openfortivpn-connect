@@ -60,7 +60,7 @@ impl ProfileStore {
     fn save(&self, profiles: &[VpnProfile]) -> Result<(), String> {
         let data = serde_json::to_string_pretty(profiles)
             .map_err(|e| format!("Failed to serialize profiles: {}", e))?;
-        fs::write(&self.profiles_path, data)
+        crate::paths::write_atomic(&self.profiles_path, &data)
             .map_err(|e| format!("Failed to write profiles: {}", e))
     }
 }
