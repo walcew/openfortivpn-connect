@@ -79,7 +79,7 @@ pub fn check_status() -> HelperStatus {
 }
 
 /// Um Helper ativo precisa ser reinstalado quando a versão difere da do app.
-fn needs_update(installed_version: Option<&str>, expected_version: &str) -> bool {
+pub(crate) fn needs_update(installed_version: Option<&str>, expected_version: &str) -> bool {
     installed_version.is_some_and(|v| v != expected_version)
 }
 

@@ -3,12 +3,13 @@
 //! | saída | quando | `code` no `--json` |
 //! |---|---|---|
 //! | 0 | sucesso | — |
-//! | 1 | recusa do Helper ou do gateway | `HELPER_REFUSED` |
-//! | 255 | falha da CLI: argumento, Helper inacessível | `CLI_ERROR`, `HELPER_UNAVAILABLE`, `HELPER_UNAUTHORIZED` |
+//! | 1 | recusa do Helper, do gateway ou da checagem antes de conectar | `HELPER_REFUSED`, `PROFILE_NOT_FOUND`, `PROFILE_AMBIGUOUS`, `OTP_REQUIRED`, `CREDENTIALS_MISSING`, `SESSION_ACTIVE`, `CERT_UNTRUSTED`, `LOGIN_FAILED`, `CONNECT_FAILED`, `CONNECT_CANCELLED`, `TIMEOUT` |
+//! | 255 | falha da CLI: argumento, Helper inacessível | `CLI_ERROR`, `HELPER_UNAVAILABLE`, `HELPER_UNAUTHORIZED`, `HELPER_NOT_INSTALLED`, `HELPER_OUTDATED` |
 //! | 130 | Ctrl-C | — |
 //!
 //! Com `--json`, a stdout leva só o JSON do resultado, numa linha, e o erro sai na stderr como
-//! `{"error":{"code","message"}}`. Sem ele, a stderr leva só a mensagem.
+//! `{"error":{"code","message"}}`, mais `cert_digest` no `CERT_UNTRUSTED`. Sem ele, a stderr
+//! leva só a mensagem.
 
 use std::process::ExitCode;
 
@@ -26,15 +27,17 @@ pub struct CliError {
     pub exit: u8,
     pub code: &'static str,
     pub message: String,
+    /// sha256 do certificado recusado, só no `CERT_UNTRUSTED`.
+    pub cert_digest: Option<String>,
 }
 
 impl CliError {
     pub fn failure(code: &'static str, message: impl Into<String>) -> Self {
-        Self { exit: EXIT_FAILURE, code, message: message.into() }
+        Self { exit: EXIT_FAILURE, code, message: message.into(), cert_digest: None }
     }
 
     pub fn refused(code: &'static str, message: impl Into<String>) -> Self {
-        Self { exit: EXIT_REFUSED, code, message: message.into() }
+        Self { exit: EXIT_REFUSED, code, message: message.into(), cert_digest: None }
     }
 }
 
@@ -65,7 +68,15 @@ impl Out {
 
     /// Escreve o erro na stderr e devolve o código de saída dele.
     pub fn fail(&self, e: CliError) -> ExitCode {
-        print_error(self.json, e.code, &e.message);
+        if self.json {
+            let mut error = json!({"code": e.code, "message": e.message});
+            if let Some(digest) = e.cert_digest {
+                error["cert_digest"] = json!(digest);
+            }
+            eprintln!("{}", json!({ "error": error }));
+        } else {
+            eprintln!("{}", e.message);
+        }
         ExitCode::from(e.exit)
     }
 }
@@ -78,17 +89,9 @@ pub fn usage_error(e: clap::Error) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if std::env::args_os().any(|a| a == "--json") {
-        print_error(true, "CLI_ERROR", e.render().to_string().trim());
+        eprintln!("{}", json!({"error": {"code": "CLI_ERROR", "message": e.render().to_string().trim()}}));
     } else {
         let _ = e.print();
     }
     ExitCode::from(EXIT_FAILURE)
-}
-
-fn print_error(json: bool, code: &str, message: &str) {
-    if json {
-        eprintln!("{}", json!({"error": {"code": code, "message": message}}));
-    } else {
-        eprintln!("{message}");
-    }
 }

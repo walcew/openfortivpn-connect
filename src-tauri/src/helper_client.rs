@@ -97,7 +97,7 @@ pub enum Credentials {
 /// `VpnProfile::otp_to_send`; sem ele e com o gateway oferecendo push, o Helper pede o push.
 /// `dns_fallback_servers` é o DNS do sistema lido antes de conectar (vazio com o fallback
 /// desligado); o Helper o usa, com os do Google, só se o gateway não mandar DNS.
-fn connect_request(profile: &VpnProfile, creds: &Credentials, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
+pub fn connect_request(profile: &VpnProfile, creds: &Credentials, otp: Option<&str>, dns_fallback_servers: &[String]) -> Value {
     let mut req = json!({
         "v": 2,
         "cmd": "connect",
@@ -137,30 +137,60 @@ fn send(mut stream: &UnixStream, cmd: &Value) -> Result<(), String> {
     writeln!(stream, "{}", cmd).map_err(|e| format!("Failed to send request: {}", e))
 }
 
-/// Envia um comando numa conexão curta e devolve a resposta; eventos
-/// intercalados são descartados.
-fn request(path: &Path, cmd: &Value) -> Result<Value, HelperError> {
-    use HelperError::Unavailable;
-    let stream = open(path).map_err(Unavailable)?;
-    stream
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|e| Unavailable(format!("Failed to set timeout: {}", e)))?;
-    send(&stream, cmd).map_err(Unavailable)?;
-    for line in BufReader::new(&stream).lines() {
-        let line = line.map_err(|e| Unavailable(format!("Failed to read response: {}", e)))?;
-        let frame: Value =
-            serde_json::from_str(&line).map_err(|e| Unavailable(format!("Failed to parse response: {}", e)))?;
-        match frame["type"].as_str() {
-            Some("response") if frame["ok"] == true => return Ok(frame),
-            Some("response") => {
-                return Err(HelperError::Refused(frame["error"].as_str().unwrap_or("Unknown helper error").to_string()))
+/// Uma conexão com o Helper: requests e, depois do primeiro, os eventos da sessão.
+pub struct Channel {
+    reader: BufReader<UnixStream>,
+    /// A linha em leitura; um prazo que vence no meio dela não perde o que já chegou.
+    line: String,
+}
+
+impl Channel {
+    pub fn open(path: &Path) -> Result<Self, HelperError> {
+        Ok(Self { reader: BufReader::new(open(path).map_err(HelperError::Unavailable)?), line: String::new() })
+    }
+
+    /// Envia `cmd` e devolve a resposta; eventos intercalados são descartados.
+    pub fn request(&mut self, cmd: &Value) -> Result<Value, HelperError> {
+        send(self.reader.get_ref(), cmd).map_err(HelperError::Unavailable)?;
+        loop {
+            let frame = self
+                .next(TIMEOUT)?
+                .ok_or_else(|| HelperError::Unavailable("Timed out waiting for the helper response".into()))?;
+            match frame["type"].as_str() {
+                Some("response") if frame["ok"] == true => return Ok(frame),
+                Some("response") => {
+                    return Err(HelperError::Refused(frame["error"].as_str().unwrap_or("Unknown helper error").to_string()))
+                }
+                // A recusa do uid sai sem envelope (`refuse` em helper/src/server.rs).
+                None if frame["ok"] == false => return Err(HelperError::Unauthorized),
+                _ => {}
             }
-            // A recusa do uid sai sem envelope (`refuse` em helper/src/server.rs).
-            None if frame["ok"] == false => return Err(HelperError::Unauthorized),
-            _ => {}
         }
     }
-    Err(Unavailable("Helper closed the connection without a response".into()))
+
+    /// O próximo quadro em até `wait`; `None` se o prazo venceu antes.
+    pub fn next(&mut self, wait: Duration) -> Result<Option<Value>, HelperError> {
+        use HelperError::Unavailable;
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+            .map_err(|e| Unavailable(format!("Failed to set timeout: {}", e)))?;
+        match self.reader.read_line(&mut self.line) {
+            Ok(0) => Err(Unavailable("Helper closed the connection".into())),
+            Ok(_) => {
+                let frame = serde_json::from_str(&self.line).map_err(|e| Unavailable(format!("Failed to parse response: {}", e)));
+                self.line.clear();
+                frame.map(Some)
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
+            Err(e) => Err(Unavailable(format!("Failed to read response: {}", e))),
+        }
+    }
+}
+
+/// Envia um comando numa conexão curta e devolve a resposta.
+fn request(path: &Path, cmd: &Value) -> Result<Value, HelperError> {
+    Channel::open(path)?.request(cmd)
 }
 
 pub fn connect(path: &Path, profile: &VpnProfile, creds: &Credentials, otp: Option<&str>, dns_fallback_servers: &[String]) -> Result<(), HelperError> {

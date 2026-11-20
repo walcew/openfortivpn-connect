@@ -7,16 +7,20 @@ use crate::helper_client;
 use crate::profile_store::ProfileStore;
 
 pub fn run(out: &Out) -> Result<(), CliError> {
-    let mut state = helper_client::status_frame(&helper_client::socket_path())?;
-    // Sai só o estado: o envelope (`v`, `type`, `ok`) é do protocolo.
+    print(out, helper_client::status_frame(&helper_client::socket_path())?);
+    Ok(())
+}
+
+/// Imprime um estado do Helper (resposta do `status` ou evento `state`) no formato do `status`.
+pub fn print(out: &Out, mut state: Value) {
+    // Sai só o estado: o envelope (`v`, `type`, `ok`, `event`) é do protocolo.
     if let Some(fields) = state.as_object_mut() {
-        for envelope in ["v", "type", "ok"] {
+        for envelope in ["v", "type", "ok", "event"] {
             fields.remove(envelope);
         }
     }
     state["profile"] = profile(state["profile_id"].as_str());
     out.emit(&state, || print_human(&state));
-    Ok(())
 }
 
 /// O Profile da sessão, como a GUI o acha: pelo `profile_id` que o Helper manda nos estados de

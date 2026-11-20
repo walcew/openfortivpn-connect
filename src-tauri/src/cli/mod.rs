@@ -6,8 +6,11 @@
 //! leva o código de saída da tabela em [`output`].
 
 mod args;
+mod connect;
+mod disconnect;
 mod output;
 mod status;
+mod target;
 
 use std::process::ExitCode;
 
@@ -31,6 +34,8 @@ pub fn main() -> ExitCode {
     let out = Out { json: cli.json };
     let result = match cli.cmd {
         Cmd::Status => status::run(&out),
+        Cmd::Connect { profile, otp, timeout, no_browser } => connect::run(&out, &profile, otp.as_deref(), timeout, no_browser),
+        Cmd::Disconnect => disconnect::run(&out),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -1,5 +1,6 @@
 use tauri::{AppHandle, Emitter};
 
+use crate::helper_client::Credentials;
 use crate::keychain;
 use crate::models::*;
 use crate::profile_store::ProfileStore;
@@ -94,15 +95,8 @@ impl VpnManager {
             .ok_or_else(|| format!("Profile '{}' not found", profile_id))?;
         check_otp_provided(&profile, otp)?;
         let otp = profile.otp_to_send(otp);
-        // O DNS do sistema é lido antes de a VPN mexer na rede.
-        let fallback_dns = if dns_fallback { crate::dns_manager::get_current_dns_servers() } else { Vec::new() };
-
-        let creds = match profile.auth_type {
-            AuthType::Password => Self::resolve_password_creds(&profile)
-                .map(|(username, password)| crate::helper_client::Credentials::Password { username, password }),
-            AuthType::Saml => Ok(crate::helper_client::Credentials::Saml),
-        };
-        let result = creds.and_then(|creds| {
+        let fallback_dns = fallback_dns_servers(dns_fallback);
+        let result = resolve_credentials(&profile).and_then(|creds| {
             self.set_state(
                 ConnectionState::Connecting { profile_id: profile_id.to_string() },
                 app_handle,
@@ -147,35 +141,6 @@ impl VpnManager {
             out.push(d);
         }
         Ok(out)
-    }
-
-    /// Busca o usuário e a senha (no Keychain) de um Profile com senha. Os dois são
-    /// obrigatórios: sem eles o login não começa.
-    fn resolve_password_creds(profile: &VpnProfile) -> Result<(String, String), String> {
-        let username = profile
-            .username
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "Profile '{}' uses password authentication but has no username. \
-                     Edit the profile and fill in the username.",
-                    profile.name
-                )
-            })?;
-
-        let password = keychain::get_password(&profile.id)?
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "No password stored for profile '{}'. \
-                     Edit the profile and set the password.",
-                    profile.name
-                )
-            })?;
-
-        Ok((username.to_string(), password))
     }
 
     /// Começa a desconexão: põe o estado em Disconnecting e volta na hora.
@@ -233,14 +198,56 @@ impl VpnManager {
     }
 }
 
+/// Busca o usuário e a senha (no Keychain) de um Profile com senha. Os dois são
+/// obrigatórios: sem eles o login não começa.
+fn resolve_password_creds(profile: &VpnProfile) -> Result<(String, String), String> {
+    let username = profile
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Profile '{}' uses password authentication but has no username. \
+                 Edit the profile and fill in the username.",
+                profile.name
+            )
+        })?;
+
+    let password = keychain::get_password(&profile.id)?
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "No password stored for profile '{}'. \
+                 Edit the profile and set the password.",
+                profile.name
+            )
+        })?;
+
+    Ok((username.to_string(), password))
+}
+
+/// As credenciais do `connect`: usuário e senha do Keychain, ou nenhuma no SAML.
+pub(crate) fn resolve_credentials(profile: &VpnProfile) -> Result<Credentials, String> {
+    match profile.auth_type {
+        AuthType::Password => resolve_password_creds(profile).map(|(username, password)| Credentials::Password { username, password }),
+        AuthType::Saml => Ok(Credentials::Saml),
+    }
+}
+
+/// O DNS do sistema para o fallback, lido antes de a VPN mexer na rede; vazio com ele desligado.
+pub(crate) fn fallback_dns_servers(enabled: bool) -> Vec<String> {
+    if enabled { crate::dns_manager::get_current_dns_servers() } else { Vec::new() }
+}
+
 /// Aviso de uma linha para o Profile salvo com `extra_args`, que o Engine próprio não lê.
-fn extra_args_notice(profile: &VpnProfile) -> Option<String> {
+pub(crate) fn extra_args_notice(profile: &VpnProfile) -> Option<String> {
     (!profile.extra_args.is_empty()).then(|| {
         format!("Ignoring extra_args of profile '{}': extra options no longer apply since 0.4.0", profile.name)
     })
 }
 
-fn check_otp_provided(profile: &VpnProfile, otp: Option<&str>) -> Result<(), String> {
+pub(crate) fn check_otp_provided(profile: &VpnProfile, otp: Option<&str>) -> Result<(), String> {
     if profile.needs_otp() && profile.otp_to_send(otp).is_none() {
         return Err("OTP is required for this profile".into());
     }
@@ -282,7 +289,7 @@ mod tests {
     #[test]
     fn test_password_creds_require_username() {
         for profile in [password_profile(None), password_profile(Some("   "))] {
-            let err = VpnManager::resolve_password_creds(&profile).unwrap_err();
+            let err = resolve_password_creds(&profile).unwrap_err();
             assert!(err.contains("no username"), "unexpected error: {}", err);
         }
     }
@@ -292,7 +299,7 @@ mod tests {
         // The profile id is a fresh uuid, so nothing is stored in the keychain.
         let mut profile = password_profile(Some("john.doe"));
         profile.id = uuid::Uuid::new_v4().to_string();
-        let err = VpnManager::resolve_password_creds(&profile).unwrap_err();
+        let err = resolve_password_creds(&profile).unwrap_err();
         assert!(err.contains("No password stored"), "unexpected error: {}", err);
     }
 

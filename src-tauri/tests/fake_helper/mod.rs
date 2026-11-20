@@ -58,13 +58,41 @@ impl FakeHelper {
         let status = state.clone();
         Self::start(socket, state, move |req| match req["cmd"].as_str() {
             Some("status") => vec![response(status.clone())],
-            Some("version") => vec![response(json!({"version": "0.4.0"}))],
+            Some("version") => vec![response(json!({"version": env!("CARGO_PKG_VERSION")}))],
+            _ => vec![response(json!({}))],
+        })
+    }
+
+    /// Helper sem sessão, na versão do app: `status` responde `disconnected` e o `connect`
+    /// responde ok seguido dos quadros de `after_connect` (o roteiro da sessão).
+    pub fn idle(socket: &Path, after_connect: Vec<Value>) -> Self {
+        let idle = json!({"state": "disconnected"});
+        Self::start(socket, idle.clone(), move |req| match req["cmd"].as_str() {
+            Some("status") => vec![response(idle.clone())],
+            Some("version") => vec![response(json!({"version": env!("CARGO_PKG_VERSION")}))],
+            Some("connect") => [vec![response(json!({}))], after_connect.clone()].concat(),
             _ => vec![response(json!({}))],
         })
     }
 
     pub fn requests(&self) -> Vec<Value> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Os `cmd` dos requests recebidos, em ordem.
+    pub fn commands(&self) -> Vec<String> {
+        self.requests().iter().map(|r| r["cmd"].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    /// Espera até 5 s pelo request `cmd`.
+    pub fn wait_for(&self, cmd: &str) {
+        for _ in 0..100 {
+            if self.commands().iter().any(|c| c == cmd) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("no {cmd} request; got {:?}", self.commands());
     }
 }
 
@@ -86,6 +114,16 @@ pub fn event(body: Value) -> Value {
     let mut frame = json!({"v": 2, "type": "event"});
     frame.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
     frame
+}
+
+/// `response` com `ok: false` e o erro.
+pub fn refusal(error: &str) -> Value {
+    json!({"v": 2, "type": "response", "ok": false, "error": error})
+}
+
+/// Evento `state` com os campos de `body` (que leva o `state`).
+pub fn state(body: Value) -> Value {
+    event(state_event(&body))
 }
 
 /// A recusa do Helper a um uid que não é root nem o usuário do console: sai sem envelope.

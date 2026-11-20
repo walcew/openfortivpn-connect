@@ -33,4 +33,35 @@ pub enum Cmd {
         state) plus \"profile\": {\"id\", \"name\"}, or null when no session is active. \"name\" is \
         null when the Profile no longer exists on this Mac.")]
     Status,
+    /// Connect a Profile and wait until the session is up or has failed
+    #[command(long_about = "Connect a Profile and wait until the session is up (exit 0, prints the \
+        status, same format as `status`) or has failed (exit 1 and the error code). The session \
+        lives in the Helper: it stays up after this command returns or the terminal closes.\n\n\
+        Runs the same checks as the app: the password comes from the Keychain (no prompt, there is \
+        no password flag), an OTP Profile needs --otp (else OTP_REQUIRED), extra_args only print a \
+        warning, and the DNS fallback setting applies. Refused with SESSION_ACTIVE when a session \
+        is already active.\n\n\
+        SAML: opens the login URL in the default browser and prints it on stderr; --no-browser \
+        only prints it. FortiToken push: stderr says it waits for the approval on the phone.\n\n\
+        After --timeout seconds without a session, or on Ctrl-C, the pending login is cancelled \
+        (exit 1 TIMEOUT, or 130). An untrusted certificate fails with CERT_UNTRUSTED and the \
+        digest in the error JSON (\"cert_digest\"); only a human may decide to trust it.")]
+    Connect {
+        /// Profile id or exact name; partial or ambiguous names are refused
+        profile: String,
+        /// One-time password, for a Profile that requires OTP
+        #[arg(long, value_name = "CODE")]
+        otp: Option<String>,
+        /// Seconds to wait for the session before cancelling the login
+        #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+        timeout: u64,
+        /// Print the SAML login URL without opening the browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// End the session or cancel a pending login (SAML, push), from the app or the CLI
+    #[command(long_about = "End the VPN session, connected or still logging in (SAML, push), \
+        whether the app or the CLI started it. Waits until the Helper reports disconnected and \
+        prints the status. Without a session it is not an error: exits 0 and says so on stderr.")]
+    Disconnect,
 }
