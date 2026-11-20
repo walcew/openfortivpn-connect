@@ -12,9 +12,8 @@ use crate::helper_client::{self, Channel};
 const WAIT: Duration = Duration::from_secs(30);
 
 pub fn run(out: &Out) -> Result<(), CliError> {
-    let status_request = json!({"v": 2, "cmd": "status"});
     let mut channel = Channel::open(&helper_client::socket_path())?;
-    let current = channel.request(&status_request)?;
+    let current = channel.request(&helper_client::status_request())?;
     if current["state"] == "disconnected" {
         eprintln!("No active session");
         status::print(out, current);
@@ -29,7 +28,7 @@ pub fn run(out: &Out) -> Result<(), CliError> {
         }
     }
     // O `disconnected` pode ter saído antes da resposta ao `disconnect`, e aí foi descartado.
-    let current = channel.request(&status_request)?;
+    let current = channel.request(&helper_client::status_request())?;
     if current["state"] == "disconnected" {
         status::print(out, current);
         return Ok(());

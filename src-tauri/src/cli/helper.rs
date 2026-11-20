@@ -40,7 +40,7 @@ fn print(out: &Out, status: &HelperStatus) {
 /// No build de teste o osascript nunca roda: o teste não pode pedir senha de administrador.
 fn refuse_in_test_mode() -> Result<(), CliError> {
     if paths::test_home().is_some() {
-        return Err(CliError::failure("CLI_ERROR", "helper install and uninstall are not available in test mode"));
+        return Err(CliError::cli("helper install and uninstall are not available in test mode"));
     }
     Ok(())
 }

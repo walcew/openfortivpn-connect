@@ -6,7 +6,7 @@ use crate::models::VpnProfile;
 use crate::profile_store::ProfileStore;
 
 pub fn resolve(target: &str) -> Result<VpnProfile, CliError> {
-    let profiles = ProfileStore::new().and_then(|s| s.get_all()).map_err(|e| CliError::failure("CLI_ERROR", e))?;
+    let profiles = ProfileStore::new().and_then(|s| s.get_all()).map_err(CliError::cli)?;
     if let Some(p) = profiles.iter().find(|p| p.id == target) {
         return Ok(p.clone());
     }

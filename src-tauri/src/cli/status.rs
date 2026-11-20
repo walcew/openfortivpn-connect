@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use super::{CliError, Out};
+use super::{output, CliError, Out};
 use crate::helper_client;
 use crate::profile_store::ProfileStore;
 
@@ -52,12 +52,7 @@ fn print_human(state: &Value) {
         ("Certificate", &state["cert_digest"]),
     ];
     for (label, value) in rows {
-        let text = match value {
-            Value::String(s) => s.clone(),
-            Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
-            _ => continue,
-        };
-        if !text.is_empty() {
+        if let Some(text) = output::text(value) {
             println!("{:<13} {text}", format!("{label}:"));
         }
     }

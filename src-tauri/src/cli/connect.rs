@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{status, target, CliError, Out};
 use crate::helper_client::{self, Channel, HelperError};
@@ -28,7 +28,7 @@ pub fn run(out: &Out, target: &str, otp: Option<&str>, timeout: u64, no_browser:
 
     let mut channel = Channel::open(&socket)?;
     // Como a GUI: só conecta sem sessão, para não trocar uma sessão que o usuário abriu.
-    let current = channel.request(&json!({"v": 2, "cmd": "status"}))?;
+    let current = channel.request(&helper_client::status_request())?;
     if current["state"] != "disconnected" {
         return Err(session_active(&format!("state {}", current["state"])));
     }

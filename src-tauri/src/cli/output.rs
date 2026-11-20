@@ -36,6 +36,11 @@ impl CliError {
         Self { exit: EXIT_FAILURE, code, message: message.into(), cert_digest: None }
     }
 
+    /// Falha interna da CLI (IO, saída fechada, modo de teste), não de argumento nem do Helper.
+    pub fn cli(message: impl Into<String>) -> Self {
+        Self::failure("CLI_ERROR", message)
+    }
+
     pub fn refused(code: &'static str, message: impl Into<String>) -> Self {
         Self { exit: EXIT_REFUSED, code, message: message.into(), cert_digest: None }
     }
@@ -49,6 +54,18 @@ impl From<HelperError> for CliError {
             HelperError::Refused(m) => Self::refused("HELPER_REFUSED", m),
         }
     }
+}
+
+/// Um valor JSON como a saída humana o mostra: lista separada por vírgula, `None` se não há
+/// nada a mostrar (null ou vazio).
+pub fn text(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::Null => return None,
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
+        other => other.to_string(),
+    };
+    Some(text).filter(|t| !t.is_empty())
 }
 
 /// O formato da saída: o único ponto que decide entre JSON e texto.

@@ -22,7 +22,7 @@ pub fn install(out: &Out) -> Result<(), CliError> {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| CliError::failure("CLI_ERROR", "HOME is not set"))?;
+        .ok_or_else(|| CliError::cli("HOME is not set"))?;
     let canonical = home.join(".agents").join("skills").join(NAME);
     let mut installed = vec![("universal", canonical.clone())];
     write_skill(&canonical).map_err(|e| io_error(&canonical, e))?;
@@ -81,5 +81,5 @@ fn write_skill(dir: &Path) -> std::io::Result<()> {
 }
 
 fn io_error(path: &Path, e: std::io::Error) -> CliError {
-    CliError::failure("CLI_ERROR", format!("{}: {e}", path.display()))
+    CliError::cli(format!("{}: {e}", path.display()))
 }

@@ -20,6 +20,21 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
 pub const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
+/// A próxima espera de reconexão: o dobro da atual, até `RECONNECT_MAX`.
+pub fn next_delay(delay: Duration) -> Duration {
+    (delay * 2).min(RECONNECT_MAX)
+}
+
+/// O request `status`; o Helper começa a mandar os eventos depois dele.
+pub fn status_request() -> Value {
+    json!({"v": 2, "cmd": "status"})
+}
+
+/// A recusa do uid sai sem envelope (`refuse` em helper/src/server.rs).
+pub fn is_uid_refusal(frame: &Value) -> bool {
+    frame["type"].as_str().is_none() && frame["ok"] == false
+}
+
 pub enum Incoming {
     /// `cert_digest` só vem no `disconnected` por certificado não confiável; `cause` só no
     /// `disconnected` de uma sessão que caiu ou expirou.
@@ -166,8 +181,7 @@ impl Channel {
                 Some("response") => {
                     return Err(HelperError::Refused(frame["error"].as_str().unwrap_or("Unknown helper error").to_string()))
                 }
-                // A recusa do uid sai sem envelope (`refuse` em helper/src/server.rs).
-                None if frame["ok"] == false => return Err(HelperError::Unauthorized),
+                _ if is_uid_refusal(&frame) => return Err(HelperError::Unauthorized),
                 _ => {}
             }
         }
@@ -213,7 +227,7 @@ pub fn version(path: &Path) -> Result<String, HelperError> {
 
 /// A resposta do `status` como o Helper a manda (envelope incluso).
 pub fn status_frame(path: &Path) -> Result<Value, HelperError> {
-    request(path, &json!({"v": 2, "cmd": "status"}))
+    request(path, &status_request())
 }
 
 pub fn status(path: &Path) -> Result<ConnectionState, HelperError> {
@@ -274,7 +288,7 @@ pub(crate) fn parse_frame(frame: &Value) -> Option<Incoming> {
 /// `Err` só quando nem conectou.
 fn listen_once(path: &Path, on: &mut impl FnMut(Incoming)) -> Result<(), String> {
     let stream = open(path)?;
-    send(&stream, &json!({"v": 2, "cmd": "status"}))?;
+    send(&stream, &status_request())?;
     for line in BufReader::new(&stream).lines() {
         let Ok(line) = line else { break };
         if let Some(incoming) = serde_json::from_str(&line).ok().as_ref().and_then(parse_frame) {
@@ -293,7 +307,7 @@ pub fn run_events(path: &Path, mut on: impl FnMut(Incoming)) {
             Ok(()) => RECONNECT_MIN,
             Err(e) => {
                 log::debug!("Helper event channel unavailable: {}", e);
-                (delay * 2).min(RECONNECT_MAX)
+                next_delay(delay)
             }
         };
         std::thread::sleep(delay);

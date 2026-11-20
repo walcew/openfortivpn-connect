@@ -6,20 +6,16 @@ use std::io::{IsTerminal, Read};
 use serde_json::{json, Value};
 
 use super::args::{Auth, Fields, ProfileCmd};
-use super::{target, CliError, Out};
+use super::{output, target, CliError, Out};
 use crate::keychain;
 use crate::models::{AuthType, VpnProfile};
 use crate::vpn_manager::VpnManager;
 
-fn cli_error(e: String) -> CliError {
-    CliError::failure("CLI_ERROR", e)
-}
-
 pub fn run(out: &Out, cmd: ProfileCmd) -> Result<(), CliError> {
-    let mgr = VpnManager::new().map_err(cli_error)?;
+    let mgr = VpnManager::new().map_err(CliError::cli)?;
     match cmd {
         ProfileCmd::Ls => {
-            let views = mgr.get_profiles().map_err(cli_error)?.iter().map(view).collect::<Result<Vec<_>, _>>()?;
+            let views = mgr.get_profiles().map_err(CliError::cli)?.iter().map(view).collect::<Result<Vec<_>, _>>()?;
             out.emit(&Value::Array(views.clone()), || print_table(&views));
         }
         ProfileCmd::Show { profile } => print(out, &target::resolve(&profile)?)?,
@@ -40,18 +36,18 @@ pub fn run(out: &Out, cmd: ProfileCmd) -> Result<(), CliError> {
         }
         ProfileCmd::Rm { profile } => {
             let p = target::resolve(&profile)?;
-            mgr.delete_profile(&p.id).map_err(cli_error)?;
+            mgr.delete_profile(&p.id).map_err(CliError::cli)?;
             let removed = json!({"id": p.id, "name": p.name, "removed": true});
             out.emit(&removed, || println!("Removed Profile '{}' ({})", p.name, p.id));
         }
         ProfileCmd::SetPassword { profile, .. } => {
             let p = target::resolve(&profile)?;
-            keychain::set_password(&p.id, &read_password()?).map_err(cli_error)?;
+            keychain::set_password(&p.id, &read_password()?).map_err(CliError::cli)?;
             print(out, &p)?;
         }
         ProfileCmd::ClearPassword { profile } => {
             let p = target::resolve(&profile)?;
-            keychain::delete_password(&p.id).map_err(cli_error)?;
+            keychain::delete_password(&p.id).map_err(CliError::cli)?;
             print(out, &p)?;
         }
         ProfileCmd::Trust { profile, digest } => {
@@ -122,7 +118,7 @@ fn apply(p: &mut VpnProfile, name: Option<String>, host: Option<String>, f: &Fie
 
 /// Nome repetido deixaria a mira por nome exato ambígua.
 fn ensure_name_free(mgr: &VpnManager, p: &VpnProfile) -> Result<(), CliError> {
-    if mgr.get_profiles().map_err(cli_error)?.iter().any(|o| o.id != p.id && o.name == p.name) {
+    if mgr.get_profiles().map_err(CliError::cli)?.iter().any(|o| o.id != p.id && o.name == p.name) {
         return Err(CliError::refused("PROFILE_NAME_TAKEN", format!("Another Profile is already named '{}'", p.name)));
     }
     Ok(())
@@ -132,7 +128,7 @@ fn ensure_name_free(mgr: &VpnManager, p: &VpnProfile) -> Result<(), CliError> {
 fn save(out: &Out, mgr: &VpnManager, mut p: VpnProfile) -> Result<(), CliError> {
     p.dns_match_domains =
         VpnManager::normalize_dns_domains(&p.dns_match_domains).map_err(|m| CliError::refused("INVALID_DNS_DOMAIN", m))?;
-    print(out, &mgr.save_profile(p, None).map_err(cli_error)?)
+    print(out, &mgr.save_profile(p, None).map_err(CliError::cli)?)
 }
 
 /// O digest como o editor da GUI o guarda: sem `:`, em minúsculas, 64 hex.
@@ -152,15 +148,16 @@ fn read_password() -> Result<String, CliError> {
     }
     let mut password = String::new();
     std::io::stdin().read_to_string(&mut password).map_err(|e| usage(&format!("Cannot read the password from stdin: {e}")))?;
-    if password.strip_suffix('\n').unwrap_or(&password).is_empty() {
+    let password = password.strip_suffix('\n').unwrap_or(&password);
+    if password.is_empty() {
         return Err(usage("The password on stdin is empty"));
     }
-    Ok(password.strip_suffix('\n').unwrap_or(&password).to_string())
+    Ok(password.to_string())
 }
 
 /// O Profile como a CLI o mostra: sem `extra_args`, nunca com a senha, só se ela existe.
 fn view(p: &VpnProfile) -> Result<Value, CliError> {
-    let has_password = keychain::get_password(&p.id).map_err(cli_error)?.is_some_and(|s| !s.is_empty());
+    let has_password = keychain::get_password(&p.id).map_err(CliError::cli)?.is_some_and(|s| !s.is_empty());
     Ok(json!({
         "id": p.id, "name": p.name, "host": p.host, "port": p.port,
         "auth": if p.auth_type == AuthType::Saml { "saml" } else { "password" },
@@ -174,16 +171,9 @@ fn print(out: &Out, p: &VpnProfile) -> Result<(), CliError> {
     let v = view(p)?;
     out.emit(&v, || {
         for key in ["id", "name", "host", "port", "auth", "username", "realm", "otp_required", "auto_trust", "trusted_certs", "dns_domains", "has_password"] {
-            let text = match &v[key] {
-                Value::Null => continue,
-                Value::String(s) => s.clone(),
-                Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
-                other => other.to_string(),
-            };
-            if text.is_empty() {
-                continue;
+            if let Some(text) = output::text(&v[key]) {
+                println!("{:<14} {text}", format!("{key}:"));
             }
-            println!("{:<14} {text}", format!("{key}:"));
         }
     });
     Ok(())

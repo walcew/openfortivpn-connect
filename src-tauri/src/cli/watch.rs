@@ -23,7 +23,7 @@ pub fn run() -> Result<(), CliError> {
         }
         emit(&json!({"event": "reconnecting", "in_ms": delay.as_millis() as u64}))?;
         std::thread::sleep(delay);
-        delay = (delay * 2).min(helper_client::RECONNECT_MAX);
+        delay = helper_client::next_delay(delay);
     }
 }
 
@@ -35,7 +35,7 @@ fn stream(socket: &Path, delay: &mut Duration) -> Result<HelperError, CliError> 
         Err(e) => return Ok(e),
     };
     // O Helper começa pelo estado atual depois do primeiro request; o `status` é só esse gatilho.
-    if let Err(e) = channel.send(&json!({"v": 2, "cmd": "status"})) {
+    if let Err(e) = channel.send(&helper_client::status_request()) {
         return Ok(e);
     }
     loop {
@@ -44,8 +44,7 @@ fn stream(socket: &Path, delay: &mut Duration) -> Result<HelperError, CliError> 
             Ok(None) => continue,
             Err(e) => return Ok(e),
         };
-        // A recusa do uid sai sem envelope (`refuse` em helper/src/server.rs).
-        if frame["type"].is_null() && frame["ok"] == false {
+        if helper_client::is_uid_refusal(&frame) {
             return Ok(HelperError::Unauthorized);
         }
         // A resposta ao `status` repete o estado que o evento já trouxe.
@@ -69,5 +68,5 @@ fn emit(line: &Value) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "{line}")
         .and_then(|()| out.flush())
-        .map_err(|e| CliError::failure("CLI_ERROR", format!("Cannot write to stdout: {e}")))
+        .map_err(|e| CliError::cli(format!("Cannot write to stdout: {e}")))
 }
