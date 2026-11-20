@@ -8,6 +8,7 @@
 mod args;
 mod connect;
 mod disconnect;
+mod helper;
 mod output;
 mod profile;
 mod settings;
@@ -42,6 +43,7 @@ pub fn main() -> ExitCode {
         Cmd::Watch => watch::run(),
         Cmd::Profile(cmd) => profile::run(&out, cmd),
         Cmd::Settings(cmd) => settings::run(&out, cmd),
+        Cmd::Helper(cmd) => helper::run(&out, cmd),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

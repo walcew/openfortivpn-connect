@@ -1049,3 +1049,83 @@ fn a_profile_created_by_the_cli_connects() {
     assert_eq!(request["profile"]["dns_match_domains"], json!(["corp.example.com"]));
     assert_eq!(request["password"], "pw");
 }
+
+/// O campo `name:` da saída de texto de `helper status`, sem o espaço que o alinha.
+fn helper_field(stdout: &str, name: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| panic!("no {name} in:\n{stdout}"))
+}
+
+#[test]
+fn helper_status_json_shows_the_running_helper_version_and_no_update() {
+    let home = Home::new();
+    let helper = FakeHelper::with_state(&home.socket(), connected());
+
+    let out = home.run(&["helper", "status", "--json"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let status = json_out(&out);
+    assert_eq!(status["running"], true);
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["needs_update"], false);
+    // `installed` vem de /Library, fora do socket: o teste só confere que é um booleano.
+    assert!(status["installed"].is_boolean(), "{status}");
+    assert_eq!(helper.commands(), ["version"]);
+}
+
+#[test]
+fn helper_status_flags_a_helper_on_another_version_as_needing_update() {
+    let home = Home::new();
+    let _helper = FakeHelper::start(&home.socket(), json!({"state": "disconnected"}), |_| vec![response(json!({"version": "0.0.1"}))]);
+
+    let status = json_out(&home.run(&["helper", "status", "--json"]));
+
+    assert_eq!(status["version"], "0.0.1");
+    assert_eq!(status["needs_update"], true);
+}
+
+#[test]
+fn helper_status_text_prints_one_field_per_line() {
+    let home = Home::new();
+    let _helper = FakeHelper::with_state(&home.socket(), connected());
+
+    let out = home.run(&["helper", "status"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.lines().count(), 4, "{stdout}");
+    assert_eq!(helper_field(&stdout, "running:"), "true");
+    assert_eq!(helper_field(&stdout, "version:"), env!("CARGO_PKG_VERSION"));
+    assert_eq!(helper_field(&stdout, "needs_update:"), "false");
+    assert!(["true", "false"].contains(&helper_field(&stdout, "installed:").as_str()), "{stdout}");
+}
+
+#[test]
+fn helper_status_without_a_helper_reports_it_not_running_and_exits_0() {
+    let home = Home::new();
+
+    let out = home.run(&["helper", "status", "--json"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let status = json_out(&out);
+    assert_eq!(status["running"], false);
+    assert!(status["version"].is_null(), "{status}");
+    assert_eq!(status["needs_update"], false);
+
+    let text_out = home.run(&["helper", "status"]);
+    assert_eq!(text_out.status.code(), Some(0), "{}", text(&text_out.stderr));
+    assert_eq!(helper_field(&text(&text_out.stdout), "running:"), "false");
+}
+
+#[test]
+fn helper_install_and_uninstall_are_refused_in_test_mode_without_running_osascript() {
+    let home = Home::new();
+    for cmd in ["install", "uninstall"] {
+        let out = home.run(&["helper", cmd, "--json"]);
+        assert_eq!(out.status.code(), Some(255), "{cmd}: {}", text(&out.stderr));
+        assert_eq!(json_err(&out)["error"]["code"], "CLI_ERROR", "{cmd}");
+    }
+}

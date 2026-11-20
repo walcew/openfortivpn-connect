@@ -1,7 +1,6 @@
+use std::fmt;
 use std::path::Path;
 use std::process::Command;
-
-use tauri::{AppHandle, Manager};
 
 use crate::helper_client;
 
@@ -154,19 +153,40 @@ fn install_cmd(bundled_helper: &str) -> String {
     )
 }
 
-/// Instala o Helper com osascript (uma senha de admin) a partir dos resources do bundle do app.
-pub fn install(app_handle: &AppHandle) -> Result<(), String> {
-    let resource_dir = app_handle
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
+/// Falha de instalar ou remover. `Cancelled` quando a pessoa recusou o diálogo de administrador.
+/// O texto é o que a GUI mostra.
+#[derive(Debug)]
+pub enum AdminError {
+    Cancelled(String),
+    Failed(String),
+}
+
+impl fmt::Display for AdminError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled(m) | Self::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+/// `-128` (ou "User canceled") é a recusa do diálogo de administrador; o resto é falha.
+fn osascript_error(stderr: &str, cancelled: &str, failed: &str) -> AdminError {
+    if stderr.contains("User canceled") || stderr.contains("-128") {
+        AdminError::Cancelled(cancelled.to_string())
+    } else {
+        AdminError::Failed(format!("{failed}: {stderr}"))
+    }
+}
+
+/// Instala o Helper com osascript (uma senha de admin) a partir dos `resource_dir` do bundle do app.
+pub fn install(resource_dir: &Path) -> Result<(), AdminError> {
     let bundled_helper = resource_dir.join("openvpngui-helper");
 
     if !bundled_helper.exists() {
-        return Err(format!(
+        return Err(AdminError::Failed(format!(
             "Helper binary not found in bundle at {:?}",
             bundled_helper
-        ));
+        )));
     }
 
     let script = admin_script(&install_cmd(&bundled_helper.to_string_lossy()));
@@ -176,14 +196,14 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()
-        .map_err(|e| format!("Failed to run osascript: {}", e))?;
+        .map_err(|e| AdminError::Failed(format!("Failed to run osascript: {}", e)))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Err("Installation cancelled by user".to_string());
-        }
-        return Err(format!("Installation failed: {}", stderr));
+        return Err(osascript_error(
+            &String::from_utf8_lossy(&output.stderr),
+            "Installation cancelled by user",
+            "Installation failed",
+        ));
     }
 
     // Espera o daemon subir
@@ -195,15 +215,15 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
             log::info!("Helper daemon installed and running (v{})", version);
             Ok(())
         }
-        Err(e) => Err(format!(
+        Err(e) => Err(AdminError::Failed(format!(
             "Helper installed but not responding: {}. Check /var/log/vpnconnect-helper.log",
             e
-        )),
+        ))),
     }
 }
 
 /// Desinstala o Helper e qualquer resto da 0.3.0.
-pub fn uninstall() -> Result<(), String> {
+pub fn uninstall() -> Result<(), AdminError> {
     let script = admin_script(&format!(
         "set -e; \
          {legacy}; \
@@ -220,14 +240,14 @@ pub fn uninstall() -> Result<(), String> {
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()
-        .map_err(|e| format!("Failed to run osascript: {}", e))?;
+        .map_err(|e| AdminError::Failed(format!("Failed to run osascript: {}", e)))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Err("Uninstall cancelled by user".to_string());
-        }
-        return Err(format!("Uninstall failed: {}", stderr));
+        return Err(osascript_error(
+            &String::from_utf8_lossy(&output.stderr),
+            "Uninstall cancelled by user",
+            "Uninstall failed",
+        ));
     }
 
     log::info!("Helper daemon uninstalled");
@@ -294,6 +314,14 @@ mod tests {
     #[test]
     fn helper_not_running_is_not_an_update() {
         assert!(!needs_update(None, "0.4.0"));
+    }
+
+    #[test]
+    fn osascript_cancel_is_told_apart_from_other_failures() {
+        let cancelled = osascript_error("execution error: User canceled. (-128)\n", "Uninstall cancelled by user", "Uninstall failed");
+        assert!(matches!(cancelled, AdminError::Cancelled(_)), "{cancelled}");
+        let failed = osascript_error("some other error", "Uninstall cancelled by user", "Uninstall failed");
+        assert_eq!(failed.to_string(), "Uninstall failed: some other error");
     }
 
     #[test]

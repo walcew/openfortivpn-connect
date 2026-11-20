@@ -106,10 +106,14 @@ pub fn check_helper_status() -> Result<helper_installer::HelperStatus, String> {
 
 #[tauri::command]
 pub fn install_helper(app_handle: tauri::AppHandle) -> Result<(), String> {
-    helper_installer::install(&app_handle)
+    let resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
+    helper_installer::install(&resource_dir).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn uninstall_helper() -> Result<(), String> {
-    helper_installer::uninstall()
+    helper_installer::uninstall().map_err(|e| e.to_string())
 }

@@ -3,7 +3,7 @@
 //! | saída | quando | `code` no `--json` |
 //! |---|---|---|
 //! | 0 | sucesso | — |
-//! | 1 | recusa do Helper, do gateway ou da checagem antes de conectar | `HELPER_REFUSED`, `PROFILE_NOT_FOUND`, `PROFILE_AMBIGUOUS`, `PROFILE_NAME_TAKEN`, `INVALID_DNS_DOMAIN`, `INVALID_CERT_DIGEST`, `OTP_REQUIRED`, `CREDENTIALS_MISSING`, `SESSION_ACTIVE`, `CERT_UNTRUSTED`, `LOGIN_FAILED`, `CONNECT_FAILED`, `CONNECT_CANCELLED`, `TIMEOUT` |
+//! | 1 | recusa do Helper, do gateway ou da checagem antes de conectar; diálogo de administrador recusado ou falho no `helper install`/`uninstall` | `HELPER_REFUSED`, `PROFILE_NOT_FOUND`, `PROFILE_AMBIGUOUS`, `PROFILE_NAME_TAKEN`, `INVALID_DNS_DOMAIN`, `INVALID_CERT_DIGEST`, `OTP_REQUIRED`, `CREDENTIALS_MISSING`, `SESSION_ACTIVE`, `CERT_UNTRUSTED`, `LOGIN_FAILED`, `CONNECT_FAILED`, `CONNECT_CANCELLED`, `TIMEOUT`, `HELPER_INSTALL_CANCELLED`, `HELPER_INSTALL_FAILED` |
 //! | 255 | falha da CLI: argumento, Helper inacessível | `CLI_ERROR`, `INVALID_ARGUMENT`, `HELPER_UNAVAILABLE`, `HELPER_UNAUTHORIZED`, `HELPER_NOT_INSTALLED`, `HELPER_OUTDATED` |
 //! | 130 | Ctrl-C | — |
 //!

@@ -10,8 +10,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     long_about = "Control the OpenFortiVpn Connect VPN session from the terminal.\n\n\
         The session lives in the Helper, so the app window and this CLI see and control the same \
         session. Only root and the user logged in at the console can talk to the Helper.\n\n\
-        Exit codes: 0 success; 1 refused by the Helper or the gateway; 255 CLI failure (bad \
-        argument, Helper unavailable); 130 interrupted (Ctrl-C).",
+        Exit codes: 0 success; 1 refused by the Helper or the gateway, or the Helper install was \
+        cancelled or failed; 255 CLI failure (bad argument, Helper unavailable); 130 interrupted \
+        (Ctrl-C).",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -96,6 +97,29 @@ pub enum Cmd {
     #[command(subcommand, long_about = "Show or change the app settings, stored in the same file the app uses. \
         --json prints {\"dns_fallback\", \"helper_install_declined\"}. Changing one setting keeps the others.")]
     Settings(SettingsCmd),
+    /// Show, install or uninstall the Helper, the root daemon the VPN runs in
+    #[command(subcommand, long_about = "Show, install or uninstall the Helper. The same installer as the app. \
+        `install` and `uninstall` open the macOS administrator dialog: the password is typed there, never \
+        in the terminal. Cancelling the dialog exits 1 with HELPER_INSTALL_CANCELLED; other failures exit 1 \
+        with HELPER_INSTALL_FAILED.")]
+    Helper(HelperCmd),
+}
+
+#[derive(Subcommand)]
+pub enum HelperCmd {
+    /// Show whether the Helper is installed and running, its version and whether it needs an update
+    #[command(long_about = "Show whether the Helper is installed and running, its version and whether it needs \
+        an update (running with another version than this app's). With --json, prints \
+        {\"installed\", \"running\", \"version\", \"needs_update\"}; version is null when the Helper is not \
+        running. Exits 0 even when the Helper is not running.")]
+    Status,
+    /// Install the Helper, or update it to this app's version
+    #[command(long_about = "Install the Helper, or update it to this app's version, from the app bundle. \
+        Prints the status after the install.")]
+    Install,
+    /// Remove the Helper, and what the 0.3.0 Helper left behind
+    #[command(long_about = "Remove the Helper and the files of the 0.3.0 Helper. Prints the status after the removal.")]
+    Uninstall,
 }
 
 #[derive(Subcommand)]
