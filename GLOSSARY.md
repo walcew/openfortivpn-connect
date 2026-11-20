@@ -27,3 +27,7 @@ _Avoid_: Token, 2FA code, TOTP code
 **FortiToken push**:
 Segundo fator em que o gateway envia uma notificação ao celular do usuário, que a aprova sem digitar nenhum OTP.
 _Avoid_: Push token, push OTP
+
+**CLI**:
+O modo de linha de comando do executável do app, o comando `vpnconnect`. Faz pelo terminal o que a GUI faz e é cliente do Helper, igual a ela.
+_Avoid_: Binário da CLI, app de terminal
