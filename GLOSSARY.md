@@ -9,7 +9,7 @@ A configuração salva de um gateway VPN: host, porta, método de autenticação
 _Avoid_: Connection, account, server
 
 **Helper**:
-O daemon privilegiado que roda como root. É o dono da sessão: hospeda o Engine, cria o túnel, aplica rotas e DNS e desfaz tudo quando a sessão termina. A GUI e a futura CLI são clientes do socket dele.
+O daemon privilegiado que roda como root. É o dono da sessão: hospeda o Engine, cria o túnel, aplica rotas e DNS e desfaz tudo quando a sessão termina. A GUI e a CLI `vpnconnect` são clientes iguais do socket dele.
 _Avoid_: Daemon, service, agent
 
 **Engine**:
