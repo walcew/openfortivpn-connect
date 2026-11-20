@@ -8,8 +8,17 @@ fn account_for(profile_id: &str) -> String {
     format!("vpn-{}", profile_id)
 }
 
+/// Com `VPNCONNECT_TEST_HOME`, a senha fica num arquivo por conta em `keychain/`.
+fn test_file(account: &str) -> Option<std::path::PathBuf> {
+    crate::paths::test_home().map(|home| home.join("keychain").join(account))
+}
+
 pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
     let account = account_for(profile_id);
+    if let Some(file) = test_file(&account) {
+        let write = std::fs::create_dir_all(file.parent().unwrap()).and_then(|_| std::fs::write(&file, password));
+        return write.map_err(|e| format!("Failed to save password to Keychain: {}", e));
+    }
     // Delete first to avoid "duplicate item" errors
     let _ = delete_generic_password(SERVICE, &account);
     set_generic_password(SERVICE, &account, password.as_bytes())
@@ -18,6 +27,12 @@ pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
 
 pub fn get_password(profile_id: &str) -> Result<Option<String>, String> {
     let account = account_for(profile_id);
+    if let Some(file) = test_file(&account) {
+        return match std::fs::read_to_string(&file) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            r => r.map(Some).map_err(|e| format!("Failed to retrieve password from Keychain: {}", e)),
+        };
+    }
     match get_generic_password(SERVICE, &account) {
         Ok(bytes) => {
             let password = String::from_utf8(bytes.to_vec())
@@ -37,6 +52,12 @@ pub fn get_password(profile_id: &str) -> Result<Option<String>, String> {
 
 pub fn delete_password(profile_id: &str) -> Result<(), String> {
     let account = account_for(profile_id);
+    if let Some(file) = test_file(&account) {
+        return match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Failed to delete password from Keychain: {}", e)),
+            _ => Ok(()),
+        };
+    }
     match delete_generic_password(SERVICE, &account) {
         Ok(()) => Ok(()),
         Err(e) => {

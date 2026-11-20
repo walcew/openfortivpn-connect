@@ -9,12 +9,8 @@ pub struct ProfileStore {
 
 impl ProfileStore {
     pub fn new() -> Result<Self, String> {
-        let base = dirs::config_dir()
-            .ok_or_else(|| "Could not determine config directory".to_string())?;
-        let app_dir = base.join("com.openvpngui.app");
-        fs::create_dir_all(&app_dir).map_err(|e| format!("Failed to create app dir: {}", e))?;
         Ok(Self {
-            profiles_path: app_dir.join("profiles.json"),
+            profiles_path: crate::paths::app_dir()?.join("profiles.json"),
         })
     }
 

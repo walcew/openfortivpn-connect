@@ -63,7 +63,7 @@ pub fn check_status() -> HelperStatus {
     let installed = Path::new(HELPER_INSTALL_PATH).exists()
         && Path::new(PLIST_INSTALL_PATH).exists();
 
-    let (running, version) = match helper_client::version(helper_client::socket_path()) {
+    let (running, version) = match helper_client::version(&helper_client::socket_path()) {
         Ok(v) => (true, Some(v)),
         Err(_) => (false, None),
     };
@@ -190,7 +190,7 @@ pub fn install(app_handle: &AppHandle) -> Result<(), String> {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Confere se o Helper responde
-    match helper_client::version(helper_client::socket_path()) {
+    match helper_client::version(&helper_client::socket_path()) {
         Ok(version) => {
             log::info!("Helper daemon installed and running (v{})", version);
             Ok(())
@@ -214,7 +214,7 @@ pub fn uninstall() -> Result<(), String> {
         legacy = legacy_cleanup_cmd(),
         helper = HELPER_INSTALL_PATH,
         plist = PLIST_INSTALL_PATH,
-        socket = helper_client::socket_path().display(),
+        socket = helper_client::SOCKET_PATH,
     ));
 
     let output = Command::new("osascript")
@@ -327,8 +327,7 @@ mod tests {
 
     #[test]
     fn no_new_artifact_carries_the_old_names() {
-        let socket = helper_client::socket_path().to_string_lossy().into_owned();
-        for new in [HELPER_INSTALL_PATH, PLIST_INSTALL_PATH, PLIST_CONTENT, &socket] {
+        for new in [HELPER_INSTALL_PATH, PLIST_INSTALL_PATH, PLIST_CONTENT, helper_client::SOCKET_PATH] {
             assert!(!new.contains("openvpngui") && !new.to_lowercase().contains("openfortivpn"), "{new}");
         }
     }

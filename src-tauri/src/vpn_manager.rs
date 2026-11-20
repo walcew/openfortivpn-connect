@@ -112,12 +112,13 @@ impl VpnManager {
                 let _ = app_handle.emit("log-line", &payload);
             }
             crate::helper_client::connect(
-                crate::helper_client::socket_path(),
+                &crate::helper_client::socket_path(),
                 &profile,
                 &creds,
                 otp,
                 &fallback_dns,
             )
+            .map_err(String::from)
         });
         if let Err(e) = &result {
             self.set_state(ConnectionState::Error { message: e.clone() }, app_handle);
@@ -184,9 +185,9 @@ impl VpnManager {
 
     /// Pede o `disconnect` ao Engine, que também encerra um login pendente; o estado final chega por evento.
     pub fn finish_disconnect(&mut self, app_handle: &AppHandle) {
-        let path = crate::helper_client::socket_path();
+        let path = &crate::helper_client::socket_path();
         if let Err(e) = crate::helper_client::disconnect(path) {
-            self.set_state(ConnectionState::Error { message: e }, app_handle);
+            self.set_state(ConnectionState::Error { message: e.into() }, app_handle);
             return;
         }
         // Sem sessão ativa o Helper não emite estado novo e o Disconnecting ficaria

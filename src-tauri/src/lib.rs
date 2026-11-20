@@ -6,8 +6,11 @@ mod profile_store;
 mod settings_store;
 pub mod tray;
 mod vpn_manager;
+mod gui_events;
 mod helper_client;
 mod helper_installer;
+mod paths;
+pub mod cli;
 
 use std::sync::Mutex;
 
@@ -40,7 +43,7 @@ pub fn run() {
             tray::setup_tray(app)?;
 
             // Conexão longa de eventos do Helper: sincroniza o estado ao abrir o app.
-            helper_client::start(app.handle().clone());
+            gui_events::start(app.handle().clone());
 
             #[cfg(target_os = "macos")]
             {
